@@ -20,6 +20,7 @@ from .icon import flower_icon
 from .messaging import KINDS, SHORT, build_action, render
 from . import backup, telegram, theme
 from .announcements_dialog import HistoryDialog, UnreadDialog, short
+from .notifications_dialog import NotificationsDialog
 from .bot_commands import BotContext, BotHandler, chunk
 from .version import VERSION
 from .duties_dialog import ChecklistDialog
@@ -60,6 +61,18 @@ ANNOUNCE_FOR = timedelta(days=7)  # сколько дней новое объя�
 
 def to_date(qd: QDate) -> date:
     return date(qd.year(), qd.month(), qd.day())
+
+
+class LoggingTray(QSystemTrayIcon):
+    """Значок у часов, который запоминает каждое показанное уведомление."""
+
+    def __init__(self, icon, parent, on_message):
+        super().__init__(icon, parent)
+        self._on_message = on_message
+
+    def showMessage(self, title, message, *args):
+        self._on_message(title, message)
+        super().showMessage(title, message, *args)
 
 
 class ShiftCalendar(QCalendarWidget):
@@ -220,6 +233,10 @@ class MainWindow(QMainWindow):
         self.ann_btn = QPushButton("📢 Объявления")
         self.ann_btn.clicked.connect(self.open_announcements)
         top.addWidget(self.ann_btn)
+        self.notif_btn = QPushButton("🔔 Уведомления")
+        self.notif_btn.setToolTip("Всё, что программа показывала в углу экрана за последние 24 часа")
+        self.notif_btn.clicked.connect(self.open_notifications)
+        top.addWidget(self.notif_btn)
         self.settings_btn = QPushButton("⚙ Настройки")
         self.settings_btn.clicked.connect(self.open_settings)
         password_btn = QPushButton("🔑 Сменить пароль")
@@ -291,7 +308,7 @@ class MainWindow(QMainWindow):
     # ----- напоминания и трей -----
 
     def _setup_tray(self):
-        self.tray = QSystemTrayIcon(flower_icon(), self)
+        self.tray = LoggingTray(flower_icon(), self, self._log_notification)
         self.tray.setToolTip("AloFlorist")
         menu = QMenu(self)
         open_action = QAction("Открыть", self)
@@ -575,6 +592,7 @@ class MainWindow(QMainWindow):
         self.settings_btn.setVisible(user.is_admin)
         self.update_shift_box()
         self._update_ann_button()
+        self._update_notif_button()
 
     def logout(self):
         self.set_user(None)
@@ -675,6 +693,35 @@ class MainWindow(QMainWindow):
         if self.user is None or self.user.is_admin:
             return []  # объявления пишет хозяин — показываем их сотрудникам
         return self.db.unread_announcements(self.user.id, datetime.now() - ANNOUNCE_FOR)
+
+    # ----- журнал уведомлений -----
+
+    def _log_notification(self, title: str, text: str):
+        """Всё, что показано в углу экрана, остаётся в журнале на сутки — можно посмотреть ещё раз."""
+        try:
+            self.db.add_notification(title, text, datetime.now())
+            self._update_notif_button()
+        except Exception:  # noqa: BLE001 — журнал не должен мешать самому уведомлению
+            pass
+
+    def _notif_seen_key(self) -> str:
+        return f"notif_seen_{self.user.id}"
+
+    def _update_notif_button(self):
+        if self.user is None:
+            return
+        try:
+            seen = datetime.fromisoformat(str(self.settings.value(self._notif_seen_key(), "")))
+        except ValueError:
+            seen = datetime.now() - timedelta(hours=24)
+        count = len([n for n in self.db.notifications_since(datetime.now() - timedelta(hours=24)) if n[0] > seen])
+        self.notif_btn.setText(f"🔔 Уведомления ({count})" if count else "🔔 Уведомления")
+        self.notif_btn.setStyleSheet(f"font-weight: bold; color: {C.orange}" if count else "")
+
+    def open_notifications(self):
+        NotificationsDialog(self, self.db).exec()
+        self.settings.setValue(self._notif_seen_key(), datetime.now().isoformat(timespec="seconds"))
+        self._update_notif_button()
 
     def _update_ann_button(self):
         count = len(self._unread())

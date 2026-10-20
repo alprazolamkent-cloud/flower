@@ -147,6 +147,13 @@ CREATE TABLE IF NOT EXISTS duties (
     position INTEGER NOT NULL DEFAULT 0,
     active   INTEGER NOT NULL DEFAULT 1
 );
+CREATE TABLE IF NOT EXISTS notifications (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    title      TEXT NOT NULL,
+    text       TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_notifications_time ON notifications(created_at);
 CREATE TABLE IF NOT EXISTS announcements (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     update_id  INTEGER UNIQUE,
@@ -732,3 +739,18 @@ class Database:
         self.conn.execute("DELETE FROM announcement_reads WHERE announcement_id = ?", (announcement_id,))
         self.conn.execute("DELETE FROM announcements WHERE id = ?", (announcement_id,))
         self.conn.commit()
+
+    # ----- журнал уведомлений (то, что всплывало в углу экрана) -----
+
+    def add_notification(self, title: str, text: str, now: datetime, keep_days: int = 7):
+        self.conn.execute("INSERT INTO notifications (title, text, created_at) VALUES (?, ?, ?)",
+                          (title, text, _ts(now)))
+        self.conn.execute("DELETE FROM notifications WHERE created_at < ?", (_ts(now - timedelta(days=keep_days)),))
+        self.conn.commit()
+
+    def notifications_since(self, since: datetime) -> list[tuple[datetime, str, str]]:
+        """Уведомления с момента since, новые сверху: (когда, заголовок, текст)."""
+        rows = self.conn.execute(
+            "SELECT created_at, title, text FROM notifications WHERE created_at >= ?"
+            " ORDER BY created_at DESC, id DESC", (_ts(since),)).fetchall()
+        return [(datetime.fromisoformat(r[0]), r[1], r[2]) for r in rows]
