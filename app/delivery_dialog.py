@@ -15,7 +15,8 @@ MAX_MONEY = 10_000_000
 
 
 def money(value: int) -> str:
-    return f"{value:,}".replace(",", " ") + " ₽"
+    text = f"{abs(value):,}".replace(",", " ") + " ₽"
+    return f"−{text}" if value < 0 else text
 
 
 def money_box() -> QSpinBox:

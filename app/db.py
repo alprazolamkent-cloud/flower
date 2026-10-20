@@ -6,7 +6,8 @@ from datetime import date, datetime, time, timedelta
 
 from .auth import hash_password, verify_password
 from .shifts import (
-    KIND_TEXT, CashOp, Shift, delivery_business_day, opening_business_day,
+    KIND_TEXT, Adjustment, CashOp, ChecklistItem, Duty, Shift, delivery_business_day,
+    opening_business_day,
 )
 
 
@@ -110,6 +111,36 @@ CREATE TABLE IF NOT EXISTS water_changes (
     user_id    INTEGER,
     changed_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS salary_adjustments (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id    INTEGER NOT NULL,
+    month      TEXT    NOT NULL,
+    amount     INTEGER NOT NULL,
+    reason     TEXT    NOT NULL DEFAULT '',
+    created_at TEXT    NOT NULL,
+    created_by INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_salary_adj ON salary_adjustments(user_id, month);
+CREATE TABLE IF NOT EXISTS telegram_outbox (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    key        TEXT UNIQUE,
+    text       TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    sent_at    TEXT
+);
+CREATE TABLE IF NOT EXISTS duties (
+    id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    text     TEXT    NOT NULL,
+    position INTEGER NOT NULL DEFAULT 0,
+    active   INTEGER NOT NULL DEFAULT 1
+);
+CREATE TABLE IF NOT EXISTS shift_duties (
+    shift_id INTEGER NOT NULL,
+    duty_id  INTEGER NOT NULL,
+    text     TEXT    NOT NULL,
+    done_at  TEXT,
+    PRIMARY KEY (shift_id, duty_id)
+);
 """
 
 # Столбцы смен, добавленные позже.
@@ -124,7 +155,10 @@ SELECT s.id, s.user_id, COALESCE(NULLIF(u.name, ''), u.login, ''), s.day, s.open
        s.courier_cash, s.note,
        COALESCE((SELECT SUM(amount) FROM cash_ops c WHERE c.shift_id = s.id AND c.kind = 'expense'), 0),
        COALESCE((SELECT SUM(amount) FROM cash_ops c WHERE c.shift_id = s.id AND c.kind = 'withdrawal'), 0),
-       s.revenue, s.flowers, s.terminal, s.qr, s.deliveries
+       s.revenue, s.flowers, s.terminal, s.qr, s.deliveries,
+       (SELECT COUNT(*) FROM shift_duties sd WHERE sd.shift_id = s.id AND sd.done_at IS NOT NULL),
+       CASE WHEN s.closed_at IS NULL THEN (SELECT COUNT(*) FROM duties WHERE active = 1)
+            ELSE (SELECT COUNT(*) FROM shift_duties sd WHERE sd.shift_id = s.id) END
 FROM shifts s LEFT JOIN users u ON u.id = s.user_id
 """
 
@@ -140,7 +174,7 @@ def _row_to_shift(r) -> Shift:
         closed_at=datetime.fromisoformat(r[6]) if r[6] else None, closing_cash=r[7],
         cash_sales=r[8], delivery_cash=r[9], courier_cash=r[10], note=r[11],
         expenses=r[12], withdrawals=r[13], revenue=r[14], flowers=r[15], terminal=r[16], qr=r[17],
-        deliveries=r[18],
+        deliveries=r[18], duties_done=r[19], duties_total=r[20],
     )
 
 # Столбцы, добавленные после первой версии: старые базы дополняются при запуске.
@@ -211,6 +245,21 @@ class Database:
             self.conn.backup(dest)
         finally:
             dest.close()
+
+    def restore(self, path: str):
+        """Заменить все данные содержимым резервной копии."""
+        try:
+            src = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+            tables = {r[0] for r in src.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        except sqlite3.Error:
+            raise UserError("Это не файл резервной копии программы.") from None
+        try:
+            if "deliveries" not in tables:
+                raise UserError("Это не файл резервной копии программы.")
+            src.backup(self.conn)
+        finally:
+            src.close()
+        Database.__init__(self, self.path)  # копия могла быть от старой версии — дополнить таблицы
 
     def add(self, d: Delivery) -> int:
         cur = self.conn.execute(
@@ -352,6 +401,7 @@ class Database:
         self.conn.execute("UPDATE shifts SET user_id=NULL WHERE user_id=?", (user_id,))
         self.conn.execute("UPDATE cash_ops SET created_by=NULL WHERE created_by=?", (user_id,))
         self.conn.execute("UPDATE water_changes SET user_id=NULL WHERE user_id=?", (user_id,))
+        self.conn.execute("DELETE FROM salary_adjustments WHERE user_id=?", (user_id,))
         self.conn.execute("DELETE FROM users WHERE id=?", (user_id,))
         self.conn.commit()
 
@@ -410,6 +460,11 @@ class Database:
         self.conn.commit()
         if cur.rowcount == 0:
             raise UserError("Эта смена уже сдана.")
+        # Список обязанностей на момент сдачи: потом его могут поменять, а история останется.
+        self.conn.execute(
+            "INSERT OR IGNORE INTO shift_duties (shift_id, duty_id, text, done_at)"
+            " SELECT ?, id, text, NULL FROM duties WHERE active = 1", (shift_id,))
+        self.conn.commit()
         return self.get_shift(shift_id)
 
     def previous_shift(self, shift: Shift) -> Shift | None:
@@ -494,3 +549,90 @@ class Database:
 
     def water_change(self, day: date) -> tuple[str, datetime] | None:
         return self.water_changes_between(day, day).get(day)
+
+    # ----- зарплата: доплаты и удержания -----
+
+    def add_adjustment(self, user_id: int, month: str, amount: int, reason: str,
+                       created_by: int | None, now: datetime) -> int:
+        if amount == 0:
+            raise UserError("Введите сумму.")
+        if not reason.strip():
+            raise UserError("Напишите, за что (например «аванс» или «премия»).")
+        cur = self.conn.execute(
+            "INSERT INTO salary_adjustments (user_id, month, amount, reason, created_at, created_by)"
+            " VALUES (?, ?, ?, ?, ?, ?)", (user_id, month, amount, reason.strip(), _ts(now), created_by))
+        self.conn.commit()
+        return cur.lastrowid
+
+    def adjustments(self, user_id: int, month: str) -> list[Adjustment]:
+        rows = self.conn.execute(
+            "SELECT a.id, a.amount, a.reason, a.created_at, COALESCE(NULLIF(u.name, ''), u.login, '')"
+            " FROM salary_adjustments a LEFT JOIN users u ON u.id = a.created_by"
+            " WHERE a.user_id = ? AND a.month = ? ORDER BY a.created_at, a.id", (user_id, month)).fetchall()
+        return [Adjustment(r[0], r[1], r[2], datetime.fromisoformat(r[3]), r[4]) for r in rows]
+
+    def delete_adjustment(self, adjustment_id: int):
+        self.conn.execute("DELETE FROM salary_adjustments WHERE id=?", (adjustment_id,))
+        self.conn.commit()
+
+    # ----- очередь сообщений в Telegram -----
+
+    def queue_message(self, text: str, now: datetime, key: str | None = None) -> bool:
+        """Поставить сообщение в очередь. С тем же key второй раз не ставится. True — поставлено."""
+        cur = self.conn.execute(
+            "INSERT OR IGNORE INTO telegram_outbox (key, text, created_at) VALUES (?, ?, ?)",
+            (key, text, _ts(now)))
+        self.conn.commit()
+        return cur.rowcount > 0
+
+    def unsent_messages(self, limit: int = 20) -> list[tuple[int, str]]:
+        return self.conn.execute(
+            "SELECT id, text FROM telegram_outbox WHERE sent_at IS NULL ORDER BY id LIMIT ?", (limit,)).fetchall()
+
+    def mark_message_sent(self, message_id: int, now: datetime):
+        self.conn.execute("UPDATE telegram_outbox SET sent_at=? WHERE id=?", (_ts(now), message_id))
+        self.conn.commit()
+
+    # ----- обязанности смены -----
+
+    def duties(self) -> list[Duty]:
+        rows = self.conn.execute("SELECT id, text FROM duties WHERE active = 1 ORDER BY position, id").fetchall()
+        return [Duty(r[0], r[1]) for r in rows]
+
+    def save_duties(self, items: list[tuple[int | None, str]]):
+        """Новый список обязанностей: (id существующей или None для новой, текст). Убранные — в архив."""
+        keep = {duty_id for duty_id, _ in items if duty_id is not None}
+        for duty in self.duties():
+            if duty.id not in keep:
+                self.conn.execute("UPDATE duties SET active = 0 WHERE id = ?", (duty.id,))
+        for position, (duty_id, text) in enumerate(items):
+            text = text.strip()
+            if not text:
+                continue
+            if duty_id is None:
+                self.conn.execute("INSERT INTO duties (text, position) VALUES (?, ?)", (text, position))
+            else:
+                self.conn.execute("UPDATE duties SET text = ?, position = ?, active = 1 WHERE id = ?",
+                                  (text, position, duty_id))
+        self.conn.commit()
+
+    def checklist(self, shift: Shift) -> list[ChecklistItem]:
+        """Обязанности смены: у идущей — текущий список, у сданной — каким он был при сдаче."""
+        if shift.closed_at is None:
+            rows = self.conn.execute(
+                "SELECT d.id, d.text, sd.done_at FROM duties d LEFT JOIN shift_duties sd"
+                " ON sd.duty_id = d.id AND sd.shift_id = ? WHERE d.active = 1 ORDER BY d.position, d.id",
+                (shift.id,)).fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT sd.duty_id, sd.text, sd.done_at FROM shift_duties sd LEFT JOIN duties d"
+                " ON d.id = sd.duty_id WHERE sd.shift_id = ? ORDER BY COALESCE(d.position, 0), sd.duty_id",
+                (shift.id,)).fetchall()
+        return [ChecklistItem(r[0], r[1], datetime.fromisoformat(r[2]) if r[2] else None) for r in rows]
+
+    def set_duty_done(self, shift_id: int, duty_id: int, text: str, done: bool, now: datetime):
+        self.conn.execute(
+            "INSERT INTO shift_duties (shift_id, duty_id, text, done_at) VALUES (?, ?, ?, ?)"
+            " ON CONFLICT (shift_id, duty_id) DO UPDATE SET done_at = excluded.done_at",
+            (shift_id, duty_id, text, _ts(now) if done else None))
+        self.conn.commit()

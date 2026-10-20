@@ -95,6 +95,33 @@ class CashOp:
 
 
 @dataclass
+class Adjustment:
+    """Доплата (+) или удержание (−) к зарплате за месяц: аванс, премия, штраф."""
+    id: int
+    amount: int
+    reason: str
+    created_at: datetime
+    created_by_name: str = ""
+
+
+@dataclass
+class Duty:
+    id: int
+    text: str
+
+
+@dataclass
+class ChecklistItem:
+    duty_id: int
+    text: str
+    done_at: datetime | None
+
+    @property
+    def done(self) -> bool:
+        return self.done_at is not None
+
+
+@dataclass
 class Shift:
     id: int
     user_id: int | None
@@ -113,6 +140,8 @@ class Shift:
     terminal: int = 0  # оплаты картой
     qr: int = 0  # оплаты по QR-коду
     deliveries: int = 0  # взяли за доставки (перевод / QR), в кассу не идёт
+    duties_done: int = 0
+    duties_total: int = 0
     expenses: int = 0
     withdrawals: int = 0
 

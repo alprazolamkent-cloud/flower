@@ -7,15 +7,17 @@ from datetime import date, datetime, time
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
-    QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QGroupBox,
+    QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QGridLayout, QGroupBox,
     QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMessageBox, QPlainTextEdit, QPushButton,
     QSpinBox, QTableWidget, QTableWidgetItem, QVBoxLayout,
 )
 
 from .db import Database, User, UserError
 from .delivery_dialog import MAX_MONEY, money, money_box
+from .salary import SalaryRules, calculate
 from .shifts import (
-    KIND_TEXT, PROBLEM_STATUSES, STATUS_TEXT, Shift, WaterSchedule, expected_cash, revenue_mismatch, window,
+    KIND_TEXT, PROBLEM_STATUSES, STATUS_TEXT, ChecklistItem, Shift, WaterSchedule, expected_cash,
+    revenue_mismatch, window,
 )
 
 RED, GREEN, ORANGE, GRAY = "#c62828", "#2e7d32", "#ef6c00", "#757575"
@@ -222,6 +224,18 @@ class CloseShiftDialog(QDialog):
                 self.water_check = QCheckBox("💧 Вода поменяна (сегодня день смены воды)")
             layout.addWidget(self.water_check)
 
+        self.duty_boxes: list[tuple[ChecklistItem, QCheckBox]] = []
+        items = db.checklist(s)
+        if items:
+            duties = QGroupBox("Обязанности смены")
+            grid = QGridLayout(duties)
+            for i, item in enumerate(items):
+                box = QCheckBox(item.text)
+                box.setChecked(item.done)
+                grid.addWidget(box, i // 2, i % 2)
+                self.duty_boxes.append((item, box))
+            layout.addWidget(duties)
+
         note_form = QFormLayout()
         self.note_edit = QPlainTextEdit()
         self.note_edit.setPlaceholderText("Что важно знать: почему не сходится касса, что случилось "
@@ -264,11 +278,10 @@ class CloseShiftDialog(QDialog):
         if check is None:
             self.check_label.setText("")
         elif check == 0:
-            self.check_label.setText(f"<span style='color:{GREEN}'>✓ наличные + терминал + QR = "
-                                     f"{parts}, сходится с приходом</span>")
+            self.check_label.setText(f"<span style='color:{GREEN}'>✓ нал. + терминал + QR = приход</span>")
         else:
-            self.check_label.setText(f"<span style='color:{ORANGE}'>⚠ наличные + терминал + QR = "
-                                     f"{parts}, с приходом не сходится на {money(abs(check))}</span>")
+            self.check_label.setText(f"<span style='color:{ORANGE}'>⚠ нал. + терминал + QR = {parts},<br>"
+                                     f"с приходом разница {money(abs(check))}</span>")
 
     def _ask(self, title: str, text: str) -> bool:
         return QMessageBox.question(self, title, text, QMessageBox.Yes | QMessageBox.No,
@@ -306,10 +319,17 @@ class CloseShiftDialog(QDialog):
         if self.water_check is not None and self.water_done is None and not water_now and not self._ask(
                 "Смена воды", "Сегодня день смены воды, а отметки нет.\n\nСдать смену без замены воды?"):
             return
+        missed = [item.text for item, box in self.duty_boxes if not box.isChecked()]
+        if missed and not self._ask("Обязанности", "Не отмечено:\n• " + "\n• ".join(missed)
+                                    + "\n\nВсё равно сдать смену? Это увидит администратор."):
+            return
         if not self.shift.can_close(datetime.now(), self.change, self.grace):
             QMessageBox.warning(self, "Сдача смены", "Время на сдачу этой смены уже вышло.")
             self.reject()
             return
+        for item, box in self.duty_boxes:
+            if box.isChecked() != item.done:
+                self.db.set_duty_done(self.shift.id, item.duty_id, item.text, box.isChecked(), datetime.now())
         try:
             self.shift = self.db.close_shift(
                 self.shift.id, datetime.now(), self.cash_box.value(), self.sales_box.value(),
@@ -397,8 +417,8 @@ class CashOpDialog(QDialog):
 CABINET_HEADERS = ["Смена", "Сотрудник", "Открыта", "Сдана", "Статус",
                    "Приход", "Цветы", "Терминал", "QR-код", "Наличные", "Доставки",
                    "Приняли", "При приёме", "Курьерам", "Расходы", "Изъятия",
-                   "Должно быть", "Сдали", "Касса", "Вода", "Комментарий"]
-(C_STATUS, C_HANDOVER, C_CASH, C_WATER, C_NOTE) = (4, 12, 18, 19, 20)
+                   "Должно быть", "Сдали", "Касса", "Вода", "Обязанности", "Комментарий"]
+(C_STATUS, C_HANDOVER, C_CASH, C_WATER, C_DUTIES, C_NOTE) = (4, 12, 18, 19, 20, 21)
 MONEY_COLS = {5, 6, 7, 8, 9, 10, 11, 13, 14, 15, 16, 17}
 WATER_TEXT = {"done": ("поменяли", GREEN), "missed": ("не поменяли", RED), "planned": ("надо поменять", ORANGE)}
 
@@ -407,9 +427,10 @@ class CabinetDialog(QDialog):
     """Личный кабинет: смены и итоги за месяц. Админ может смотреть любого сотрудника или всех."""
 
     def __init__(self, parent, db: Database, user: User, change: time, grace: int, year: int, month: int,
-                 water: WaterSchedule | None = None):
+                 water: WaterSchedule | None = None, rules: SalaryRules | None = None):
         super().__init__(parent)
         self.db, self.user, self.change, self.grace, self.water = db, user, change, grace, water
+        self.rules = rules
         self.year, self.month = year, month
         self.shifts: list[Shift] = []
         self.setWindowTitle("Личный кабинет")
@@ -443,6 +464,17 @@ class CabinetDialog(QDialog):
         self.summary.setWordWrap(True)
         self.summary.setStyleSheet("font-size: 14px; padding: 6px 0")
         layout.addWidget(self.summary)
+
+        self.salary_box = QGroupBox("Зарплата за месяц")
+        salary_row = QHBoxLayout(self.salary_box)
+        self.salary_label = QLabel()
+        self.salary_label.setWordWrap(True)
+        salary_row.addWidget(self.salary_label, 1)
+        self.adjust_btn = QPushButton("± Аванс / премия / штраф…")
+        self.adjust_btn.clicked.connect(self._adjust)
+        salary_row.addWidget(self.adjust_btn)
+        self.salary_box.setVisible(rules is not None)
+        layout.addWidget(self.salary_box)
 
         self.table = QTableWidget(0, len(CABINET_HEADERS))
         self.table.setHorizontalHeaderLabels(CABINET_HEADERS)
@@ -519,7 +551,9 @@ class CabinetDialog(QDialog):
                 money(s.opening_cash), diff_text(handover) if handover is not None else "",
                 m(s.courier_cash), money(s.expenses), money(s.withdrawals),
                 m(s.expected_cash()), m(s.closing_cash or 0), diff_text(diff),
-                WATER_TEXT[water][0] if water else "", " ".join(s.note.split()),
+                WATER_TEXT[water][0] if water else "",
+                f"{s.duties_done} из {s.duties_total}" if s.duties_total else "",
+                " ".join(s.note.split()),
             ]
             for col, text in enumerate(cells):
                 item = QTableWidgetItem(text)
@@ -536,6 +570,12 @@ class CabinetDialog(QDialog):
                     if s.day in waters:
                         who, when = waters[s.day]
                         item.setToolTip(f"Отметил(а) {who or '—'} {when:%d.%m %H:%M}")
+                if col == C_DUTIES and s.duties_total:
+                    missed = [i.text for i in self.db.checklist(s) if not i.done]
+                    if closed:
+                        item.setForeground(QColor(RED if missed else GREEN))
+                    if missed:
+                        item.setToolTip("Не сделано: " + ", ".join(missed))
                 if col == C_NOTE and s.note:
                     item.setToolTip(s.note)
                 self.table.setItem(row, col, item)
@@ -565,7 +605,46 @@ class CabinetDialog(QDialog):
         if problems:
             text += "<br>" + " &nbsp;·&nbsp; ".join(problems)
         self.summary.setText(text)
+        self._refresh_salary()
         self._show_ops()
+
+    def month_key(self) -> str:
+        return f"{self.year:04d}-{self.month:02d}"
+
+    def _refresh_salary(self):
+        if self.rules is None:
+            return
+        person = self.person_box.currentData()
+        self.adjust_btn.setVisible(self.user.is_admin and person is not None)
+        if person is None:  # все сотрудники — по строчке на каждого
+            lines = []
+            for u in self.db.users():
+                shifts = [s for s in self.shifts if s.user_id == u.id]
+                if shifts:
+                    sal = calculate(shifts, self.db.adjustments(u.id, self.month_key()), self.rules)
+                    lines.append(f"{u.name or u.login}: <b>{money(sal.total)}</b>")
+            self.salary_label.setText(" &nbsp;·&nbsp; ".join(lines) or "Смен за месяц нет.")
+            return
+        sal = calculate(self.shifts, self.db.adjustments(person, self.month_key()), self.rules)
+        parts = [f"Смены: {sal.shifts} × {money(self.rules.shift_rate)} = {money(sal.base)}"]
+        if self.rules.flowers_percent:
+            parts.append(f"Цветы: {money(sal.flowers)} × {self.rules.flowers_percent:g}% = {money(sal.percent_part)}")
+        if sal.shortage:
+            parts.append(f"<span style='color:{RED}'>Недостача: −{money(sal.shortage)}</span>")
+        for a in sal.adjustments:
+            sign = "+" if a.amount > 0 else "−"
+            parts.append(f"{_html(a.reason)}: {sign}{money(abs(a.amount))}")
+        text = " &nbsp;·&nbsp; ".join(parts) + f"<br><b style='font-size:15px'>Итого: {money(sal.total)}</b>"
+        if sal.not_closed:
+            text += f" &nbsp;<span style='color:{GRAY}'>(несданные смены не учтены: {sal.not_closed})</span>"
+        self.salary_label.setText(text)
+
+    def _adjust(self):
+        person = self.person_box.currentData()
+        if person is not None:
+            AdjustmentDialog(self, self.db, person, self.person_box.currentText(), self.month_key(),
+                             self.user).exec()
+            self._refresh_salary()
 
     def _show_ops(self):
         row = self.table.currentRow()
@@ -576,3 +655,86 @@ class CabinetDialog(QDialog):
             + (f" · комментарий: {_html(shift.note)}" if shift.note else "")
             if shift else "<b>Расходы и изъятия</b> — выберите смену в таблице")
         _fill_ops(self.ops, self.db, shift.id if shift else None)
+
+
+class AdjustmentDialog(QDialog):
+    """Аванс, премия, штраф — доплаты и удержания к зарплате за месяц (только админ)."""
+
+    KINDS = (("Аванс (выдали заранее)", -1, "аванс"), ("Премия", 1, "премия"),
+             ("Штраф", -1, "штраф"), ("Доплата", 1, "доплата"), ("Удержание", -1, "удержание"))
+
+    def __init__(self, parent, db: Database, user_id: int, name: str, month: str, admin: User):
+        super().__init__(parent)
+        self.db, self.user_id, self.month, self.admin = db, user_id, month, admin
+        self.items = []
+        self.setWindowTitle(f"Зарплата: {name}, {month[5:]}.{month[:4]}")
+        self.resize(560, 420)
+        layout = QVBoxLayout(self)
+
+        self.table = QTableWidget(0, 4)
+        self.table.setHorizontalHeaderLabels(["Дата", "За что", "Сумма", "Добавил"])
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.verticalHeader().setVisible(False)
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.Stretch)
+        layout.addWidget(self.table, 1)
+        delete = QPushButton("🗑 Удалить выбранное")
+        delete.clicked.connect(self._delete)
+        layout.addWidget(delete)
+
+        form = QFormLayout()
+        self.kind_box = QComboBox()
+        for title, _, _ in self.KINDS:
+            self.kind_box.addItem(title)
+        self.kind_box.currentIndexChanged.connect(self._kind_changed)
+        form.addRow("Что:", self.kind_box)
+        self.amount_box = money_box()
+        form.addRow("Сумма:", self.amount_box)
+        self.reason_edit = QLineEdit(self.KINDS[0][2])
+        form.addRow("Комментарий:", self.reason_edit)
+        layout.addLayout(form)
+        add = QPushButton("➕ Добавить")
+        add.clicked.connect(self._add)
+        layout.addWidget(add)
+        close = QDialogButtonBox(QDialogButtonBox.Close)
+        close.button(QDialogButtonBox.Close).setText("Готово")
+        close.rejected.connect(self.accept)
+        layout.addWidget(close)
+        self.refresh()
+
+    def _kind_changed(self, index: int):
+        self.reason_edit.setText(self.KINDS[index][2])
+
+    def refresh(self):
+        self.items = self.db.adjustments(self.user_id, self.month)
+        self.table.setRowCount(len(self.items))
+        for row, a in enumerate(self.items):
+            sign = "+" if a.amount > 0 else "−"
+            cells = [f"{a.created_at:%d.%m.%Y}", a.reason, f"{sign}{money(abs(a.amount))}", a.created_by_name]
+            for col, text in enumerate(cells):
+                item = QTableWidgetItem(text)
+                if col == 2:
+                    item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                    item.setForeground(QColor(GREEN if a.amount > 0 else RED))
+                self.table.setItem(row, col, item)
+
+    def _add(self):
+        sign = self.KINDS[self.kind_box.currentIndex()][1]
+        try:
+            self.db.add_adjustment(self.user_id, self.month, sign * self.amount_box.value(),
+                                   self.reason_edit.text(), self.admin.id, datetime.now())
+        except UserError as e:
+            QMessageBox.warning(self, "Зарплата", str(e))
+            return
+        self.amount_box.setValue(0)
+        self.refresh()
+
+    def _delete(self):
+        row = self.table.currentRow()
+        if 0 <= row < len(self.items) and self.table.selectionModel().hasSelection():
+            if QMessageBox.question(self, "Удалить", f"Удалить «{self.items[row].reason}»?",
+                                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No) == QMessageBox.Yes:
+                self.db.delete_adjustment(self.items[row].id)
+                self.refresh()

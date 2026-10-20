@@ -18,7 +18,12 @@ from .db import Database, Delivery, Totals, User
 from .delivery_dialog import DeliveryDialog, money
 from .icon import flower_icon
 from .messaging import KINDS, SHORT, build_action, render
-from .settings_dialog import SettingsDialog, grace_minutes, lead_minutes, shift_change, water_schedule
+from . import backup, telegram
+from .duties_dialog import ChecklistDialog
+from .settings_dialog import (
+    SettingsDialog, backup_dir, backup_keep, grace_minutes, last_backup, lead_minutes, salary_rules,
+    set_last_backup, shift_change, water_schedule,
+)
 from .shift_dialogs import CabinetDialog, CashOpDialog, CloseShiftDialog, StartShiftDialog, fmt_dt
 from .shifts import PROBLEM_STATUSES, REMIND_BEFORE_MINUTES, Shift, business_day, short_name, window
 from .templates_dialog import load_templates
@@ -49,6 +54,7 @@ PENDING_DAY_BG = QColor("#ffe0b2")  # в этот день есть недост
 DONE_DAY_BG = QColor("#c8e6c9")  # всё доставлено
 WATER_COLORS = {"planned": "#1e88e5", "done": "#1e88e5", "missed": "#c62828"}
 WATER_REMIND_AFTER = timedelta(hours=4)  # через сколько после начала смены напомнить про воду
+BACKUP_EVERY = timedelta(hours=24)
 
 
 def to_date(qd: QDate) -> date:
@@ -118,6 +124,8 @@ class MainWindow(QMainWindow):
         self._shift_reminded: set[int] = set()
         self._shift_ended: set[int] = set()
         self._water_reminded: set[date] = set()
+        self._backup_warned: date | None = None
+        self.telegram = telegram.TelegramSender(db, self)
         self.settings = QSettings("FlowerDeliveries", "FlowerDeliveries")
 
         self.setWindowTitle("Доставки цветов")
@@ -179,6 +187,10 @@ class MainWindow(QMainWindow):
         self.water_btn.clicked.connect(self.mark_water)
         water_row.addWidget(self.water_label, 1)
         water_row.addWidget(self.water_btn)
+        self.duties_btn = QPushButton()
+        self.duties_btn.setToolTip("Отметить, что сделано из обязанностей смены")
+        self.duties_btn.clicked.connect(self.open_checklist)
+        water_row.addWidget(self.duties_btn)
         shift_layout.addLayout(water_row)
         left.addWidget(self.shift_box)
 
@@ -336,11 +348,13 @@ class MainWindow(QMainWindow):
                     self, "Сдача смены",
                     f"Смена закончилась в {pending.end(change):%H:%M}. Сдайте её до "
                     f"{pending.deadline(change, grace):%H:%M} — иначе она будет отмечена как не сданная.")
-                if CloseShiftDialog(self, self.db, pending, change, grace, water_schedule()).exec() != QDialog.Accepted:
+                closing = CloseShiftDialog(self, self.db, pending, change, grace, water_schedule())
+                if closing.exec() != QDialog.Accepted:
                     if self.user.is_admin:
                         self.shift = pending
                         return True
                     return False
+                self._after_shift_closed(closing.shift)
                 just_closed = True
             else:
                 QMessageBox.warning(
@@ -358,10 +372,31 @@ class MainWindow(QMainWindow):
         if dlg.exec() != QDialog.Accepted:
             return False
         self.shift = dlg.shift
+        self._after_shift_started(self.shift)
         return True
+
+    def _after_shift_started(self, shift: Shift):
+        handover = self.db.handover_difference(shift)
+        if telegram.settings()["on_start"] or handover:
+            prev = self.db.previous_shift(shift)
+            self.telegram.queue(telegram.shift_started_text(shift, handover, prev.user_name if prev else ""),
+                                key=f"start:{shift.id}")
+
+    def _after_shift_closed(self, shift: Shift):
+        """Итоги — в Telegram, данные — в резервную копию."""
+        if shift is not None and shift.closed_at is not None and telegram.settings()["on_close"]:
+            change = shift_change()
+            water = water_schedule().status(shift.day, self.db.water_change(shift.day) is not None,
+                                            datetime.now(), change)
+            missed = [i.text for i in self.db.checklist(shift) if not i.done]
+            late = shift.status(datetime.now(), change, grace_minutes()) == "late"
+            self.telegram.queue(telegram.shift_closed_text(shift, change, late, water, missed),
+                                key=f"close:{shift.id}")
+        self.run_backup()
 
     def update_shift_box(self):
         self._update_water_row()
+        self.duties_btn.setVisible(False)
         if self.user is None:
             self.shift_label.setText("")
             return
@@ -391,6 +426,14 @@ class MainWindow(QMainWindow):
         self.shift_btn.setText("🔴 Сдать смену")
         self.shift_btn.setVisible(True)
         self.cash_btn.setEnabled(True)
+        if s.duties_total:
+            self.duties_btn.setText(f"📋 Обязанности {s.duties_done}/{s.duties_total}")
+            self.duties_btn.setVisible(True)
+
+    def open_checklist(self):
+        if self.shift is not None:
+            ChecklistDialog(self, self.db, self.shift).exec()
+            self.update_shift_box()
 
     def _water_day(self) -> date:
         """Смена, для которой показываем воду: текущая смена сотрудника или идущая сейчас."""
@@ -435,6 +478,7 @@ class MainWindow(QMainWindow):
         dlg = StartShiftDialog(self, self.db, self.user, shift_change())
         if dlg.exec() == QDialog.Accepted:
             self.shift = dlg.shift
+            self._after_shift_started(self.shift)
             self.update_shift_box()
             self.refresh_month()
 
@@ -445,8 +489,10 @@ class MainWindow(QMainWindow):
             self.shift = None
             self.update_shift_box()
             return
-        if CloseShiftDialog(self, self.db, self.shift, change, grace, water_schedule()).exec() != QDialog.Accepted:
+        closing = CloseShiftDialog(self, self.db, self.shift, change, grace, water_schedule())
+        if closing.exec() != QDialog.Accepted:
             return
+        self._after_shift_closed(closing.shift)
         self.shift = None
         self.refresh_month()
         if self.user.is_admin:
@@ -462,7 +508,8 @@ class MainWindow(QMainWindow):
 
     def open_cabinet(self):
         CabinetDialog(self, self.db, self.user, shift_change(), grace_minutes(),
-                      self.calendar.yearShown(), self.calendar.monthShown(), water_schedule()).exec()
+                      self.calendar.yearShown(), self.calendar.monthShown(), water_schedule(),
+                      salary_rules()).exec()
 
     def active_shifts(self) -> list[Shift]:
         """Кто сейчас на смене (или ещё может её сдать)."""
@@ -498,6 +545,11 @@ class MainWindow(QMainWindow):
                 if mine:
                     self.logout()
                     return
+
+        for s in self.db.open_shifts():
+            deadline = s.deadline(change, grace)
+            if deadline <= now < deadline + timedelta(days=1):  # не сдана — сообщить хозяину один раз
+                self.telegram.queue(telegram.not_closed_text(s), key=f"not_closed:{s.id}")
 
         day = business_day(now, change)
         if active and now >= window(day, change)[0] + WATER_REMIND_AFTER and day not in self._water_reminded \
@@ -568,7 +620,32 @@ class MainWindow(QMainWindow):
                 QSystemTrayIcon.Information, 5000,
             )
 
+    def run_backup(self):
+        """Копия базы на компьютер и, если настроено, на флешку."""
+        if self.db.path == ":memory:":
+            return
+        now = datetime.now()
+        try:
+            result = backup.make_backups(self.db, backup_dir(), backup_keep(), now)
+        except Exception as e:  # noqa: BLE001 — копия не должна мешать работе
+            self.tray.showMessage("Резервная копия", f"Не удалось сделать копию: {e}",
+                                  QSystemTrayIcon.Warning, 30_000)
+            return
+        set_last_backup(now)
+        if result.extra_error and self._backup_warned != now.date():
+            self._backup_warned = now.date()
+            self.tray.showMessage("Резервная копия",
+                                  f"На флешку не скопировано ({result.extra_error}). "
+                                  "Копия сохранена только на компьютере.", QSystemTrayIcon.Warning, 30_000)
+
+    def after_restore(self):
+        QMessageBox.information(self, "Восстановление", "Данные восстановлены из копии. Войдите заново.")
+        self.logout()
+
     def check_reminders(self):
+        last = last_backup()
+        if last is None or datetime.now() - last >= BACKUP_EVERY:
+            self.run_backup()
         self.check_shift()
         now = datetime.now()
         today = now.date()
