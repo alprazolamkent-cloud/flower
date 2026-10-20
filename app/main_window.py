@@ -28,7 +28,8 @@ from .version import VERSION
 from .duties_dialog import ChecklistDialog
 from .reports import due_reports, report_text
 from .settings_dialog import (
-    SettingsDialog, backup_dir, backup_keep, grace_minutes, last_backup, late_minutes, lead_minutes,
+    SettingsDialog, assembly_alert_minutes, assembly_minutes, backup_dir, backup_keep, backup_to_telegram,
+    grace_minutes, last_backup, late_minutes, lead_minutes,
     penalty_catalog, report_settings, salary_rules, set_last_backup, shift_change, theme_mode, water_schedule,
     writeoff_alert,
 )
@@ -37,7 +38,9 @@ from .shifts import PROBLEM_STATUSES, REMIND_BEFORE_MINUTES, Shift, business_day
 from .templates_dialog import load_templates
 from .theme import C
 from .update_ui import UpdateController
-from .reminders import due_reminders, overdue_deliveries, reminder_key
+from .assembly_dialog import SNOOZE, AssemblyReminder
+from .reminders import assembly_due, assembly_escalations, due_reminders, overdue_deliveries, reminder_key
+from .shift_plan import ShiftPlanDialog
 from .salary import pct, shop_writeoff
 from .users_dialog import LoginDialog, PasswordDialog, UserFormDialog, UsersDialog
 
@@ -51,9 +54,9 @@ MONTHS = [
 ]
 WEEKDAYS = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
 
-HEADERS = ["✓", "Время", "Что доставить", "Кому", "Адрес",
+HEADERS = ["💐", "✓", "Время", "Что доставить", "Кому", "Адрес",
            "Взяли", "Курьеру", "Осталось", "Заказчик", "Писали", "Кто"]
-COL_DONE, COL_TIME, COL_ITEMS, COL_RECIPIENT, COL_ADDRESS, \
+COL_ASSEMBLED, COL_DONE, COL_TIME, COL_ITEMS, COL_RECIPIENT, COL_ADDRESS, \
     COL_PRICE, COL_COURIER, COL_REST, COL_CUSTOMER, COL_MESSAGES, COL_WHO = range(len(HEADERS))
 WRAP_UP_TO = {COL_RECIPIENT: 170, COL_CUSTOMER: 160}  # длинное — переносится, а не растягивает столбец
 MIN_WIDTH = {COL_ITEMS: 220, COL_ADDRESS: 160}  # главные столбцы: всё свободное место, но не уже этого
@@ -78,7 +81,7 @@ def describe_delivery(d: Delivery) -> str:
 
 DELIVERY_FIELDS = (("day", "дата"), ("time", "время"), ("items", "что доставить"), ("recipient", "получатель"),
                    ("phone", "телефон"), ("address", "адрес"), ("price", "взяли"), ("courier_pay", "курьеру"),
-                   ("delivered", "доставлено"), ("source", "откуда заказ"), ("customer_contact", "контакт заказчика"))
+                   ("assembled", "собрано"), ("delivered", "доставлено"), ("source", "откуда заказ"), ("customer_contact", "контакт заказчика"))
 
 
 def delivery_changes(old: Delivery, new: Delivery) -> str:
@@ -145,7 +148,7 @@ class ShiftCalendar(QCalendarWidget):
 
 def totals_text(t: Totals) -> str:
     return (
-        f"Доставок: <b>{t.count}</b> (доставлено {t.delivered})"
+        f"Доставок: <b>{t.count}</b> (собрано {t.assembled}, доставлено {t.delivered})"
         f" &nbsp;|&nbsp; Взяли: <b>{money(t.price)}</b>"
         f" &nbsp;|&nbsp; Курьерам: <b>{money(t.courier_pay)}</b>"
         f" &nbsp;|&nbsp; Осталось: <b>{money(t.remainder)}</b>"
@@ -162,6 +165,13 @@ class MainWindow(QMainWindow):
         self.user: User | None = None
         self._reminded: set = set()
         self._reports_done: set = set()
+        self.assembly = AssemblyReminder()  # «Не собрано!» — отдельное окно поверх всех
+        self.assembly.assembled.connect(self._assembled_from_reminder)
+        self.assembly.snoozed.connect(self._snooze_assembly)
+        self._assembly_snooze_until: datetime | None = None
+        self._assembly_seen: set[int] = set()  # о каких уже напоминали: новая — показываем сразу
+        self._backup_attempt: datetime | None = None
+        self._backup_day_pending = ""
         self._really_quit = False
         self._tray_hint_shown = False
         self._last_reminded_day: date | None = None
@@ -171,6 +181,7 @@ class MainWindow(QMainWindow):
         self._water_reminded: set[date] = set()
         self._backup_warned: date | None = None
         self.telegram = telegram.TelegramSender(db, self)
+        self.telegram.file_sent.connect(self._backup_file_sent)
         self.inbox = telegram.TelegramInbox(db, self)
         self.inbox.arrived.connect(self._on_announcements)
         self.bot = BotHandler()
@@ -235,7 +246,10 @@ class MainWindow(QMainWindow):
         cabinet_btn = QPushButton("👤 Кабинет")
         cabinet_btn.setToolTip("Личный кабинет: смены и итоги за месяц")
         cabinet_btn.clicked.connect(self.open_cabinet)
-        for b in (self.shift_btn, self.cash_btn, cabinet_btn):
+        self.plan_btn = QPushButton("📋 План")
+        self.plan_btn.setToolTip("План на смену: что собрать и к какому времени, вода, обязанности")
+        self.plan_btn.clicked.connect(self.open_plan)
+        for b in (self.shift_btn, self.cash_btn, self.plan_btn, cabinet_btn):
             shift_buttons.addWidget(b)
         shift_layout.addLayout(shift_buttons)
         water_row = QHBoxLayout()
@@ -332,6 +346,7 @@ class MainWindow(QMainWindow):
             header.setSectionResizeMode(col, QHeaderView.Interactive if col in (*WRAP_UP_TO, *MIN_WIDTH)
                                         else QHeaderView.ResizeToContents)
         self.table.horizontalHeaderItem(COL_DONE).setToolTip("Доставлено")
+        self.table.horizontalHeaderItem(COL_ASSEMBLED).setToolTip("Букет собран")
         self.table.horizontalHeaderItem(COL_WHO).setToolTip("Кто добавил доставку и кто отметил «Доставлено» (✓)")
         self.table.itemChanged.connect(self._on_item_changed)
         self.table.itemDoubleClicked.connect(self._on_double_click)
@@ -341,7 +356,7 @@ class MainWindow(QMainWindow):
         self.day_totals = QLabel()
         right.addWidget(self.day_totals)
 
-        self.hint = QLabel("Галочка в первом столбце — «Доставлено». Двойной щелчок — изменить.")
+        self.hint = QLabel("💐 — букет собран, ✓ — доставлено. Двойной щелчок — изменить.")
         self.hint.setStyleSheet(f"color: {C.gray}")
         right.addWidget(self.hint)
 
@@ -447,6 +462,7 @@ class MainWindow(QMainWindow):
             return False
         self.shift = dlg.shift
         self._after_shift_started(self.shift)
+        QTimer.singleShot(0, self.open_plan)  # сразу показать, что сегодня сделать
         return True
 
     def _after_shift_started(self, shift: Shift):
@@ -478,6 +494,7 @@ class MainWindow(QMainWindow):
     def update_shift_box(self):
         self._update_water_row()
         self.duties_btn.setVisible(False)
+        self.plan_btn.setVisible(self.user is not None and (self.shift is not None or bool(self.active_shifts())))
         if self.user is None:
             self.shift_label.setText("")
             return
@@ -562,6 +579,7 @@ class MainWindow(QMainWindow):
             self._after_shift_started(self.shift)
             self.update_shift_box()
             self.refresh_month()
+            self.open_plan()
 
     def close_shift(self):
         change, grace = shift_change(), grace_minutes()
@@ -685,6 +703,7 @@ class MainWindow(QMainWindow):
 
     def quit_app(self):
         self._really_quit = True
+        self.assembly.hide()
         self.tray.hide()
         QApplication.quit()
 
@@ -740,6 +759,10 @@ class MainWindow(QMainWindow):
             text += " и на флешке / в папке"
         if result.extra_error:
             text += f". На флешку не получилось: {result.extra_error}"
+        if self._current_bot_chat:  # файл — тому, кто попросил
+            self.telegram.send_file(backup.zip_copy(result.local, datetime.now()), self._backup_caption(),
+                                    "bot", [self._current_bot_chat])
+            text += ". Файл пришлю следующим сообщением"
         return text + "."
 
     def run_backup(self):
@@ -848,7 +871,9 @@ class MainWindow(QMainWindow):
         now = datetime.now()
         today = now.date()
         self._check_overdue(now)
+        self._check_assembly(now)
         self._check_reports(now)
+        self._maybe_send_backup(now)
         deliveries = self.db.for_day(today) + self.db.for_day(today + timedelta(days=1))
         due = due_reminders(deliveries, now, lead_minutes(), self._reminded)
         for d in due:
@@ -954,6 +979,7 @@ class MainWindow(QMainWindow):
         )
         self.deliveries = self.db.for_day(day)
 
+        due_ids = {d.id for d in assembly_due(self.deliveries, datetime.now(), assembly_minutes())}
         self._loading = True
         self.table.setRowCount(len(self.deliveries))
         for row, d in enumerate(self.deliveries):
@@ -961,7 +987,14 @@ class MainWindow(QMainWindow):
             done.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
             done.setCheckState(Qt.Checked if d.delivered else Qt.Unchecked)
             done.setToolTip("Доставлено" if d.delivered else "Не доставлено")
+            assembled = QTableWidgetItem()
+            assembled.setFlags((Qt.ItemIsUserCheckable if not d.delivered else Qt.NoItemFlags)
+                               | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+            assembled.setCheckState(Qt.Checked if d.assembled else Qt.Unchecked)
+            assembled.setToolTip(f"Собрано{' — ' + d.assembled_by_name if d.assembled_by_name else ''}"
+                                 if d.assembled else "Не собрано")
             cells = {
+                COL_ASSEMBLED: assembled,
                 COL_DONE: done,
                 COL_TIME: QTableWidgetItem(d.time),
                 COL_ITEMS: QTableWidgetItem(("🗑 ждёт удаления · " if d.delete_requested_at else "") + d.items),
@@ -988,6 +1021,11 @@ class MainWindow(QMainWindow):
                 self.table.setItem(row, col, item)
             if d.remainder < 0:
                 cells[COL_REST].setForeground(QColor(C.red))
+            if d.id in due_ids:  # скоро везти, а букет не собран
+                for col in (COL_ASSEMBLED, COL_TIME):
+                    cells[col].setBackground(QColor(C.pending_day))
+                cells[COL_TIME].setForeground(QColor(C.red))
+                cells[COL_ASSEMBLED].setToolTip("Скоро доставка — соберите букет и поставьте галочку")
             if d.delete_requested_at:
                 cells[COL_ITEMS].setForeground(QColor(C.orange))
                 cells[COL_ITEMS].setToolTip(
@@ -1043,11 +1081,14 @@ class MainWindow(QMainWindow):
         return None
 
     def _on_item_changed(self, item: QTableWidgetItem):
-        if self._loading or item.column() != COL_DONE:
+        if self._loading or item.column() not in (COL_DONE, COL_ASSEMBLED):
             return
         d = self.deliveries[item.row()]
+        if item.column() == COL_ASSEMBLED:
+            self._set_assembled(d, item.checkState() == Qt.Checked)
+            return
         delivered = item.checkState() == Qt.Checked
-        self.db.set_delivered(d.id, delivered, self.user.id)
+        self.db.set_delivered(d.id, delivered, self.user.id, datetime.now())
         self.audit("Доставка отмечена доставленной" if delivered else "Отметка «Доставлено» снята", describe_delivery(d))
         self.refresh_all()
         if delivered and d.customer_contact and not d.sent("delivered"):
@@ -1082,7 +1123,7 @@ class MainWindow(QMainWindow):
             SettingsDialog(self).exec()
 
     def _on_double_click(self, item: QTableWidgetItem):
-        if item.column() != COL_DONE:
+        if item.column() not in (COL_DONE, COL_ASSEMBLED):
             self.edit_delivery()
 
     def _open_dialog(self, delivery: Delivery) -> bool:
@@ -1098,6 +1139,8 @@ class MainWindow(QMainWindow):
     def add_delivery(self):
         d = Delivery(day=self.selected_day(), created_by=self.user.id, delivered_by=self.user.id)
         if self._open_dialog(d):
+            if d.assembled or d.delivered:
+                d.assembled_by, d.assembled_at = self.user.id, datetime.now()
             self.db.add(d)
             self.audit("Доставка создана", describe_delivery(d))
             self._show_day(d.day)
@@ -1106,11 +1149,13 @@ class MainWindow(QMainWindow):
         d = self.current_delivery()
         if d is None:
             return
-        was_delivered = d.delivered
+        was_delivered, was_assembled = d.delivered, d.assembled
         before = copy.copy(d)  # окно правит доставку на месте — запоминаем, что было
         if self._open_dialog(d):
             if d.delivered and not was_delivered:
                 d.delivered_by = self.user.id
+            if (d.assembled or d.delivered) and not was_assembled:
+                d.assembled_by, d.assembled_at = self.user.id, datetime.now()
             self.db.update(d)
             changes = delivery_changes(before, d)
             if changes:
@@ -1183,6 +1228,93 @@ class MainWindow(QMainWindow):
         self.telegram.queue(f"ℹ️ {who or 'Администратор'} {verb}: {what}",
                             key=f"pen:{p.id}:{int(set_)}:{datetime.now():%Y%m%d%H%M%S}",
                             except_chat=self._current_bot_chat)
+
+    # ----- сборка букетов -----
+
+    def _check_assembly(self, now: datetime):
+        """Букет не собран, а до доставки час (по настройке) — окно поверх всех, пока не соберут."""
+        today = now.date()
+        candidates = (self.db.for_day(today - timedelta(days=1)) + self.db.for_day(today)
+                      + self.db.for_day(today + timedelta(days=1)))
+        for d in assembly_escalations(candidates, now, assembly_alert_minutes(), self._reminded):
+            self._reminded.add(("assembly",) + reminder_key(d))
+            self.telegram.queue(f"💐 Букет ещё не собран, а доставка скоро\n{describe_delivery(d)}",
+                                key=f"assembly:{d.id}:{d.day}:{d.time}")
+        due = assembly_due(candidates, now, assembly_minutes())
+        if not due:
+            self.assembly.hide()
+            self._assembly_seen.clear()
+            return
+        new = {d.id for d in due} - self._assembly_seen
+        snoozed = self._assembly_snooze_until is not None and now < self._assembly_snooze_until
+        if self.assembly.isVisible() or new or not snoozed:
+            self.assembly.show_items(due, now)
+        if new or (not snoozed and not self.assembly.isVisible()):
+            self._assembly_seen |= {d.id for d in due}
+            self._assembly_snooze_until = None
+            self.assembly.show()
+            self.assembly.raise_()
+            self.assembly.activateWindow()
+            QApplication.beep()
+            QApplication.alert(self.assembly)
+            if new:
+                first = next(d for d in due if d.id in new)
+                self.tray.showMessage("Букет не собран!", f"{first.time} — {describe_delivery(first)}",
+                                      QSystemTrayIcon.Critical, 60_000)
+
+    def _snooze_assembly(self):
+        self._assembly_snooze_until = datetime.now() + SNOOZE
+
+    def _assembled_from_reminder(self, delivery_id: int):
+        d = self.db.get_delivery(delivery_id)
+        if d is not None:
+            self._set_assembled(d, True)
+        self._check_assembly(datetime.now())
+
+    def _set_assembled(self, d: Delivery, assembled: bool):
+        self.db.set_assembled(d.id, assembled, self.user.id if self.user else None, datetime.now())
+        self.audit("Букет собран" if assembled else "Отметка «Собрано» снята", describe_delivery(d))
+        self.refresh_all()
+
+    # ----- план смены -----
+
+    def open_plan(self):
+        shift = self.shift or next(iter(self.active_shifts()), None)
+        if shift is None:
+            QMessageBox.information(self, "План на смену", "Сейчас никто не на смене.")
+            return
+        ShiftPlanDialog(self, self.db, shift, shift_change(), water_schedule(), assembly_minutes()).exec()
+
+    # ----- копия базы в Telegram -----
+
+    @staticmethod
+    def _backup_caption() -> str:
+        return (f"💾 Копия базы AloFlorist, {datetime.now():%d.%m.%Y %H:%M}.\n"
+                "Восстановить: ⚙ Настройки → Копии → «Восстановить из копии» и выбрать этот файл. "
+                "Никому не пересылайте: в нём телефоны клиентов.")
+
+    def _maybe_send_backup(self, now: datetime):
+        """Раз в сутки — после утренней пересменки и сдачи смены — свежая копия хозяевам в Telegram."""
+        if not (backup_to_telegram() and telegram.configured()) or self.db.path == ":memory:":
+            return
+        change, day = shift_change(), business_day(now, shift_change())
+        if str(self.settings.value("tg_backup_day", "")) == day.isoformat():
+            return
+        if now < window(day, change)[0] + timedelta(minutes=grace_minutes() + 5):
+            return  # ночная смена ещё сдаётся — пусть в копию попадут её итоги
+        if self._backup_attempt is not None and now - self._backup_attempt < timedelta(hours=1):
+            return  # не получилось недавно (нет интернета) — не чаще раза в час
+        self._backup_attempt = now
+        result = self.run_backup()
+        if result is not None:
+            self._backup_day_pending = day.isoformat()
+            self.telegram.send_file(backup.zip_copy(result.local, now), self._backup_caption(), "daily")
+
+    def _backup_file_sent(self, tag: str, errors: list):
+        if tag == "daily" and len(errors) < len(telegram.settings()["chats"]):  # хотя бы одному дошло
+            self.settings.setValue("tg_backup_day", self._backup_day_pending)
+        if errors:
+            self.db.log_action(None, "Копия в Telegram не отправлена", "; ".join(errors), who="программа")
 
     def _check_reports(self, now: datetime):
         """Утренний, недельный и месячный отчёты хозяевам в Telegram — по одному разу за период."""

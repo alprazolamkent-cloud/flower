@@ -78,3 +78,35 @@ def overdue_deliveries(deliveries: list[Delivery], now: datetime, minutes: int, 
         if timedelta(0) <= overdue <= OVERDUE_MAX_AGE:
             late.append(d)
     return late
+
+
+ASSEMBLY_KEEP = timedelta(hours=1)  # после крайнего времени про сборку уже не напоминаем — там «не отмечена»
+
+
+def _needs_assembly(d: Delivery) -> bool:
+    return not d.assembled and not d.delivered and d.delete_requested_at is None
+
+
+def assembly_due(deliveries: list[Delivery], now: datetime, lead_minutes: int) -> list[Delivery]:
+    """Несобранные букеты, до доставки которых осталось lead_minutes минут или меньше (и пока не поздно).
+    lead_minutes = 0 — не напоминать. Заказы на дальние дни сюда не попадают: собирать их рано."""
+    if lead_minutes <= 0:
+        return []
+    due = []
+    for d in deliveries:
+        start = parse_start_time(d.time)
+        if not _needs_assembly(d) or start is None:
+            continue
+        begin = datetime.combine(d.day, start)
+        end = datetime.combine(d.day, parse_deadline_time(d.time) or start) + ASSEMBLY_KEEP
+        if begin - timedelta(minutes=lead_minutes) <= now <= end:
+            due.append(d)
+    return sorted(due, key=lambda d: (d.day, parse_start_time(d.time)))
+
+
+def assembly_escalations(deliveries: list[Delivery], now: datetime, minutes: int, already: set) -> list[Delivery]:
+    """Букет так и не собран за minutes минут до доставки — пора сообщить хозяевам (один раз).
+    minutes = 0 — не сообщать."""
+    if minutes <= 0:
+        return []
+    return [d for d in assembly_due(deliveries, now, minutes) if ("assembly",) + reminder_key(d) not in already]

@@ -1,8 +1,10 @@
 """Сообщения хозяину в Telegram: итоги смен и проблемы. Отправка — через очередь в базе."""
 
 import json
+import os
 import re
 import threading
+import uuid
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -31,9 +33,12 @@ class TelegramError(Exception):
         self.permanent = permanent
 
 
-def _call(token: str, method: str, params: dict | None = None, timeout: float = TIMEOUT) -> dict:
-    data = urllib.parse.urlencode(params or {}).encode()
+def _call(token: str, method: str, params: dict | None = None, timeout: float = TIMEOUT,
+          body: bytes | None = None, content_type: str = "") -> dict:
+    data = body if body is not None else urllib.parse.urlencode(params or {}).encode()
     req = urllib.request.Request(API.format(token=token.strip(), method=method), data=data)
+    if content_type:
+        req.add_header("Content-Type", content_type)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as response:
             payload = json.load(response)
@@ -52,6 +57,32 @@ def _call(token: str, method: str, params: dict | None = None, timeout: float = 
 
 def send_message(token: str, chat_id: str, text: str):
     _call(token, "sendMessage", {"chat_id": chat_id, "text": text})
+
+
+MAX_FILE = 49 * 1024 * 1024  # бот может отправить файл до 50 МБ
+
+
+def multipart(fields: dict[str, str], file_field: str, filename: str, data: bytes) -> tuple[bytes, str]:
+    """Тело запроса multipart/form-data с одним файлом: (тело, Content-Type)."""
+    boundary = uuid.uuid4().hex
+    parts = []
+    for name, value in fields.items():
+        parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n{value}\r\n'.encode())
+    safe = "".join(c if c.isascii() and c not in '"\\\r\n' else "_" for c in filename)  # имя латиницей
+    parts.append((f'--{boundary}\r\nContent-Disposition: form-data; name="{file_field}"; filename="{safe}"\r\n'
+                  "Content-Type: application/octet-stream\r\n\r\n").encode() + data + b"\r\n")
+    parts.append(f"--{boundary}--\r\n".encode())
+    return b"".join(parts), f"multipart/form-data; boundary={boundary}"
+
+
+def send_document(token: str, chat_id: str, path: str, caption: str = ""):
+    """Отправить файл (копию базы). Большой файл Telegram не примет — сообщаем сразу."""
+    if os.path.getsize(path) > MAX_FILE:
+        raise TelegramError("файл больше 50 МБ — Telegram такой не примет", permanent=True)
+    with open(path, "rb") as f:
+        body, content_type = multipart({"chat_id": str(chat_id), "caption": caption}, "document",
+                                       os.path.basename(path), f.read())
+    _call(token, "sendDocument", timeout=120, body=body, content_type=content_type)
 
 
 def chat_title(chat: dict) -> str:
@@ -300,6 +331,7 @@ class TelegramSender(QObject):
     """Раз в минуту отправляет накопившиеся сообщения. Нет интернета — попробует позже."""
 
     done = Signal(list)  # [(id сообщения, текст ошибки или "")]
+    file_sent = Signal(str, list)  # (метка, [ошибки по чатам]) — после отправки файла
 
     def __init__(self, db, parent=None):
         super().__init__(parent)
@@ -324,6 +356,23 @@ class TelegramSender(QObject):
             queued |= self.db.queue_message(text, datetime.now(), f"{key}|{target}" if key else None, target)
         if queued:
             QTimer.singleShot(0, self.flush)
+
+    def send_file(self, path: str, caption: str, tag: str, chats: list[str] | None = None):
+        """Файл (копию базы) — сразу, в фоне, мимо очереди: в базе ему не место. Итог — сигнал file_sent."""
+        cfg = settings()
+        targets = [str(c) for c in (chats or cfg["chats"])]
+        if not (cfg["token"] and targets):
+            return
+        threading.Thread(target=self._send_file, args=(cfg["token"], targets, path, caption, tag), daemon=True).start()
+
+    def _send_file(self, token: str, chats: list[str], path: str, caption: str, tag: str):
+        errors = []
+        for chat in chats:
+            try:
+                send_document(token, chat, path, caption)
+            except (TelegramError, OSError) as e:
+                errors.append(f"{chat}: {e}")
+        self.file_sent.emit(tag, errors)
 
     def flush(self):
         cfg = settings()

@@ -4,7 +4,7 @@ from datetime import date
 
 from PySide6.QtCore import QDate
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QDateEdit, QDialog, QDialogButtonBox, QFormLayout, QLabel,
+    QCheckBox, QComboBox, QDateEdit, QDialog, QDialogButtonBox, QFormLayout, QHBoxLayout, QLabel,
     QLineEdit, QMessageBox, QPlainTextEdit, QSpinBox,
 )
 
@@ -92,9 +92,17 @@ class DeliveryDialog(QDialog):
         self.courier_box.valueChanged.connect(self._update_remainder)
         self._update_remainder()
 
+        self.assembled_check = QCheckBox("💐 Букет собран")
+        self.assembled_check.setChecked(delivery.assembled or delivery.delivered)
         self.delivered_check = QCheckBox("Доставлено")
         self.delivered_check.setChecked(delivery.delivered)
-        form.addRow("", self.delivered_check)
+        self.delivered_check.toggled.connect(self._delivered_toggled)
+        self._delivered_toggled(delivery.delivered)
+        status = QHBoxLayout()
+        status.addWidget(self.assembled_check)
+        status.addWidget(self.delivered_check)
+        status.addStretch(1)
+        form.addRow("", status)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
         buttons.button(QDialogButtonBox.Save).setText("Сохранить")
@@ -102,6 +110,12 @@ class DeliveryDialog(QDialog):
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         form.addRow(buttons)
+
+    def _delivered_toggled(self, delivered: bool):
+        """Доставили — значит, и собрали: «собрано» отмечается само и не снимается."""
+        if delivered:
+            self.assembled_check.setChecked(True)
+        self.assembled_check.setEnabled(not delivered)
 
     def _update_contact_hint(self):
         hints = {
@@ -135,4 +149,5 @@ class DeliveryDialog(QDialog):
         d.price = self.price_box.value()
         d.courier_pay = self.courier_box.value()
         d.delivered = self.delivered_check.isChecked()
+        d.assembled = self.assembled_check.isChecked() or d.delivered
         super().accept()

@@ -497,10 +497,13 @@ def cmd_deliveries(ctx: BotContext, args: str) -> str:
     items = ctx.db.for_day(day)
     if not items:
         return f"🚚 На {day:%d.%m} доставок нет."
-    lines = [f"🚚 Доставки на {day:%d.%m}: {len(items)}, доставлено {sum(d.delivered for d in items)}"]
+    lines = [f"🚚 Доставки на {day:%d.%m}: {len(items)}, собрано {sum(d.assembled for d in items)}, "
+             f"доставлено {sum(d.delivered for d in items)}",
+             "✅ доставлено · 💐 собрано · ⏳ не собрано"]
     for d in items[:MAX_LIST]:
         what = d.items.splitlines()[0] if d.items else "—"
-        lines.append(f"{'✅' if d.delivered else '⏳'} {d.time or '—'} {what}, {d.address or 'адрес не указан'}"
+        icon = "✅" if d.delivered else "💐" if d.assembled else "⏳"
+        lines.append(f"{icon} {d.time or '—'} {what}, {d.address or 'адрес не указан'}"
                      + (f" ({money(d.price)})" if d.price else ""))
     if len(items) > MAX_LIST:
         lines.append(f"…и ещё {len(items) - MAX_LIST}")

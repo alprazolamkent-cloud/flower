@@ -32,6 +32,10 @@ class Delivery:
     messages: str = ""  # какие сообщения уже отправляли: «departed,delivered»
     delete_requested_at: datetime | None = None  # сотрудник попросил удалить — ждёт решения администратора
     delete_requested_by_name: str = ""
+    assembled: bool = False  # букет собран (доставленный — всегда собран)
+    assembled_by: int | None = None
+    assembled_at: datetime | None = None
+    assembled_by_name: str = ""
 
     def sent(self, kind: str) -> bool:
         return kind in self.messages.split(",")
@@ -64,6 +68,7 @@ class Totals:
     delivered: int = 0
     price: int = 0
     courier_pay: int = 0
+    assembled: int = 0  # собрано (в том числе уже доставленные)
 
     @property
     def remainder(self) -> int:
@@ -258,16 +263,21 @@ MIGRATIONS = {
     "messages": "ALTER TABLE deliveries ADD COLUMN messages TEXT NOT NULL DEFAULT ''",
     "delete_requested_by": "ALTER TABLE deliveries ADD COLUMN delete_requested_by INTEGER",
     "delete_requested_at": "ALTER TABLE deliveries ADD COLUMN delete_requested_at TEXT",
+    "assembled": "ALTER TABLE deliveries ADD COLUMN assembled INTEGER NOT NULL DEFAULT 0",
+    "assembled_by": "ALTER TABLE deliveries ADD COLUMN assembled_by INTEGER",
+    "assembled_at": "ALTER TABLE deliveries ADD COLUMN assembled_at TEXT",
 }
 
 COLUMNS = ("d.id, d.day, d.time, d.items, d.recipient, d.phone, d.address, d.price,"
            " d.courier_pay, d.delivered, d.created_by, d.delivered_by,"
            " COALESCE(NULLIF(uc.name, ''), uc.login, ''), COALESCE(NULLIF(ud.name, ''), ud.login, ''),"
            " d.source, d.customer_contact, d.messages, d.delete_requested_at,"
-           " COALESCE(NULLIF(ur.name, ''), ur.login, '')")
+           " COALESCE(NULLIF(ur.name, ''), ur.login, ''),"
+           " d.assembled, d.assembled_by, d.assembled_at, COALESCE(NULLIF(ua.name, ''), ua.login, '')")
 FROM = ("deliveries d LEFT JOIN users uc ON uc.id = d.created_by"
         " LEFT JOIN users ud ON ud.id = d.delivered_by"
-        " LEFT JOIN users ur ON ur.id = d.delete_requested_by")
+        " LEFT JOIN users ur ON ur.id = d.delete_requested_by"
+        " LEFT JOIN users ua ON ua.id = d.assembled_by")
 
 
 def _row_to_delivery(row) -> Delivery:
@@ -291,6 +301,10 @@ def _row_to_delivery(row) -> Delivery:
         messages=row[16],
         delete_requested_at=datetime.fromisoformat(row[17]) if row[17] else None,
         delete_requested_by_name=row[18],
+        assembled=bool(row[19]) or bool(row[9]),
+        assembled_by=row[20],
+        assembled_at=datetime.fromisoformat(row[21]) if row[21] else None,
+        assembled_by_name=row[22],
     )
 
 
@@ -307,6 +321,8 @@ class Database:
         for column, sql in MIGRATIONS.items():
             if column not in existing:
                 self.conn.execute(sql)
+        if "assembled" not in existing:  # до появления «собрано»: доставленные, конечно, были собраны
+            self.conn.execute("UPDATE deliveries SET assembled = 1 WHERE delivered = 1")
         existing = {r[1] for r in self.conn.execute("PRAGMA table_info(shifts)")}
         for column, sql in SHIFT_MIGRATIONS.items():
             if column not in existing:
@@ -351,11 +367,12 @@ class Database:
         cur = self.conn.execute(
             "INSERT INTO deliveries (day, time, items, recipient, phone, address,"
             " price, courier_pay, delivered, created_by, delivered_by,"
-            " source, customer_contact, messages)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " source, customer_contact, messages, assembled, assembled_by, assembled_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (d.day.isoformat(), d.time, d.items, d.recipient, d.phone, d.address,
              d.price, d.courier_pay, int(d.delivered), d.created_by,
-             d.delivered_by if d.delivered else None, d.source, d.customer_contact, d.messages),
+             d.delivered_by if d.delivered else None, d.source, d.customer_contact, d.messages,
+             *self._assembly_values(d)),
         )
         self.conn.commit()
         d.id = cur.lastrowid
@@ -365,18 +382,40 @@ class Database:
         self.conn.execute(
             "UPDATE deliveries SET day=?, time=?, items=?, recipient=?, phone=?,"
             " address=?, price=?, courier_pay=?, delivered=?, delivered_by=?,"
-            " source=?, customer_contact=? WHERE id=?",
+            " source=?, customer_contact=?, assembled=?, assembled_by=?, assembled_at=? WHERE id=?",
             (d.day.isoformat(), d.time, d.items, d.recipient, d.phone, d.address,
              d.price, d.courier_pay, int(d.delivered),
-             d.delivered_by if d.delivered else None, d.source, d.customer_contact, d.id),
+             d.delivered_by if d.delivered else None, d.source, d.customer_contact,
+             *self._assembly_values(d), d.id),
         )
         self.conn.commit()
 
-    def set_delivered(self, delivery_id: int, delivered: bool, user_id: int | None = None):
+    @staticmethod
+    def _assembly_values(d: Delivery) -> tuple:
+        """(собрано, кем, когда): доставленный букет считается собранным."""
+        assembled = d.assembled or d.delivered
+        if not assembled:
+            return 0, None, None
+        return 1, d.assembled_by, _ts(d.assembled_at) if d.assembled_at else None
+
+    def set_delivered(self, delivery_id: int, delivered: bool, user_id: int | None = None,
+                      now: datetime | None = None):
         self.conn.execute(
             "UPDATE deliveries SET delivered=?, delivered_by=? WHERE id=?",
             (int(delivered), user_id if delivered else None, delivery_id),
         )
+        if delivered:  # доставили — значит, и собрали (если забыли отметить)
+            self.conn.execute(
+                "UPDATE deliveries SET assembled=1, assembled_by=COALESCE(assembled_by, ?),"
+                " assembled_at=COALESCE(assembled_at, ?) WHERE id=? AND assembled=0",
+                (user_id, _ts(now or datetime.now()), delivery_id))
+        self.conn.commit()
+
+    def set_assembled(self, delivery_id: int, assembled: bool, user_id: int | None, now: datetime):
+        """Букет собран (или отметку сняли). У доставленного снять «собрано» нельзя."""
+        self.conn.execute(
+            "UPDATE deliveries SET assembled=?, assembled_by=?, assembled_at=? WHERE id=? AND delivered=0",
+            (int(assembled), user_id if assembled else None, _ts(now) if assembled else None, delivery_id))
         self.conn.commit()
 
     def mark_message(self, delivery_id: int, kind: str):
@@ -428,7 +467,8 @@ class Database:
     def _totals(self, where: str, param: str) -> Totals:
         row = self.conn.execute(
             "SELECT COUNT(*), COALESCE(SUM(delivered), 0), COALESCE(SUM(price), 0),"
-            f" COALESCE(SUM(courier_pay), 0) FROM deliveries WHERE {where}",
+            " COALESCE(SUM(courier_pay), 0), COALESCE(SUM(assembled = 1 OR delivered = 1), 0)"
+            f" FROM deliveries WHERE {where}",
             (param,),
         ).fetchone()
         return Totals(*row)
@@ -641,10 +681,14 @@ class Database:
         ).fetchall()
         return [CashOp(r[0], r[1], r[2], r[3], datetime.fromisoformat(r[4]), r[5]) for r in rows]
 
+    def deliveries_for_shift(self, day: date, change: time) -> list[Delivery]:
+        """Доставки, которые приходятся на смену этого дня (ночные — на вчерашнюю смену)."""
+        candidates = self.for_day(day) + self.for_day(day + timedelta(days=1))
+        return [d for d in candidates if delivery_business_day(d, change) == day]
+
     def delivery_cash_for_shift(self, day: date, change: time) -> tuple[int, int]:
         """(взяли за доставки, отдали курьерам) по доставкам, которые приходятся на смену."""
-        candidates = self.for_day(day) + self.for_day(day + timedelta(days=1))
-        own = [d for d in candidates if delivery_business_day(d, change) == day]
+        own = self.deliveries_for_shift(day, change)
         return sum(d.price for d in own), sum(d.courier_pay for d in own)
 
     # ----- смена воды -----

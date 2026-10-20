@@ -33,6 +33,21 @@ def _settings() -> QSettings:
     return QSettings("FlowerDeliveries", "FlowerDeliveries")
 
 
+def assembly_minutes() -> int:
+    """За сколько минут до доставки требовать собрать букет (0 — не напоминать)."""
+    return int(_settings().value("assembly_minutes", 60))
+
+
+def assembly_alert_minutes() -> int:
+    """За сколько минут до доставки сообщить хозяевам, что букет всё ещё не собран (0 — не сообщать)."""
+    return int(_settings().value("assembly_alert_minutes", 30))
+
+
+def backup_to_telegram() -> bool:
+    """Раз в сутки присылать копию базы хозяевам в Telegram."""
+    return str(_settings().value("backup_to_telegram", "true")) == "true"
+
+
 def late_minutes() -> int:
     """Через сколько минут после времени доставки сообщать, что она не отмечена (0 — не сообщать)."""
     return int(_settings().value("late_minutes", 20))
@@ -276,6 +291,22 @@ class SettingsDialog(QDialog):
         form.addRow("Доставка не отмечена через:", self.late_box)
         form.addRow(_gray_label("Если после времени доставки (для «14:00–16:00» — после 16:00) прошло столько минут,\n"
                                 "а «Доставлено» не отмечено — сотрудник получит уведомление, а хозяева — сообщение в Telegram."))
+        self.assembly_box = QSpinBox()
+        self.assembly_box.setRange(0, 600)
+        self.assembly_box.setSingleStep(15)
+        self.assembly_box.setSuffix(" мин")
+        self.assembly_box.setSpecialValueText("не напоминать")
+        self.assembly_box.setValue(assembly_minutes())
+        form.addRow("Букет не собран — требовать за:", self.assembly_box)
+        self.assembly_alert_box = QSpinBox()
+        self.assembly_alert_box.setRange(0, 600)
+        self.assembly_alert_box.setSingleStep(5)
+        self.assembly_alert_box.setSuffix(" мин")
+        self.assembly_alert_box.setSpecialValueText("не сообщать")
+        self.assembly_alert_box.setValue(assembly_alert_minutes())
+        form.addRow("Сообщить хозяевам, если не собран за:", self.assembly_alert_box)
+        form.addRow(_gray_label("Окно «Не собрано!» всплывает поверх всех окон и повторяется каждые 10 минут,\n"
+                                "пока букет не отметят собранным. Заказы на дальние дни собирать заранее не нужно."))
         layout.addWidget(reminders)
 
         shifts = QGroupBox("Смены")
@@ -576,6 +607,12 @@ class SettingsDialog(QDialog):
         form.addRow(_gray_label("Копия делается при каждой сдаче смены и раз в сутки.\n"
                                 "Всегда — на этом компьютере, и, если указано, — на флешку или в папку.\n"
                                 "Если флешка не вставлена, копия останется на компьютере, а программа предупредит."))
+        self.tg_backup_check = QCheckBox("Каждый день присылать копию хозяевам в Telegram")
+        self.tg_backup_check.setChecked(backup_to_telegram())
+        form.addRow(self.tg_backup_check)
+        form.addRow(_gray_label("Файл приходит после утренней пересменки — даже если компьютер сломается,\n"
+                                "данные останутся у вас в Telegram. Ещё раз — командой /копия. В файле телефоны\n"
+                                "клиентов и зашифрованные пароли: никому не пересылайте."))
         layout.addWidget(box)
 
         last = last_backup()
@@ -678,9 +715,16 @@ class SettingsDialog(QDialog):
 
     def _restore(self):
         path, _ = QFileDialog.getOpenFileName(self, "Выберите резервную копию", backup.local_dir(self.db.path),
-                                              "Резервные копии (*.db)")
+                                              "Резервные копии (*.db *.zip)")
         if not path:
             return
+        source = path
+        if path.lower().endswith(".zip"):  # копия из Telegram приходит архивом
+            try:
+                path = backup.extract_db(path)
+            except UserError as e:
+                QMessageBox.warning(self, "Восстановление", str(e))
+                return
         answer = QMessageBox.question(
             self, "Восстановить из копии",
             f"Заменить ВСЕ текущие данные (доставки, смены, сотрудников) данными из копии?\n\n{path}\n\n"
@@ -695,7 +739,7 @@ class SettingsDialog(QDialog):
             QMessageBox.warning(self, "Восстановление", str(e))
             return
         # журнал тоже вернулся к состоянию копии — эта запись осталась бы единственным следом восстановления
-        self.db.log_action(self.main.user, "Данные восстановлены из копии", os.path.basename(path))
+        self.db.log_action(self.main.user, "Данные восстановлены из копии", os.path.basename(source))
         self.reject()
         QTimer.singleShot(0, self.main.after_restore)
 
@@ -706,6 +750,9 @@ class SettingsDialog(QDialog):
         rows = [
             ("напоминать о доставке за (мин)", lead_minutes(), self.lead_box.value(), False),
             ("доставка не отмечена через (мин)", late_minutes(), self.late_box.value(), False),
+            ("требовать собрать за (мин)", assembly_minutes(), self.assembly_box.value(), False),
+            ("сообщить, если не собран за (мин)", assembly_alert_minutes(), self.assembly_alert_box.value(), False),
+            ("копия в Telegram", backup_to_telegram(), self.tg_backup_check.isChecked(), False),
             ("пересменка", shift_change().strftime("%H:%M"), self.change_edit.time().toString("HH:mm"), False),
             ("сдать смену ещё (мин)", grace_minutes(), self.grace_box.value(), False),
             ("вода раз в (дн.)", schedule.every, self.water_every.value(), False),
@@ -748,6 +795,9 @@ class SettingsDialog(QDialog):
         settings = _settings()
         settings.setValue("lead_minutes", self.lead_box.value())
         settings.setValue("late_minutes", self.late_box.value())
+        settings.setValue("assembly_minutes", self.assembly_box.value())
+        settings.setValue("assembly_alert_minutes", self.assembly_alert_box.value())
+        settings.setValue("backup_to_telegram", _bool(self.tg_backup_check.isChecked()))
         settings.setValue("shift_change", self.change_edit.time().toString("HH:mm"))
         settings.setValue("grace_minutes", self.grace_box.value())
         settings.setValue("water_every", self.water_every.value())

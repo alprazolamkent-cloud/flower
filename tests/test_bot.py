@@ -136,7 +136,7 @@ def test_deliveries(shop):
                       price=500, delivered=True))
     shop.add(Delivery(day=date(2026, 10, 21), time="09:00", items="Тюльпаны", address="пр. Мира, 2"))
     today = ask(shop, "/доставки")
-    assert "Доставки на 20.10: 1, доставлено 1" in today and "✅ 12:00 Букет роз, ул. Ленина, 10 (500 ₽)" in today
+    assert "Доставки на 20.10: 1, собрано 1, доставлено 1" in today and "✅ 12:00 Букет роз, ул. Ленина, 10 (500 ₽)" in today
     assert "⏳ 09:00 Тюльпаны" in ask(shop, "/доставки завтра") and "⏳ 09:00 Тюльпаны" in ask(shop, "/доставки 21.10")
     assert "нет" in ask(shop, "/доставки 25.12")
     assert "Дата в виде" in ask(shop, "/доставки когда-нибудь") and "не бывает" in ask(shop, "/доставки 31.02")
