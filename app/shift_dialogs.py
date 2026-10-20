@@ -7,14 +7,16 @@ from datetime import date, datetime, time
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
-    QAbstractItemView, QComboBox, QDialog, QDialogButtonBox, QFormLayout,
+    QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QGroupBox,
     QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMessageBox, QPlainTextEdit, QPushButton,
     QSpinBox, QTableWidget, QTableWidgetItem, QVBoxLayout,
 )
 
 from .db import Database, User, UserError
 from .delivery_dialog import MAX_MONEY, money, money_box
-from .shifts import KIND_TEXT, PROBLEM_STATUSES, STATUS_TEXT, Shift, expected_cash, window
+from .shifts import (
+    KIND_TEXT, PROBLEM_STATUSES, STATUS_TEXT, Shift, WaterSchedule, expected_cash, revenue_mismatch, window,
+)
 
 RED, GREEN, ORANGE, GRAY = "#c62828", "#2e7d32", "#ef6c00", "#757575"
 MONTHS = ["январь", "февраль", "март", "апрель", "май", "июнь",
@@ -42,11 +44,11 @@ def _html(text: str) -> str:
     return html.escape(text).replace("\n", "<br>")
 
 
-def count_box() -> QSpinBox:
-    """Поле для пересчитанной суммы: пустое, пока человек не введёт число сам."""
+def count_box(placeholder: str = "— пересчитайте —") -> QSpinBox:
+    """Поле для суммы, которую обязательно ввести самому: пустое, пока не введут число."""
     box = money_box()
     box.setRange(-1, MAX_MONEY)
-    box.setSpecialValueText("— пересчитайте —")
+    box.setSpecialValueText(placeholder)
     box.setValue(-1)
     return box
 
@@ -141,61 +143,103 @@ class StartShiftDialog(QDialog):
 
 
 class CloseShiftDialog(QDialog):
-    """Сдача смены: продажи, касса, расчёт «должно быть» и разница."""
+    """Сдача смены: выручка за смену, касса, расчёт «должно быть» и разница, смена воды."""
 
-    def __init__(self, parent, db: Database, shift: Shift, change: time, grace: int):
+    def __init__(self, parent, db: Database, shift: Shift, change: time, grace: int,
+                 water: WaterSchedule | None = None):
         super().__init__(parent)
         self.db, self.change, self.grace = db, change, grace
         self.shift = db.get_shift(shift.id)  # свежие суммы расходов и изъятий
         s = self.shift
-        delivery_cash, courier_cash = db.delivery_cash_for_shift(s.day, change)
+        delivery_sum, courier_sum = db.delivery_cash_for_shift(s.day, change)
         self.setWindowTitle("Сдача смены")
-        self.setMinimumWidth(500)
+        self.setMinimumWidth(760)
+        layout = QVBoxLayout(self)
 
-        form = QFormLayout(self)
-        form.addRow(QLabel(f"<h3>Сдача смены</h3>{s.user_name or '—'} · с {fmt_dt(s.opened_at)} "
-                           f"до {fmt_dt(s.end(change))}"))
+        layout.addWidget(QLabel(f"<h3>Сдача смены</h3>{s.user_name or '—'} · с {fmt_dt(s.opened_at)} "
+                                f"до {fmt_dt(s.end(change))}"))
         if datetime.now() >= s.end(change):
             late = QLabel(f"<b style='color:{ORANGE}'>Пересменка уже прошла — смена будет отмечена "
                           "«сдана с опозданием».</b>")
             late.setWordWrap(True)
-            form.addRow(late)
+            layout.addWidget(late)
 
-        form.addRow("На начало смены (приняли):", QLabel(money(s.opening_cash)))
-        self.sales_box = count_box()
-        self.sales_box.setToolTip("Сумма продаж наличными за смену из отчёта Hoog")
-        form.addRow("Продажи наличными (из Hoog):", self.sales_box)
+        columns = QHBoxLayout()
+        layout.addLayout(columns)
+
+        sales = QGroupBox("Выручка за смену (из Hoog)")
+        sales_form = QFormLayout(sales)
+        self.revenue_box = count_box("— введите —")
+        self.revenue_box.setToolTip("Вся сумма за смену: наличные, терминал, QR-код — всё вместе")
+        sales_form.addRow("Приход:", self.revenue_box)
+        self.flowers_box = count_box("— введите —")
+        self.flowers_box.setToolTip("Сколько из прихода — продажа цветов")
+        sales_form.addRow("Цветы:", self.flowers_box)
+        self.terminal_box = money_box()
+        sales_form.addRow("Терминал:", self.terminal_box)
+        self.qr_box = money_box()
+        sales_form.addRow("QR-код:", self.qr_box)
+        self.sales_box = count_box("— введите —")
+        self.sales_box.setToolTip("Продажи наличными за смену из отчёта Hoog")
+        sales_form.addRow("Продажи наличными:", self.sales_box)
+        self.check_label = QLabel()
+        self.check_label.setWordWrap(True)
+        sales_form.addRow(self.check_label)
         self.delivery_box = money_box()
-        self.delivery_box.setValue(delivery_cash)
-        form.addRow("Взяли наличными за доставки:", self.delivery_box)
+        self.delivery_box.setValue(delivery_sum)
+        sales_form.addRow("Взяли за доставки:", self.delivery_box)
+        sales_form.addRow("", _gray("перевод / QR — в кассу не идёт"))
+        columns.addWidget(sales)
+
+        cash = QGroupBox("Касса (наличные)")
+        cash_form = QFormLayout(cash)
+        cash_form.addRow("На начало смены (приняли):", QLabel(money(s.opening_cash)))
+        self.cash_sales_label = QLabel()
+        cash_form.addRow("+ продажи наличными:", self.cash_sales_label)
         self.courier_box = money_box()
-        self.courier_box.setValue(courier_cash)
-        form.addRow("Отдали курьерам (такси) из кассы:", self.courier_box)
-        form.addRow("", _gray("Доставки посчитаны по записям этой смены. Если какие-то оплачены "
-                              "картой или переводом — поправьте суммы."))
-        form.addRow("Расходы из кассы:", QLabel(f"− {money(s.expenses)}"))
-        form.addRow("Изъятия из кассы:", QLabel(f"− {money(s.withdrawals)}"))
+        self.courier_box.setValue(courier_sum)
+        cash_form.addRow("− отдали курьерам (такси):", self.courier_box)
+        cash_form.addRow("− расходы из кассы:", QLabel(money(s.expenses)))
+        cash_form.addRow("− изъятия из кассы:", QLabel(money(s.withdrawals)))
         self.expected_label = QLabel()
-        form.addRow("Должно быть в кассе:", self.expected_label)
+        cash_form.addRow("= должно быть в кассе:", self.expected_label)
         self.cash_box = count_box()
-        form.addRow("Фактически в кассе (пересчитайте):", self.cash_box)
+        cash_form.addRow("Фактически в кассе:", self.cash_box)
         self.diff_label = QLabel()
-        form.addRow("Разница:", self.diff_label)
+        cash_form.addRow("Разница:", self.diff_label)
+        columns.addWidget(cash)
+
+        self.water_check: QCheckBox | None = None
+        self.water_done = None
+        if water is not None and water.is_water_day(s.day):
+            self.water_done = db.water_change(s.day)
+            if self.water_done:
+                who, when = self.water_done
+                self.water_check = QCheckBox(f"💧 Вода поменяна — отметил(а) {who or '—'} в {when:%H:%M}")
+                self.water_check.setChecked(True)
+                self.water_check.setEnabled(False)
+            else:
+                self.water_check = QCheckBox("💧 Вода поменяна (сегодня день смены воды)")
+            layout.addWidget(self.water_check)
+
+        note_form = QFormLayout()
         self.note_edit = QPlainTextEdit()
         self.note_edit.setPlaceholderText("Что важно знать: почему не сходится касса, что случилось "
                                           "за смену, что передать следующей смене")
-        self.note_edit.setFixedHeight(70)
-        form.addRow("Комментарий к смене\n(по желанию):", self.note_edit)
-        form.addRow("", _gray("Комментарий увидит администратор и следующая смена."))
-        form.addRow(_buttons(self, "Сдать смену"))
+        self.note_edit.setFixedHeight(64)
+        note_form.addRow("Комментарий к смене\n(по желанию):", self.note_edit)
+        note_form.addRow("", _gray("Комментарий увидит администратор и следующая смена."))
+        layout.addLayout(note_form)
+        layout.addWidget(_buttons(self, "Сдать смену"))
 
-        for box in (self.sales_box, self.delivery_box, self.courier_box, self.cash_box):
+        for box in (self.revenue_box, self.terminal_box, self.qr_box, self.sales_box,
+                    self.courier_box, self.cash_box):
             box.valueChanged.connect(self._update)
         self._update()
 
     def expected(self) -> int:
         s = self.shift
-        return expected_cash(s.opening_cash, max(self.sales_box.value(), 0), self.delivery_box.value(),
+        return expected_cash(s.opening_cash, max(self.sales_box.value(), 0), 0,
                              self.courier_box.value(), s.expenses, s.withdrawals)
 
     def difference(self) -> int | None:
@@ -203,28 +247,65 @@ class CloseShiftDialog(QDialog):
             return None
         return self.cash_box.value() - self.expected()
 
+    def revenue_check(self) -> int | None:
+        """Приход − (наличные + терминал + QR), None — пока не всё введено."""
+        if self.revenue_box.value() < 0 or self.sales_box.value() < 0:
+            return None
+        return revenue_mismatch(self.revenue_box.value(), self.sales_box.value(),
+                                self.terminal_box.value(), self.qr_box.value())
+
     def _update(self):
+        self.cash_sales_label.setText(money(max(self.sales_box.value(), 0)))
         self.expected_label.setText(f"<b>{money(self.expected())}</b>")
         diff = self.difference()
         self.diff_label.setText(f"<b style='color:{diff_color(diff)}'>{diff_text(diff)}</b>")
+        check = self.revenue_check()
+        parts = money(max(self.sales_box.value(), 0) + self.terminal_box.value() + self.qr_box.value())
+        if check is None:
+            self.check_label.setText("")
+        elif check == 0:
+            self.check_label.setText(f"<span style='color:{GREEN}'>✓ наличные + терминал + QR = "
+                                     f"{parts}, сходится с приходом</span>")
+        else:
+            self.check_label.setText(f"<span style='color:{ORANGE}'>⚠ наличные + терминал + QR = "
+                                     f"{parts}, с приходом не сходится на {money(abs(check))}</span>")
+
+    def _ask(self, title: str, text: str) -> bool:
+        return QMessageBox.question(self, title, text, QMessageBox.Yes | QMessageBox.No,
+                                    QMessageBox.No) == QMessageBox.Yes
 
     def accept(self):
-        if self.sales_box.value() < 0:
-            QMessageBox.warning(self, "Сдача смены", "Введите продажи наличными из Hoog (если не было — 0).")
-            return
+        required = ((self.revenue_box, "приход"), (self.flowers_box, "сколько продано цветов"),
+                    (self.sales_box, "продажи наличными"))
+        for box, what in required:
+            if box.value() < 0:
+                QMessageBox.warning(self, "Сдача смены", f"Введите {what} (если не было — 0).")
+                box.setFocus()
+                return
         if self.cash_box.value() < 0:
             QMessageBox.warning(self, "Сдача смены", "Пересчитайте наличные в кассе и введите сумму.")
+            self.cash_box.setFocus()
+            return
+        if self.flowers_box.value() > self.revenue_box.value():
+            QMessageBox.warning(self, "Сдача смены", "Цветов не может быть продано больше, чем весь приход.")
+            return
+        check = self.revenue_check()
+        if check and not self._ask(
+                "Приход не сходится",
+                f"Наличные + терминал + QR-код = "
+                f"{money(self.sales_box.value() + self.terminal_box.value() + self.qr_box.value())}, "
+                f"а приход {money(self.revenue_box.value())}.\n\nПроверьте цифры. Всё равно сдать смену?"):
             return
         diff = self.difference()
-        if diff:
-            answer = QMessageBox.question(
-                self, "Касса не сходится",
+        if diff and not self._ask(
+                "Касса не сходится",
                 f"Должно быть {money(self.expected())}, а в кассе {money(self.cash_box.value())} "
-                f"({diff_text(diff)}).\n\nВсё равно сдать смену? Это увидит администратор.",
-                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
-            )
-            if answer != QMessageBox.Yes:
-                return
+                f"({diff_text(diff)}).\n\nВсё равно сдать смену? Это увидит администратор."):
+            return
+        water_now = self.water_check is not None and self.water_done is None and self.water_check.isChecked()
+        if self.water_check is not None and self.water_done is None and not water_now and not self._ask(
+                "Смена воды", "Сегодня день смены воды, а отметки нет.\n\nСдать смену без замены воды?"):
+            return
         if not self.shift.can_close(datetime.now(), self.change, self.grace):
             QMessageBox.warning(self, "Сдача смены", "Время на сдачу этой смены уже вышло.")
             self.reject()
@@ -232,10 +313,15 @@ class CloseShiftDialog(QDialog):
         try:
             self.shift = self.db.close_shift(
                 self.shift.id, datetime.now(), self.cash_box.value(), self.sales_box.value(),
-                self.delivery_box.value(), self.courier_box.value(), self.note_edit.toPlainText())
+                self.courier_box.value(), self.note_edit.toPlainText(),
+                revenue=self.revenue_box.value(), flowers=self.flowers_box.value(),
+                terminal=self.terminal_box.value(), qr=self.qr_box.value(),
+                deliveries=self.delivery_box.value())
         except UserError as e:
             QMessageBox.warning(self, "Сдача смены", str(e))
             return
+        if water_now:
+            self.db.mark_water(self.shift.day, self.shift.user_id, datetime.now())
         super().accept()
 
 
@@ -308,22 +394,26 @@ class CashOpDialog(QDialog):
         super().accept()
 
 
-CABINET_HEADERS = ["Смена", "Сотрудник", "Открыта", "Сдана", "Статус", "Приняли", "При приёме",
-                   "Продажи нал.", "За доставки", "Курьерам", "Расходы", "Изъятия",
-                   "Должно быть", "Сдали", "Касса", "Комментарий"]
-MONEY_COLS = {5, 7, 8, 9, 10, 11, 12, 13}
+CABINET_HEADERS = ["Смена", "Сотрудник", "Открыта", "Сдана", "Статус",
+                   "Приход", "Цветы", "Терминал", "QR-код", "Наличные", "Доставки",
+                   "Приняли", "При приёме", "Курьерам", "Расходы", "Изъятия",
+                   "Должно быть", "Сдали", "Касса", "Вода", "Комментарий"]
+(C_STATUS, C_HANDOVER, C_CASH, C_WATER, C_NOTE) = (4, 12, 18, 19, 20)
+MONEY_COLS = {5, 6, 7, 8, 9, 10, 11, 13, 14, 15, 16, 17}
+WATER_TEXT = {"done": ("поменяли", GREEN), "missed": ("не поменяли", RED), "planned": ("надо поменять", ORANGE)}
 
 
 class CabinetDialog(QDialog):
     """Личный кабинет: смены и итоги за месяц. Админ может смотреть любого сотрудника или всех."""
 
-    def __init__(self, parent, db: Database, user: User, change: time, grace: int, year: int, month: int):
+    def __init__(self, parent, db: Database, user: User, change: time, grace: int, year: int, month: int,
+                 water: WaterSchedule | None = None):
         super().__init__(parent)
-        self.db, self.user, self.change, self.grace = db, user, change, grace
+        self.db, self.user, self.change, self.grace, self.water = db, user, change, grace, water
         self.year, self.month = year, month
         self.shifts: list[Shift] = []
         self.setWindowTitle("Личный кабинет")
-        self.resize(1440, 640)
+        self.resize(1500, 660)
         layout = QVBoxLayout(self)
 
         top = QHBoxLayout()
@@ -386,12 +476,14 @@ class CabinetDialog(QDialog):
 
     def refresh(self):
         self.month_label.setText(f"<b>{MONTHS[self.month - 1]} {self.year}</b>")
-        last = calendar.monthrange(self.year, self.month)[1]
-        self.shifts = self.db.shifts_between(date(self.year, self.month, 1),
-                                             date(self.year, self.month, last),
-                                             self.person_box.currentData())
+        first = date(self.year, self.month, 1)
+        last = date(self.year, self.month, calendar.monthrange(self.year, self.month)[1])
+        self.shifts = self.db.shifts_between(first, last, self.person_box.currentData())
+        waters = self.db.water_changes_between(first, last)
         now = datetime.now()
-        stats = {"sold": 0, "short": 0, "extra": 0, "late": 0, "not_closed": 0, "handover": 0}
+        totals = dict.fromkeys(("revenue", "flowers", "terminal", "qr", "cash"), 0)
+        stats = {"short": 0, "extra": 0, "late": 0, "not_closed": 0, "handover": 0,
+                 "water_days": 0, "water_done": 0}
 
         self.table.setRowCount(len(self.shifts))
         for row, s in enumerate(self.shifts):
@@ -400,51 +492,79 @@ class CabinetDialog(QDialog):
             handover = self.db.handover_difference(s)
             closed = s.closed_at is not None
             if closed:
-                stats["sold"] += s.cash_sales
+                totals["revenue"] += s.revenue
+                totals["flowers"] += s.flowers
+                totals["terminal"] += s.terminal
+                totals["qr"] += s.qr
+                totals["cash"] += s.cash_sales
             if diff:
                 stats["short" if diff < 0 else "extra"] += abs(diff)
             if status in ("late", "not_closed"):
                 stats[status] += 1
             if handover:
                 stats["handover"] += 1
+            water = self.water.status(s.day, s.day in waters, now, self.change) if self.water else None
+            if water is not None:
+                stats["water_days"] += 1
+                stats["water_done"] += water == "done"
+
+            def m(value: int) -> str:
+                return money(value) if closed else ""
 
             start, end = window(s.day, self.change)
             cells = [
                 f"{start:%d.%m} → {end:%d.%m}", s.user_name or "—", fmt_dt(s.opened_at),
-                fmt_dt(s.closed_at), STATUS_TEXT[status], money(s.opening_cash),
-                diff_text(handover) if handover is not None else "",
-                money(s.cash_sales) if closed else "", money(s.delivery_cash) if closed else "",
-                money(s.courier_cash) if closed else "", money(s.expenses), money(s.withdrawals),
-                money(s.expected_cash()) if closed else "",
-                money(s.closing_cash) if closed else "", diff_text(diff), " ".join(s.note.split()),
+                fmt_dt(s.closed_at), STATUS_TEXT[status],
+                m(s.revenue), m(s.flowers), m(s.terminal), m(s.qr), m(s.cash_sales), m(s.deliveries),
+                money(s.opening_cash), diff_text(handover) if handover is not None else "",
+                m(s.courier_cash), money(s.expenses), money(s.withdrawals),
+                m(s.expected_cash()), m(s.closing_cash or 0), diff_text(diff),
+                WATER_TEXT[water][0] if water else "", " ".join(s.note.split()),
             ]
             for col, text in enumerate(cells):
                 item = QTableWidgetItem(text)
                 if col in MONEY_COLS:
                     item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-                if col == 4 and status in PROBLEM_STATUSES:
+                if col == C_STATUS and status in PROBLEM_STATUSES:
                     item.setForeground(QColor(ORANGE if status == "closing" else RED))
-                if col == 6 and handover:
+                if col == C_HANDOVER and handover:
                     item.setForeground(QColor(RED))
-                if col == 14:
+                if col == C_CASH:
                     item.setForeground(QColor(diff_color(diff)))
-                if col == 15 and s.note:
+                if col == C_WATER and water:
+                    item.setForeground(QColor(WATER_TEXT[water][1]))
+                    if s.day in waters:
+                        who, when = waters[s.day]
+                        item.setToolTip(f"Отметил(а) {who or '—'} {when:%d.%m %H:%M}")
+                if col == C_NOTE and s.note:
                     item.setToolTip(s.note)
                 self.table.setItem(row, col, item)
 
         parts = [f"Смен: <b>{len(self.shifts)}</b>",
-                 f"Продано наличными: <b>{money(stats['sold'])}</b>"]
+                 f"Приход: <b>{money(totals['revenue'])}</b>",
+                 f"Цветы: <b>{money(totals['flowers'])}</b>",
+                 f"Терминал: <b>{money(totals['terminal'])}</b>",
+                 f"QR-код: <b>{money(totals['qr'])}</b>",
+                 f"Наличные: <b>{money(totals['cash'])}</b>"]
+        problems = []
         if stats["short"]:
-            parts.append(f"<span style='color:{RED}'>Недостача: <b>{money(stats['short'])}</b></span>")
+            problems.append(f"<span style='color:{RED}'>Недостача: <b>{money(stats['short'])}</b></span>")
         if stats["extra"]:
-            parts.append(f"Излишек: <b>{money(stats['extra'])}</b>")
+            problems.append(f"Излишек: <b>{money(stats['extra'])}</b>")
         if stats["handover"]:
-            parts.append(f"<span style='color:{RED}'>Не сошлось при приёме: <b>{stats['handover']}</b></span>")
+            problems.append(f"<span style='color:{RED}'>Не сошлось при приёме: <b>{stats['handover']}</b></span>")
         if stats["late"]:
-            parts.append(f"<span style='color:{RED}'>Сдано с опозданием: <b>{stats['late']}</b></span>")
+            problems.append(f"<span style='color:{RED}'>Сдано с опозданием: <b>{stats['late']}</b></span>")
         if stats["not_closed"]:
-            parts.append(f"<span style='color:{RED}'>Не сдано: <b>{stats['not_closed']}</b></span>")
-        self.summary.setText(" &nbsp;·&nbsp; ".join(parts))
+            problems.append(f"<span style='color:{RED}'>Не сдано: <b>{stats['not_closed']}</b></span>")
+        if stats["water_days"]:
+            color = GREEN if stats["water_done"] == stats["water_days"] else RED
+            problems.append(f"<span style='color:{color}'>💧 Вода: поменяли <b>{stats['water_done']}</b> "
+                            f"из {stats['water_days']}</span>")
+        text = " &nbsp;·&nbsp; ".join(parts)
+        if problems:
+            text += "<br>" + " &nbsp;·&nbsp; ".join(problems)
+        self.summary.setText(text)
         self._show_ops()
 
     def _show_ops(self):

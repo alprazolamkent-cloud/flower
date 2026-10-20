@@ -50,8 +50,34 @@ def delivery_business_day(d, change: time) -> date:
 
 def expected_cash(opening: int, cash_sales: int, delivery_cash: int, courier_cash: int,
                   expenses: int, withdrawals: int) -> int:
-    """Сколько наличных должно быть в кассе в конце смены."""
+    """Сколько наличных должно быть в кассе в конце смены.
+
+    delivery_cash — только у старых смен: за доставку платят переводом или по QR, в кассу это не идёт.
+    """
     return opening + cash_sales + delivery_cash - courier_cash - expenses - withdrawals
+
+
+def revenue_mismatch(revenue: int, cash_sales: int, terminal: int, qr: int) -> int:
+    """Приход − (наличные + терминал + QR): не 0 — где-то ошиблись или были переводы."""
+    return revenue - (cash_sales + terminal + qr)
+
+
+@dataclass
+class WaterSchedule:
+    """Вода меняется раз в every дней, начиная с anchor (смена anchor — день замены)."""
+    anchor: date
+    every: int = 2
+
+    def is_water_day(self, day: date) -> bool:
+        return (day - self.anchor).days % max(self.every, 1) == 0
+
+    def status(self, day: date, done: bool, now: datetime, change: time) -> str | None:
+        """None — не день воды (или до начала учёта); done — поменяли; missed — не поменяли; planned."""
+        if day < self.anchor or not self.is_water_day(day):
+            return None
+        if done:
+            return "done"
+        return "missed" if now >= window(day, change)[1] else "planned"
 
 
 def short_name(name: str) -> str:
@@ -78,10 +104,15 @@ class Shift:
     opening_cash: int
     closed_at: datetime | None = None
     closing_cash: int | None = None
-    cash_sales: int = 0
-    delivery_cash: int = 0
+    cash_sales: int = 0  # продажи наличными из Hoog
+    delivery_cash: int = 0  # только у старых смен
     courier_cash: int = 0
     note: str = ""
+    revenue: int = 0  # приход: вся выручка за смену любыми способами
+    flowers: int = 0  # из прихода — цветы
+    terminal: int = 0  # оплаты картой
+    qr: int = 0  # оплаты по QR-коду
+    deliveries: int = 0  # взяли за доставки (перевод / QR), в кассу не идёт
     expenses: int = 0
     withdrawals: int = 0
 

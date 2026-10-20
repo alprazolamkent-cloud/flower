@@ -4,7 +4,8 @@ from datetime import date, datetime, timedelta
 
 from PySide6.QtCore import QDate, QLocale, QSettings, Qt, QTimer, QUrl
 from PySide6.QtGui import (
-    QAction, QBrush, QColor, QDesktopServices, QFont, QKeySequence, QShortcut, QTextCharFormat,
+    QAction, QBrush, QColor, QDesktopServices, QFont, QKeySequence, QPainter, QPen, QShortcut,
+    QTextCharFormat,
 )
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCalendarWidget, QDialog,
@@ -17,9 +18,9 @@ from .db import Database, Delivery, Totals, User
 from .delivery_dialog import DeliveryDialog, money
 from .icon import flower_icon
 from .messaging import KINDS, SHORT, build_action, render
-from .settings_dialog import SettingsDialog, grace_minutes, lead_minutes, shift_change
+from .settings_dialog import SettingsDialog, grace_minutes, lead_minutes, shift_change, water_schedule
 from .shift_dialogs import CabinetDialog, CashOpDialog, CloseShiftDialog, StartShiftDialog, fmt_dt
-from .shifts import PROBLEM_STATUSES, REMIND_BEFORE_MINUTES, Shift, short_name
+from .shifts import PROBLEM_STATUSES, REMIND_BEFORE_MINUTES, Shift, business_day, short_name, window
 from .templates_dialog import load_templates
 from .update_ui import UpdateController
 from .reminders import due_reminders, reminder_key
@@ -46,6 +47,8 @@ REMINDER_CHECK_MS = 30_000
 DELIVERED_BG = QColor("#e3f4e4")
 PENDING_DAY_BG = QColor("#ffe0b2")  # в этот день есть недоставленные
 DONE_DAY_BG = QColor("#c8e6c9")  # всё доставлено
+WATER_COLORS = {"planned": "#1e88e5", "done": "#1e88e5", "missed": "#c62828"}
+WATER_REMIND_AFTER = timedelta(hours=4)  # через сколько после начала смены напомнить про воду
 
 
 def to_date(qd: QDate) -> date:
@@ -58,9 +61,20 @@ class ShiftCalendar(QCalendarWidget):
     def __init__(self):
         super().__init__()
         self.marks: dict[date, tuple[str, bool]] = {}  # день -> (имена, есть ли проблема)
+        self.water: dict[date, str] = {}  # день смены воды -> planned / done / missed
 
     def paintCell(self, painter, rect, qdate):
         super().paintCell(painter, rect, qdate)
+        water = self.water.get(to_date(qdate))
+        if water:
+            painter.save()
+            painter.setRenderHint(QPainter.Antialiasing)
+            color = QColor("white" if qdate == self.selectedDate() else WATER_COLORS[water])
+            painter.setPen(QPen(color, 1.5))
+            painter.setBrush(color if water != "planned" else Qt.NoBrush)
+            size = max(6, min(rect.width(), rect.height()) // 6)
+            painter.drawEllipse(rect.right() - size - 4, rect.top() + 4, size, size)
+            painter.restore()
         mark = self.marks.get(to_date(qdate))
         if not mark:
             return
@@ -103,6 +117,7 @@ class MainWindow(QMainWindow):
         self.shift: Shift | None = None  # несданная смена того, кто сейчас вошёл
         self._shift_reminded: set[int] = set()
         self._shift_ended: set[int] = set()
+        self._water_reminded: set[date] = set()
         self.settings = QSettings("FlowerDeliveries", "FlowerDeliveries")
 
         self.setWindowTitle("Доставки цветов")
@@ -130,6 +145,9 @@ class MainWindow(QMainWindow):
         legend = QLabel(
             "<span style='background:#ffe0b2'>&nbsp;&nbsp;&nbsp;&nbsp;</span> есть недоставленные"
             " &nbsp; <span style='background:#c8e6c9'>&nbsp;&nbsp;&nbsp;&nbsp;</span> всё доставлено"
+            "<br><span style='color:#1e88e5'>○</span> поменять воду &nbsp; "
+            "<span style='color:#1e88e5'>●</span> воду поменяли &nbsp; "
+            "<span style='color:#c62828'>●</span> не поменяли"
         )
         left.addWidget(legend)
 
@@ -154,6 +172,14 @@ class MainWindow(QMainWindow):
         for b in (self.shift_btn, self.cash_btn, cabinet_btn):
             shift_buttons.addWidget(b)
         shift_layout.addLayout(shift_buttons)
+        water_row = QHBoxLayout()
+        self.water_label = QLabel()
+        self.water_btn = QPushButton("💧 Вода поменяна")
+        self.water_btn.setToolTip("Отметить, что воду в вёдрах поменяли")
+        self.water_btn.clicked.connect(self.mark_water)
+        water_row.addWidget(self.water_label, 1)
+        water_row.addWidget(self.water_btn)
+        shift_layout.addLayout(water_row)
         left.addWidget(self.shift_box)
 
         self.month_box = QGroupBox()
@@ -310,7 +336,7 @@ class MainWindow(QMainWindow):
                     self, "Сдача смены",
                     f"Смена закончилась в {pending.end(change):%H:%M}. Сдайте её до "
                     f"{pending.deadline(change, grace):%H:%M} — иначе она будет отмечена как не сданная.")
-                if CloseShiftDialog(self, self.db, pending, change, grace).exec() != QDialog.Accepted:
+                if CloseShiftDialog(self, self.db, pending, change, grace, water_schedule()).exec() != QDialog.Accepted:
                     if self.user.is_admin:
                         self.shift = pending
                         return True
@@ -335,6 +361,7 @@ class MainWindow(QMainWindow):
         return True
 
     def update_shift_box(self):
+        self._update_water_row()
         if self.user is None:
             self.shift_label.setText("")
             return
@@ -357,6 +384,33 @@ class MainWindow(QMainWindow):
         self.shift_btn.setVisible(True)
         self.cash_btn.setEnabled(True)
 
+    def _water_day(self) -> date:
+        """Смена, для которой показываем воду: текущая смена сотрудника или идущая сейчас."""
+        if self.shift is not None:
+            return self.shift.day
+        return business_day(datetime.now(), shift_change())
+
+    def _update_water_row(self):
+        day = self._water_day()
+        if self.user is None or not water_schedule().is_water_day(day):
+            self.water_label.setText("")
+            self.water_btn.setVisible(False)
+            return
+        done = self.db.water_change(day)
+        if done:
+            who, when = done
+            self.water_label.setText(f"<span style='color:#1e88e5'>💧 Вода поменяна</span> — "
+                                     f"{who or '—'}, {when:%H:%M}")
+            self.water_btn.setVisible(False)
+        else:
+            self.water_label.setText("<b style='color:#1e88e5'>💧 Сегодня день смены воды</b>")
+            self.water_btn.setVisible(self.shift is not None or self.user.is_admin)
+
+    def mark_water(self):
+        self.db.mark_water(self._water_day(), self.user.id, datetime.now())
+        self.update_shift_box()
+        self.refresh_month()
+
     def toggle_shift(self):
         if self.shift is None:
             self.start_shift()
@@ -377,7 +431,7 @@ class MainWindow(QMainWindow):
             self.shift = None
             self.update_shift_box()
             return
-        if CloseShiftDialog(self, self.db, self.shift, change, grace).exec() != QDialog.Accepted:
+        if CloseShiftDialog(self, self.db, self.shift, change, grace, water_schedule()).exec() != QDialog.Accepted:
             return
         self.shift = None
         self.refresh_month()
@@ -394,7 +448,7 @@ class MainWindow(QMainWindow):
 
     def open_cabinet(self):
         CabinetDialog(self, self.db, self.user, shift_change(), grace_minutes(),
-                      self.calendar.yearShown(), self.calendar.monthShown()).exec()
+                      self.calendar.yearShown(), self.calendar.monthShown(), water_schedule()).exec()
 
     def check_shift(self):
         """Напомнить о скорой пересменке, а в пересменку вывести сотрудника из программы."""
@@ -408,6 +462,12 @@ class MainWindow(QMainWindow):
             self.tray.showMessage("Скоро пересменка",
                                   f"Смена заканчивается в {end:%H:%M}. Сдайте смену: кнопка «Сдать смену».",
                                   QSystemTrayIcon.Warning, 60_000)
+        start = window(self.shift.day, change)[0]
+        if now >= start + WATER_REMIND_AFTER and self.shift.day not in self._water_reminded \
+                and water_schedule().is_water_day(self.shift.day) and not self.db.water_change(self.shift.day):
+            self._water_reminded.add(self.shift.day)
+            self.tray.showMessage("Смена воды", "Сегодня день смены воды. Поменяйте воду и отметьте "
+                                  "кнопкой «💧 Вода поменяна».", QSystemTrayIcon.Information, 60_000)
         if now >= end and self.shift.id not in self._shift_ended \
                 and QApplication.activeModalWidget() is None:
             self._shift_ended.add(self.shift.id)
@@ -547,6 +607,16 @@ class MainWindow(QMainWindow):
                    or bool(s.difference()) or bool(self.db.handover_difference(s)))
             problems[s.day] = problems.get(s.day, False) or (show_problems and bad)
         self.calendar.marks = {d: (", ".join(n), problems[d]) for d, n in names.items()}
+
+        schedule = water_schedule()
+        done = self.db.water_changes_between(first, last)
+        self.calendar.water = {}
+        day = first
+        while day <= last:
+            status = schedule.status(day, day in done, now, change)
+            if status:
+                self.calendar.water[day] = status
+            day += timedelta(days=1)
         self.calendar.updateCells()
 
     def refresh_day(self):

@@ -5,7 +5,9 @@ from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 
 from .auth import hash_password, verify_password
-from .shifts import KIND_TEXT, CashOp, Shift, delivery_business_day, opening_business_day
+from .shifts import (
+    KIND_TEXT, CashOp, Shift, delivery_business_day, opening_business_day,
+)
 
 
 @dataclass
@@ -103,14 +105,26 @@ CREATE TABLE IF NOT EXISTS cash_ops (
     created_by INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_cash_ops_shift ON cash_ops(shift_id);
+CREATE TABLE IF NOT EXISTS water_changes (
+    day        TEXT PRIMARY KEY,
+    user_id    INTEGER,
+    changed_at TEXT NOT NULL
+);
 """
+
+# Столбцы смен, добавленные позже.
+SHIFT_MIGRATIONS = {
+    column: f"ALTER TABLE shifts ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0"
+    for column in ("revenue", "flowers", "terminal", "qr", "deliveries")
+}
 
 SHIFT_SELECT = """
 SELECT s.id, s.user_id, COALESCE(NULLIF(u.name, ''), u.login, ''), s.day, s.opened_at,
        s.opening_cash, s.closed_at, s.closing_cash, s.cash_sales, s.delivery_cash,
        s.courier_cash, s.note,
        COALESCE((SELECT SUM(amount) FROM cash_ops c WHERE c.shift_id = s.id AND c.kind = 'expense'), 0),
-       COALESCE((SELECT SUM(amount) FROM cash_ops c WHERE c.shift_id = s.id AND c.kind = 'withdrawal'), 0)
+       COALESCE((SELECT SUM(amount) FROM cash_ops c WHERE c.shift_id = s.id AND c.kind = 'withdrawal'), 0),
+       s.revenue, s.flowers, s.terminal, s.qr, s.deliveries
 FROM shifts s LEFT JOIN users u ON u.id = s.user_id
 """
 
@@ -125,7 +139,8 @@ def _row_to_shift(r) -> Shift:
         opened_at=datetime.fromisoformat(r[4]), opening_cash=r[5],
         closed_at=datetime.fromisoformat(r[6]) if r[6] else None, closing_cash=r[7],
         cash_sales=r[8], delivery_cash=r[9], courier_cash=r[10], note=r[11],
-        expenses=r[12], withdrawals=r[13],
+        expenses=r[12], withdrawals=r[13], revenue=r[14], flowers=r[15], terminal=r[16], qr=r[17],
+        deliveries=r[18],
     )
 
 # Столбцы, добавленные после первой версии: старые базы дополняются при запуске.
@@ -178,6 +193,10 @@ class Database:
         self.conn.executescript(SCHEMA)
         existing = {r[1] for r in self.conn.execute("PRAGMA table_info(deliveries)")}
         for column, sql in MIGRATIONS.items():
+            if column not in existing:
+                self.conn.execute(sql)
+        existing = {r[1] for r in self.conn.execute("PRAGMA table_info(shifts)")}
+        for column, sql in SHIFT_MIGRATIONS.items():
             if column not in existing:
                 self.conn.execute(sql)
         self.conn.commit()
@@ -332,6 +351,7 @@ class Database:
         self.conn.execute("UPDATE deliveries SET delivered_by=NULL WHERE delivered_by=?", (user_id,))
         self.conn.execute("UPDATE shifts SET user_id=NULL WHERE user_id=?", (user_id,))
         self.conn.execute("UPDATE cash_ops SET created_by=NULL WHERE created_by=?", (user_id,))
+        self.conn.execute("UPDATE water_changes SET user_id=NULL WHERE user_id=?", (user_id,))
         self.conn.execute("DELETE FROM users WHERE id=?", (user_id,))
         self.conn.commit()
 
@@ -370,13 +390,17 @@ class Database:
         return _row_to_shift(row) if row else None
 
     def close_shift(self, shift_id: int, now: datetime, closing_cash: int, cash_sales: int,
-                    delivery_cash: int, courier_cash: int, note: str = "") -> Shift:
-        if min(closing_cash, cash_sales, delivery_cash, courier_cash) < 0:
+                    courier_cash: int, note: str = "", revenue: int = 0, flowers: int = 0,
+                    terminal: int = 0, qr: int = 0, deliveries: int = 0) -> Shift:
+        if min(closing_cash, cash_sales, courier_cash, revenue, flowers, terminal, qr, deliveries) < 0:
             raise UserError("Суммы не могут быть отрицательными.")
+        if flowers > revenue:
+            raise UserError("Цветов не может быть продано больше, чем весь приход.")
         cur = self.conn.execute(
-            "UPDATE shifts SET closed_at=?, closing_cash=?, cash_sales=?, delivery_cash=?,"
-            " courier_cash=?, note=? WHERE id=? AND closed_at IS NULL",
-            (_ts(now), closing_cash, cash_sales, delivery_cash, courier_cash, note.strip(), shift_id),
+            "UPDATE shifts SET closed_at=?, closing_cash=?, cash_sales=?, delivery_cash=0, courier_cash=?,"
+            " note=?, revenue=?, flowers=?, terminal=?, qr=?, deliveries=? WHERE id=? AND closed_at IS NULL",
+            (_ts(now), closing_cash, cash_sales, courier_cash, note.strip(), revenue, flowers,
+             terminal, qr, deliveries, shift_id),
         )
         self.conn.commit()
         if cur.rowcount == 0:
@@ -444,3 +468,24 @@ class Database:
         candidates = self.for_day(day) + self.for_day(day + timedelta(days=1))
         own = [d for d in candidates if delivery_business_day(d, change) == day]
         return sum(d.price for d in own), sum(d.courier_pay for d in own)
+
+    # ----- смена воды -----
+
+    def mark_water(self, day: date, user_id: int | None, now: datetime):
+        self.conn.execute(
+            "INSERT OR IGNORE INTO water_changes (day, user_id, changed_at) VALUES (?, ?, ?)",
+            (day.isoformat(), user_id, _ts(now)),
+        )
+        self.conn.commit()
+
+    def water_changes_between(self, first: date, last: date) -> dict[date, tuple[str, datetime]]:
+        """День смены -> (кто поменял, когда)."""
+        rows = self.conn.execute(
+            "SELECT w.day, COALESCE(NULLIF(u.name, ''), u.login, ''), w.changed_at"
+            " FROM water_changes w LEFT JOIN users u ON u.id = w.user_id"
+            " WHERE w.day BETWEEN ? AND ?", (first.isoformat(), last.isoformat()),
+        ).fetchall()
+        return {date.fromisoformat(r[0]): (r[1], datetime.fromisoformat(r[2])) for r in rows}
+
+    def water_change(self, day: date) -> tuple[str, datetime] | None:
+        return self.water_changes_between(day, day).get(day)
