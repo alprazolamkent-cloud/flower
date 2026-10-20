@@ -4,11 +4,12 @@ from datetime import date
 
 from PySide6.QtCore import QDate
 from PySide6.QtWidgets import (
-    QCheckBox, QDateEdit, QDialog, QDialogButtonBox, QFormLayout, QLabel,
+    QCheckBox, QComboBox, QDateEdit, QDialog, QDialogButtonBox, QFormLayout, QLabel,
     QLineEdit, QMessageBox, QPlainTextEdit, QSpinBox,
 )
 
 from .db import Delivery
+from .messaging import CHANNELS
 
 MAX_MONEY = 10_000_000
 
@@ -62,6 +63,19 @@ class DeliveryDialog(QDialog):
         self.address_edit = QLineEdit(delivery.address)
         form.addRow("Адрес:", self.address_edit)
 
+        self.source_box = QComboBox()
+        self.source_box.addItem("— не указано —", "")
+        for channel in CHANNELS:
+            self.source_box.addItem(channel, channel)
+        index = self.source_box.findData(delivery.source)
+        self.source_box.setCurrentIndex(max(index, 0))
+        self.source_box.currentIndexChanged.connect(self._update_contact_hint)
+        form.addRow("Откуда заказ:", self.source_box)
+
+        self.contact_edit = QLineEdit(delivery.customer_contact)
+        form.addRow("Контакт заказчика:", self.contact_edit)
+        self._update_contact_hint()
+
         self.price_box = _money_box()
         self.price_box.setValue(delivery.price)
         form.addRow("Взяли с покупателя:", self.price_box)
@@ -87,6 +101,16 @@ class DeliveryDialog(QDialog):
         buttons.rejected.connect(self.reject)
         form.addRow(buttons)
 
+    def _update_contact_hint(self):
+        hints = {
+            "WhatsApp": "номер телефона, например +7 900 123-45-67",
+            "Telegram": "логин @имя (тогда текст подставится сам) или ссылка на чат",
+            "ВКонтакте": "ссылка на страницу, короткое имя или id",
+            "Макс": "ссылка на чат (скопируйте из адресной строки)",
+        }
+        self.contact_edit.setPlaceholderText(
+            hints.get(self.source_box.currentData(), "телефон, логин или ссылка заказчика"))
+
     def _update_remainder(self):
         rest = self.price_box.value() - self.courier_box.value()
         color = "#c62828" if rest < 0 else "#2e7d32"
@@ -104,6 +128,8 @@ class DeliveryDialog(QDialog):
         d.recipient = self.recipient_edit.text().strip()
         d.phone = self.phone_edit.text().strip()
         d.address = self.address_edit.text().strip()
+        d.source = self.source_box.currentData() or ""
+        d.customer_contact = self.contact_edit.text().strip()
         d.price = self.price_box.value()
         d.courier_pay = self.courier_box.value()
         d.delivered = self.delivered_check.isChecked()

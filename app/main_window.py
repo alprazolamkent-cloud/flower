@@ -3,8 +3,8 @@
 import sys
 from datetime import date, datetime, timedelta
 
-from PySide6.QtCore import QDate, QLocale, QSettings, Qt, QTimer
-from PySide6.QtGui import QAction, QBrush, QColor, QFont, QKeySequence, QShortcut, QTextCharFormat
+from PySide6.QtCore import QDate, QLocale, QSettings, Qt, QTimer, QUrl
+from PySide6.QtGui import QAction, QBrush, QDesktopServices, QColor, QFont, QKeySequence, QShortcut, QTextCharFormat
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCalendarWidget, QCheckBox, QDialog, QFormLayout,
     QGroupBox, QHBoxLayout, QHeaderView, QLabel, QMainWindow, QMenu, QMessageBox,
@@ -15,6 +15,8 @@ from PySide6.QtWidgets import (
 from .db import Database, Delivery, Totals, User
 from .delivery_dialog import DeliveryDialog, money
 from .icon import flower_icon
+from .messaging import KINDS, SHORT, build_action, render
+from .templates_dialog import TemplatesDialog, load_templates
 from .reminders import due_reminders, reminder_key
 from .users_dialog import LoginDialog, PasswordDialog, UserFormDialog, UsersDialog
 
@@ -29,9 +31,10 @@ MONTHS = [
 WEEKDAYS = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
 
 HEADERS = ["✓", "Время", "Что доставить", "Кому", "Телефон", "Адрес",
-           "Взяли", "Курьеру", "Осталось", "Добавил", "Отметил"]
+           "Взяли", "Курьеру", "Осталось", "Заказчик", "Писали", "Добавил", "Отметил"]
 COL_DONE, COL_TIME, COL_ITEMS, COL_RECIPIENT, COL_PHONE, COL_ADDRESS, \
-    COL_PRICE, COL_COURIER, COL_REST, COL_CREATED_BY, COL_DELIVERED_BY = range(len(HEADERS))
+    COL_PRICE, COL_COURIER, COL_REST, COL_CUSTOMER, COL_MESSAGES, \
+    COL_CREATED_BY, COL_DELIVERED_BY = range(len(HEADERS))
 
 REMINDER_CHECK_MS = 30_000
 DEFAULT_LEAD_MINUTES = 20
@@ -72,7 +75,7 @@ class MainWindow(QMainWindow):
 
         self.setWindowTitle("Доставки цветов")
         self.setWindowIcon(flower_icon())
-        self.resize(1280, 720)
+        self.resize(1440, 720)
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -143,7 +146,17 @@ class MainWindow(QMainWindow):
         self.edit_btn.clicked.connect(self.edit_delivery)
         self.delete_btn = QPushButton("🗑 Удалить")
         self.delete_btn.clicked.connect(self.delete_delivery)
-        for b in (add_btn, self.edit_btn, self.delete_btn):
+        self.write_btn = QPushButton("💬 Написать заказчику")
+        self.write_btn.setToolTip("Сообщение заказчику в его мессенджер")
+        write_menu = QMenu(self.write_btn)
+        for kind, title in KINDS.items():
+            action = write_menu.addAction(title)
+            action.triggered.connect(lambda _=False, k=kind: self.write_to_customer(k))
+        write_menu.addSeparator()
+        self.templates_action = write_menu.addAction("✏️ Изменить тексты сообщений…")
+        self.templates_action.triggered.connect(self.edit_templates)
+        self.write_btn.setMenu(write_menu)
+        for b in (add_btn, self.edit_btn, self.delete_btn, self.write_btn):
             b.setMinimumHeight(32)
             buttons.addWidget(b)
         buttons.addStretch(1)
@@ -279,6 +292,7 @@ class MainWindow(QMainWindow):
         role = "админ" if user.is_admin else "сотрудник"
         self.user_label.setText(f"Вы вошли: <b>{user.name or user.login}</b> ({role})")
         self.users_btn.setVisible(user.is_admin)
+        self.templates_action.setVisible(user.is_admin)
 
     def logout(self):
         self.set_user(None)
@@ -404,6 +418,11 @@ class MainWindow(QMainWindow):
                 COL_PRICE: QTableWidgetItem(money(d.price)),
                 COL_COURIER: QTableWidgetItem(money(d.courier_pay)),
                 COL_REST: QTableWidgetItem(money(d.remainder)),
+                COL_CUSTOMER: QTableWidgetItem(
+                    f"{d.source}: {d.customer_contact}" if d.source and d.customer_contact
+                    else (d.customer_contact or d.source)),
+                COL_MESSAGES: QTableWidgetItem(
+                    " · ".join(SHORT[k] for k in KINDS if d.sent(k))),
                 COL_CREATED_BY: QTableWidgetItem(d.created_by_name),
                 COL_DELIVERED_BY: QTableWidgetItem(d.delivered_by_name if d.delivered else ""),
             }
@@ -429,6 +448,7 @@ class MainWindow(QMainWindow):
         has = self.current_delivery() is not None
         self.edit_btn.setEnabled(has)
         self.delete_btn.setEnabled(has)
+        self.write_btn.setEnabled(has)
 
     # ----- действия -----
 
@@ -442,8 +462,38 @@ class MainWindow(QMainWindow):
         if self._loading or item.column() != COL_DONE:
             return
         d = self.deliveries[item.row()]
-        self.db.set_delivered(d.id, item.checkState() == Qt.Checked, self.user.id)
+        delivered = item.checkState() == Qt.Checked
+        self.db.set_delivered(d.id, delivered, self.user.id)
         self.refresh_all()
+        if delivered and d.customer_contact and not d.sent("delivered"):
+            QTimer.singleShot(0, lambda: self._offer_delivered_message(d))
+
+    def _offer_delivered_message(self, d: Delivery):
+        answer = QMessageBox.question(
+            self, "Сообщить заказчику",
+            f"Написать заказчику ({d.source or d.customer_contact}), что букет доставлен?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes,
+        )
+        if answer == QMessageBox.Yes:
+            self.write_to_customer("delivered", d)
+
+    def write_to_customer(self, kind: str, delivery: Delivery | None = None):
+        d = delivery or self.current_delivery()
+        if d is None:
+            return
+        text = render(load_templates()[kind], d)
+        action = build_action(d.source, d.customer_contact, text)
+        if action.copy_text:
+            QApplication.clipboard().setText(text)
+        if action.url:
+            QDesktopServices.openUrl(QUrl(action.url))
+        if action.note:
+            QMessageBox.information(self, "Сообщение заказчику", action.note)
+        self.db.mark_message(d.id, kind)
+        self.refresh_day()
+
+    def edit_templates(self):
+        TemplatesDialog(self).exec()
 
     def _on_double_click(self, item: QTableWidgetItem):
         if item.column() != COL_DONE:

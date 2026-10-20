@@ -23,6 +23,12 @@ class Delivery:
     delivered_by: int | None = None  # id сотрудника, который отметил «Доставлено»
     created_by_name: str = ""
     delivered_by_name: str = ""
+    source: str = ""  # откуда заказ: WhatsApp, Telegram, ВК …
+    customer_contact: str = ""  # телефон, @логин или ссылка заказчика
+    messages: str = ""  # какие сообщения уже отправляли: «departed,delivered»
+
+    def sent(self, kind: str) -> bool:
+        return kind in self.messages.split(",")
 
     @property
     def remainder(self) -> int:
@@ -78,11 +84,15 @@ CREATE TABLE IF NOT EXISTS users (
 MIGRATIONS = {
     "created_by": "ALTER TABLE deliveries ADD COLUMN created_by INTEGER",
     "delivered_by": "ALTER TABLE deliveries ADD COLUMN delivered_by INTEGER",
+    "source": "ALTER TABLE deliveries ADD COLUMN source TEXT NOT NULL DEFAULT ''",
+    "customer_contact": "ALTER TABLE deliveries ADD COLUMN customer_contact TEXT NOT NULL DEFAULT ''",
+    "messages": "ALTER TABLE deliveries ADD COLUMN messages TEXT NOT NULL DEFAULT ''",
 }
 
 COLUMNS = ("d.id, d.day, d.time, d.items, d.recipient, d.phone, d.address, d.price,"
            " d.courier_pay, d.delivered, d.created_by, d.delivered_by,"
-           " COALESCE(NULLIF(uc.name, ''), uc.login, ''), COALESCE(NULLIF(ud.name, ''), ud.login, '')")
+           " COALESCE(NULLIF(uc.name, ''), uc.login, ''), COALESCE(NULLIF(ud.name, ''), ud.login, ''),"
+           " d.source, d.customer_contact, d.messages")
 FROM = ("deliveries d LEFT JOIN users uc ON uc.id = d.created_by"
         " LEFT JOIN users ud ON ud.id = d.delivered_by")
 
@@ -103,6 +113,9 @@ def _row_to_delivery(row) -> Delivery:
         delivered_by=row[11],
         created_by_name=row[12],
         delivered_by_name=row[13],
+        source=row[14],
+        customer_contact=row[15],
+        messages=row[16],
     )
 
 
@@ -126,11 +139,12 @@ class Database:
     def add(self, d: Delivery) -> int:
         cur = self.conn.execute(
             "INSERT INTO deliveries (day, time, items, recipient, phone, address,"
-            " price, courier_pay, delivered, created_by, delivered_by)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " price, courier_pay, delivered, created_by, delivered_by,"
+            " source, customer_contact, messages)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (d.day.isoformat(), d.time, d.items, d.recipient, d.phone, d.address,
              d.price, d.courier_pay, int(d.delivered), d.created_by,
-             d.delivered_by if d.delivered else None),
+             d.delivered_by if d.delivered else None, d.source, d.customer_contact, d.messages),
         )
         self.conn.commit()
         d.id = cur.lastrowid
@@ -139,10 +153,11 @@ class Database:
     def update(self, d: Delivery):
         self.conn.execute(
             "UPDATE deliveries SET day=?, time=?, items=?, recipient=?, phone=?,"
-            " address=?, price=?, courier_pay=?, delivered=?, delivered_by=? WHERE id=?",
+            " address=?, price=?, courier_pay=?, delivered=?, delivered_by=?,"
+            " source=?, customer_contact=? WHERE id=?",
             (d.day.isoformat(), d.time, d.items, d.recipient, d.phone, d.address,
              d.price, d.courier_pay, int(d.delivered),
-             d.delivered_by if d.delivered else None, d.id),
+             d.delivered_by if d.delivered else None, d.source, d.customer_contact, d.id),
         )
         self.conn.commit()
 
@@ -151,6 +166,16 @@ class Database:
             "UPDATE deliveries SET delivered=?, delivered_by=? WHERE id=?",
             (int(delivered), user_id if delivered else None, delivery_id),
         )
+        self.conn.commit()
+
+    def mark_message(self, delivery_id: int, kind: str):
+        row = self.conn.execute("SELECT messages FROM deliveries WHERE id=?", (delivery_id,)).fetchone()
+        if row is None:
+            return
+        kinds = [k for k in row[0].split(",") if k]
+        if kind not in kinds:
+            kinds.append(kind)
+        self.conn.execute("UPDATE deliveries SET messages=? WHERE id=?", (",".join(kinds), delivery_id))
         self.conn.commit()
 
     def delete(self, delivery_id: int):
