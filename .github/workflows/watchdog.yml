@@ -1,0 +1,21 @@
+name: Компьютер на связи
+
+# Каждые 10 минут: если программа в магазине давно не обновляла закреплённое сообщение — бот
+# пишет администраторам. Нужны секреты TG_TOKEN и TG_CHATS (см. README, раздел «Компьютер не на связи»).
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v4
+      - name: Проверить связь
+        env:
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+          TG_CHATS: ${{ secrets.TG_CHATS }}
+          TG_TZ: ${{ secrets.TG_TZ }}
+        run: python3 tools/watchdog.py

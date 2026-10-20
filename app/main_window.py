@@ -41,6 +41,7 @@ from .templates_dialog import load_templates
 from .theme import C
 from .update_ui import UpdateController
 from .assembly_dialog import SNOOZE, AssemblyReminder
+from .heartbeat import Heartbeat
 from .reminders import assembly_due, assembly_escalations, due_reminders, overdue_deliveries, reminder_key
 from .shift_plan import ShiftPlanDialog
 from .salary import pct, shop_writeoff
@@ -186,6 +187,9 @@ class MainWindow(QMainWindow):
         self._backup_warned: date | None = None
         self.telegram = telegram.TelegramSender(db, self)
         self.telegram.file_sent.connect(self._backup_file_sent)
+        self.heartbeat = Heartbeat(self)  # «компьютер на связи» — закреплённое сообщение для сторожа на GitHub
+        self.heartbeat.back_online.connect(
+            lambda text: self.telegram.queue(text, key=f"back:{datetime.now():%Y%m%d%H%M}"))
         self.inbox = telegram.TelegramInbox(db, self)
         self.inbox.arrived.connect(self._on_announcements)
         self.bot = BotHandler()

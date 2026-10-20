@@ -55,8 +55,21 @@ def _call(token: str, method: str, params: dict | None = None, timeout: float = 
     return payload
 
 
-def send_message(token: str, chat_id: str, text: str):
-    _call(token, "sendMessage", {"chat_id": chat_id, "text": text})
+def send_message(token: str, chat_id: str, text: str) -> int:
+    """Отправить сообщение; возвращает его номер (нужен, чтобы потом править)."""
+    return _call(token, "sendMessage", {"chat_id": chat_id, "text": text}).get("result", {}).get("message_id", 0)
+
+
+def edit_message(token: str, chat_id: str, message_id: int, text: str):
+    try:
+        _call(token, "editMessageText", {"chat_id": chat_id, "message_id": message_id, "text": text})
+    except TelegramError as e:
+        if "not modified" not in str(e):  # тот же текст — не ошибка
+            raise
+
+
+def pin_message(token: str, chat_id: str, message_id: int):
+    _call(token, "pinChatMessage", {"chat_id": chat_id, "message_id": message_id, "disable_notification": "true"})
 
 
 MAX_FILE = 49 * 1024 * 1024  # бот может отправить файл до 50 МБ

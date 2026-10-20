@@ -20,6 +20,7 @@ from .duties_dialog import DutiesEditor
 from .salary import DEFAULT_PENALTY_KINDS, WRITEOFF_BASES, PenaltyKind, SalaryRules, Tier
 from .holidays import DEFAULT_TEXT as DEFAULT_HOLIDAYS
 from .holidays import Holidays, parse_holidays
+from .heartbeat import watch_enabled
 from .reports import parse_time
 from .salary_dialog import EmployeeTiersDialog, HolidaysDialog, PenaltyCatalogEditor, TiersEditor
 from .shifts import DEFAULT_CHANGE, DEFAULT_GRACE_MINUTES, WaterSchedule
@@ -569,6 +570,13 @@ class SettingsDialog(QDialog):
         self.tg_close = QCheckBox("Присылать итоги смены при сдаче")
         self.tg_close.setChecked(cfg["on_close"])
         form.addRow(self.tg_close)
+        self.tg_watch = QCheckBox("Следить, что компьютер на связи (пропала больше чем на 10 минут — "
+                                  "сообщение каждые 10 минут)")
+        self.tg_watch.setChecked(watch_enabled())
+        form.addRow(self.tg_watch)
+        form.addRow(_gray_label("Программа держит в чате закреплённое сообщение «на связи» и обновляет его.\n"
+                                "Следит за ним GitHub — один раз добавьте там секреты TG_TOKEN и TG_CHATS\n"
+                                "(инструкция в README, раздел «Компьютер не на связи»)."))
         form.addRow(_gray_label("О проблемах (несданная смена, расхождение кассы при приёме) бот пишет всегда.\n"
                                 "Нет интернета — сообщения дождутся связи и уйдут позже.\n"
                                 "Объявление сотрудникам: напишите боту сообщение, начиная с «!».\n"
@@ -782,6 +790,7 @@ class SettingsDialog(QDialog):
             ("чаты Telegram", ", ".join(old_tg["chats"]), ", ".join(telegram.chat_ids(self.chat_edit.text())), False),
             ("сообщать о начале смены", old_tg["on_start"], self.tg_start.isChecked(), False),
             ("итоги при сдаче", old_tg["on_close"], self.tg_close.isChecked(), False),
+            ("следить за связью", watch_enabled(), self.tg_watch.isChecked(), False),
             ("флешка / папка для копий", backup_dir(), self.backup_edit.text().strip(), False),
             ("хранить копий", backup_keep(), self.keep_box.value(), False),
         ]
@@ -828,6 +837,8 @@ class SettingsDialog(QDialog):
         settings.setValue("tg_chat_id", ", ".join(telegram.chat_ids(self.chat_edit.text())))
         settings.setValue("tg_on_start", _bool(self.tg_start.isChecked()))
         settings.setValue("tg_on_close", _bool(self.tg_close.isChecked()))
+        settings.setValue("tg_watch", _bool(self.tg_watch.isChecked()))
+        QTimer.singleShot(0, self.main.heartbeat.beat)  # сразу обновить (или поставить на паузу) сообщение
         settings.setValue("backup_dir", self.backup_edit.text().strip())
         settings.setValue("backup_keep", self.keep_box.value())
         if sys.platform == "win32":
