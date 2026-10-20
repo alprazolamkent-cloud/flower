@@ -1,14 +1,13 @@
 """Главное окно: календарь на месяц и список доставок на выбранный день."""
 
-import sys
 from datetime import date, datetime, timedelta
 
 from PySide6.QtCore import QDate, QLocale, QSettings, Qt, QTimer, QUrl
 from PySide6.QtGui import QAction, QBrush, QDesktopServices, QColor, QFont, QKeySequence, QShortcut, QTextCharFormat
 from PySide6.QtWidgets import (
-    QAbstractItemView, QApplication, QCalendarWidget, QCheckBox, QDialog, QFormLayout,
+    QAbstractItemView, QApplication, QCalendarWidget, QDialog,
     QGroupBox, QHBoxLayout, QHeaderView, QLabel, QMainWindow, QMenu, QMessageBox,
-    QPushButton, QSpinBox, QSystemTrayIcon, QTableWidget, QTableWidgetItem,
+    QPushButton, QSystemTrayIcon, QTableWidget, QTableWidgetItem,
     QVBoxLayout, QWidget,
 )
 
@@ -16,7 +15,8 @@ from .db import Database, Delivery, Totals, User
 from .delivery_dialog import DeliveryDialog, money
 from .icon import flower_icon
 from .messaging import KINDS, SHORT, build_action, render
-from .templates_dialog import TemplatesDialog, load_templates
+from .settings_dialog import SettingsDialog, lead_minutes
+from .templates_dialog import load_templates
 from .update_ui import UpdateController
 from .reminders import due_reminders, reminder_key
 from .users_dialog import LoginDialog, PasswordDialog, UserFormDialog, UsersDialog
@@ -38,9 +38,6 @@ COL_DONE, COL_TIME, COL_ITEMS, COL_RECIPIENT, COL_PHONE, COL_ADDRESS, \
     COL_CREATED_BY, COL_DELIVERED_BY = range(len(HEADERS))
 
 REMINDER_CHECK_MS = 30_000
-DEFAULT_LEAD_MINUTES = 20
-AUTOSTART_KEY = r"HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Run"
-AUTOSTART_NAME = "FlowerDeliveries"
 
 DELIVERED_BG = QColor("#e3f4e4")
 PENDING_DAY_BG = QColor("#ffe0b2")  # в этот день есть недоставленные
@@ -112,9 +109,7 @@ class MainWindow(QMainWindow):
         self.month_label.setWordWrap(True)
         month_layout.addWidget(self.month_label)
         left.addWidget(self.month_box)
-        left.addWidget(self._build_reminder_box())
         self.updater = UpdateController(self)
-        left.addWidget(self.updater.build_box())
         left.addStretch(1)
 
         # Правая часть: доставки за день
@@ -131,14 +126,14 @@ class MainWindow(QMainWindow):
         top.addWidget(self.day_title, 1)
         self.user_label = QLabel()
         top.addWidget(self.user_label)
-        self.users_btn = QPushButton("👥 Сотрудники")
-        self.users_btn.clicked.connect(self.manage_users)
+        self.settings_btn = QPushButton("⚙ Настройки")
+        self.settings_btn.clicked.connect(self.open_settings)
         password_btn = QPushButton("🔑 Сменить пароль")
         password_btn.clicked.connect(self.change_password)
         logout_btn = QPushButton("🚪 Выйти")
         logout_btn.setToolTip("Выйти из профиля, чтобы вошёл другой сотрудник")
         logout_btn.clicked.connect(self.logout)
-        for b in (self.users_btn, password_btn, logout_btn):
+        for b in (self.settings_btn, password_btn, logout_btn):
             top.addWidget(b)
         right.addLayout(top)
 
@@ -155,9 +150,6 @@ class MainWindow(QMainWindow):
         for kind, title in KINDS.items():
             action = write_menu.addAction(title)
             action.triggered.connect(lambda _=False, k=kind: self.write_to_customer(k))
-        write_menu.addSeparator()
-        self.templates_action = write_menu.addAction("✏️ Изменить тексты сообщений…")
-        self.templates_action.triggered.connect(self.edit_templates)
         self.write_btn.setMenu(write_menu)
         for b in (add_btn, self.edit_btn, self.delete_btn, self.write_btn):
             b.setMinimumHeight(32)
@@ -203,50 +195,6 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(2000, self.check_reminders)
 
     # ----- напоминания и трей -----
-
-    def _build_reminder_box(self) -> QGroupBox:
-        box = QGroupBox("Напоминания")
-        form = QFormLayout(box)
-
-        self.lead_box = QSpinBox()
-        self.lead_box.setRange(1, 180)
-        self.lead_box.setSuffix(" мин")
-        self.lead_box.setValue(int(self.settings.value("lead_minutes", DEFAULT_LEAD_MINUTES)))
-        self.lead_box.valueChanged.connect(self._on_lead_changed)
-        form.addRow("Напоминать за:", self.lead_box)
-
-        self.autostart_check = QCheckBox("Запускать вместе с Windows")
-        self.autostart_check.setVisible(sys.platform == "win32")
-        self.autostart_check.setChecked(self._autostart_enabled())
-        self.autostart_check.toggled.connect(self._set_autostart)
-        form.addRow(self.autostart_check)
-
-        hint = QLabel("Приходят, пока программа запущена. Крестик сворачивает её "
-                      "к часам, выход — через значок у часов.")
-        hint.setWordWrap(True)
-        hint.setStyleSheet("color: gray")
-        form.addRow(hint)
-        return box
-
-    def _on_lead_changed(self, value: int):
-        self.settings.setValue("lead_minutes", value)
-        self.check_reminders()
-
-    def _autostart_settings(self) -> QSettings:
-        return QSettings(AUTOSTART_KEY, QSettings.NativeFormat)
-
-    def _autostart_enabled(self) -> bool:
-        if sys.platform != "win32":
-            return False
-        return self._autostart_settings().contains(AUTOSTART_NAME)
-
-    def _set_autostart(self, enabled: bool):
-        run = self._autostart_settings()
-        if enabled:
-            run.setValue(AUTOSTART_NAME, f'"{sys.executable}" --minimized'
-                         if getattr(sys, "frozen", False) else f'"{sys.executable}" "{sys.argv[0]}" --minimized')
-        else:
-            run.remove(AUTOSTART_NAME)
 
     def _setup_tray(self):
         self.tray = QSystemTrayIcon(flower_icon(), self)
@@ -294,8 +242,7 @@ class MainWindow(QMainWindow):
             return
         role = "админ" if user.is_admin else "сотрудник"
         self.user_label.setText(f"Вы вошли: <b>{user.name or user.login}</b> ({role})")
-        self.users_btn.setVisible(user.is_admin)
-        self.templates_action.setVisible(user.is_admin)
+        self.settings_btn.setVisible(user.is_admin)
 
     def logout(self):
         self.set_user(None)
@@ -351,7 +298,7 @@ class MainWindow(QMainWindow):
         now = datetime.now()
         today = now.date()
         deliveries = self.db.for_day(today) + self.db.for_day(today + timedelta(days=1))
-        due = due_reminders(deliveries, now, self.lead_box.value(), self._reminded)
+        due = due_reminders(deliveries, now, lead_minutes(), self._reminded)
         for d in due:
             self._reminded.add(reminder_key(d))
         if not due:
@@ -496,8 +443,9 @@ class MainWindow(QMainWindow):
         self.db.mark_message(d.id, kind)
         self.refresh_day()
 
-    def edit_templates(self):
-        TemplatesDialog(self).exec()
+    def open_settings(self):
+        if self.user is not None and self.user.is_admin:
+            SettingsDialog(self).exec()
 
     def _on_double_click(self, item: QTableWidgetItem):
         if item.column() != COL_DONE:
