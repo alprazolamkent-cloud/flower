@@ -208,13 +208,14 @@ def test_reminder_window_until_assembled(window):
     db.add(d)
     w._check_assembly(now)
     assert w.assembly.isVisible() and w.assembly.ids == [d.id]
-    assert any("Букет ещё не собран" in text for text, _ in w.queued)  # за 30 минут — хозяевам
+    assert w.queued == []  # заказ только что увидели — хозяевам пока не пишем
     w.assembly.close()  # «напомнить через 10 минут»
     assert not w.assembly.isVisible()
     w._check_assembly(now + timedelta(minutes=5))
     assert not w.assembly.isVisible()  # отложено
     w._check_assembly(now + timedelta(minutes=11))
     assert w.assembly.isVisible()  # снова
+    assert any("Букет ещё не собран" in text for text, _ in w.queued)  # 10 минут проигнорировали — хозяевам
     w.assembly.assembled.emit(d.id)  # нажали «Собрано»
     assert db.get_delivery(d.id).assembled and not w.assembly.isVisible()
     assert sum("Букет ещё не собран" in text for text, _ in w.queued) == 1  # хозяевам — один раз
@@ -256,3 +257,35 @@ def test_daily_backup_to_telegram(window, monkeypatch, tmp_path):
     w._backup_attempt = None
     w._maybe_send_backup(datetime.combine(day, time(15, 0)))
     assert len(sent) == 1  # выключено в настройках
+
+
+# ----- логика после проверки -----
+
+def test_best_shift_ignores_holidays():
+    from types import SimpleNamespace
+    from app.holidays import Holidays
+    from app.salary import monthly_ranking
+    rules = SalaryRules(0, holidays=Holidays(yearly={(8, 3)}))
+    mk = lambda d, r: SimpleNamespace(day=d, revenue=r, closed_at=datetime.combine(d, time(23)), user_name="Анна")
+    ranking = monthly_ranking([mk(date(2026, 3, 8), 150000), mk(date(2026, 3, 9), 50000)], rules)
+    assert ranking.best_shift.revenue == 50000  # 8 Марта не «лучшая смена» — праздник
+
+
+def test_courier_cash_counts_only_delivered(db, app):
+    from app.shift_dialogs import CloseShiftDialog
+    anna = db.add_user("anna", "Анна", "1")
+    shift = db.open_shift(anna.id, 5000, datetime.now() - timedelta(minutes=30), CH)
+    db.add(Delivery(day=shift.day, time="10:00", courier_pay=400, delivered=True))
+    db.add(Delivery(day=shift.day, time="11:00", courier_pay=300))  # не отмечена доставленной
+    dlg = CloseShiftDialog(None, db, shift, CH, 30)
+    assert dlg.courier_box.value() == 400
+    labels = [w.text() for w in dlg.findChildren(type(dlg.check_label))]
+    assert any("Не отмечены доставленными: 1" in t and "300" in t for t in labels)
+    dlg.deleteLater()
+
+
+def test_second_shift_same_day_asks(window, monkeypatch):
+    w, db = window, window.db
+    oleg = db.add_user("oleg", "Олег", "1")
+    db.open_shift(oleg.id, 5000, datetime.now(), CH)
+    assert w._same_day_shifts() and "Олег" in w._same_day_shifts()[0]

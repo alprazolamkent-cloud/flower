@@ -156,7 +156,11 @@ class CloseShiftDialog(QDialog):
         self.db, self.change, self.grace = db, change, grace
         self.shift = db.get_shift(shift.id)  # свежие суммы расходов и изъятий
         s = self.shift
-        delivery_sum, courier_sum = db.delivery_cash_for_shift(s.day, change)
+        delivery_sum, _ = db.delivery_cash_for_shift(s.day, change)
+        own = db.deliveries_for_shift(s.day, change)
+        # такси оплачивают из кассы, когда букет повезли: считаем только отмеченные доставленными
+        courier_sum = sum(d.courier_pay for d in own if d.delivered)
+        not_marked = [d for d in own if not d.delivered and d.courier_pay and d.delete_requested_at is None]
         self.setWindowTitle("Сдача смены")
         self.setMinimumWidth(1040)
         layout = QVBoxLayout(self)
@@ -216,6 +220,11 @@ class CloseShiftDialog(QDialog):
         self.courier_box = money_box()
         self.courier_box.setValue(courier_sum)
         cash_form.addRow("− отдали курьерам (такси):", self.courier_box)
+        if not_marked:
+            hint = _gray(f"Не отмечены доставленными: {len(not_marked)} (курьеру "
+                         f"{money(sum(d.courier_pay for d in not_marked))}). Если уже отвезли — добавьте сумму.")
+            hint.setStyleSheet(f"color: {C.orange}")
+            cash_form.addRow("", hint)
         cash_form.addRow("− расходы из кассы:", QLabel(money(s.expenses)))
         cash_form.addRow("− изъятия из кассы:", QLabel(money(s.withdrawals)))
         self.expected_label = QLabel()
@@ -449,10 +458,12 @@ class CabinetDialog(QDialog):
                  water: WaterSchedule | None = None,
                  rules: Callable[[int], SalaryRules] | None = None,
                  kinds: Callable[[], list[PenaltyKind]] | None = None,
-                 on_dispute: Callable[[Penalty], bool] | None = None):
+                 on_dispute: Callable[[Penalty], bool] | None = None,
+                 on_penalty: Callable[[Penalty, str], None] | None = None):
         super().__init__(parent)
         self.db, self.user, self.change, self.grace, self.water = db, user, change, grace, water
         self.on_dispute = on_dispute  # сообщить администраторам, что сотрудник оспорил санкцию
+        self.on_penalty = on_penalty  # админ поставил / снял санкцию в программе — сообщить второму хозяину
         self.rules = rules  # правила зарплаты для сотрудника (у кого-то могут быть свои ступени)
         self.kinds = kinds  # список штрафных санкций (из настроек)
         self.month_shifts: list[Shift] = []
@@ -725,7 +736,7 @@ class CabinetDialog(QDialog):
         if not (0 <= row < len(self.shifts) and self.table.selectionModel().hasSelection()):
             QMessageBox.information(self, "Санкции", "Выберите смену в таблице.")
             return
-        PenaltyDialog(self, self.db, self.shifts[row], self.kinds(), self.user).exec()
+        PenaltyDialog(self, self.db, self.shifts[row], self.kinds(), self.user, self.on_penalty).exec()
         self.refresh()
 
     def _show_ops(self):
@@ -831,9 +842,11 @@ class AdjustmentDialog(QDialog):
 class PenaltyDialog(QDialog):
     """Штрафные санкции выбранной смены: поставить из списка или убрать (только админ)."""
 
-    def __init__(self, parent, db: Database, shift: Shift, kinds: list[PenaltyKind], admin: User):
+    def __init__(self, parent, db: Database, shift: Shift, kinds: list[PenaltyKind], admin: User,
+                 on_change: Callable[[Penalty, str], None] | None = None):
         super().__init__(parent)
         self.db, self.shift, self.kinds, self.admin = db, shift, kinds, admin
+        self.on_change = on_change  # (санкция, "set" / "removed" / "kept") — сообщить второму хозяину
         self.items = []
         self.setWindowTitle(f"Санкции: {shift.user_name or '—'}, смена {shift.day:%d.%m}")
         self.resize(720, 400)
@@ -904,6 +917,8 @@ class PenaltyDialog(QDialog):
             return
         self.db.log_action(self.admin, "Штрафная санкция поставлена",
                            f"{self.shift.user_name or '—'}, смена {self.shift.day:%d.%m}: {kind.title}, −{money(kind.amount)}")
+        if self.on_change:
+            self.on_change(penalty, "set")
         self.refresh()
 
     def _selected(self) -> Penalty | None:
@@ -920,6 +935,8 @@ class PenaltyDialog(QDialog):
             if p is not None:
                 self.db.log_action(self.admin, "Штрафная санкция снята",
                                    f"{p.user_name or '—'}, смена {p.shift_day:%d.%m}: {p.title}, −{money(p.amount)}")
+                if self.on_change:
+                    self.on_change(p, "removed")
             self.refresh()
 
     def _keep(self):
@@ -932,6 +949,8 @@ class PenaltyDialog(QDialog):
         self.db.resolve_dispute(p.id)
         self.db.log_action(self.admin, "Спор по санкции: оставлена",
                            f"{p.user_name or '—'}, смена {p.shift_day:%d.%m}: {p.title}")
+        if self.on_change:
+            self.on_change(p, "kept")
         self.refresh()
 
 

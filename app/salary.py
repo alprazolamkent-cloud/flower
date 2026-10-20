@@ -244,12 +244,13 @@ class Ranking:
 
 
 def monthly_ranking(shifts: list[Shift], rules: SalaryRules, min_shifts: int = 2) -> Ranking:
-    """Лучшая смена месяца и лучший средний приход (без праздничных смен: в них выручка «не в счёт»)."""
-    closed = [s for s in shifts if s.closed_at is not None]
-    result = Ranking(best_shift=max(closed, key=lambda s: s.revenue, default=None))
+    """Лучшая смена месяца и лучший средний приход — без праздничных смен: в праздник выручка сама
+    по себе огромная (8 Марта всегда было бы «лучшей сменой»), и в премию она тоже не идёт."""
+    counted = [s for s in shifts if s.closed_at is not None and rules.shift_kind(s.day) != "holiday"]
+    result = Ranking(best_shift=max(counted, key=lambda s: s.revenue, default=None))
     per_user: dict[str, list[int]] = {}
-    for s in closed:
-        if rules.shift_kind(s.day) != "holiday" and s.user_name:
+    for s in counted:
+        if s.user_name:
             per_user.setdefault(s.user_name, []).append(s.revenue)
     averages = {name: sum(v) / len(v) for name, v in per_user.items() if len(v) >= min_shifts}
     if averages:

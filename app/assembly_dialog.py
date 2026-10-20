@@ -29,6 +29,7 @@ class AssemblyReminder(QDialog):
     """Не модальное: можно собирать и отмечать, не закрывая. Закрыть — значит «напомнить через 10 минут»."""
 
     assembled = Signal(int)  # id доставки
+    delivered = Signal(int)  # уже отвезли (время прошло), просто не отметили
     snoozed = Signal()
 
     def __init__(self, parent=None):
@@ -76,6 +77,11 @@ class AssemblyReminder(QDialog):
         done.setMinimumHeight(36)
         done.clicked.connect(lambda _=False, i=d.id: self.assembled.emit(i))
         row.addWidget(done)
+        if "прошло" in late:  # могли уже отвезти, а отметить забыли
+            gone = QPushButton("✓ Уже доставлено")
+            gone.setMinimumHeight(36)
+            gone.clicked.connect(lambda _=False, i=d.id: self.delivered.emit(i))
+            row.addWidget(gone)
         return frame
 
     def closeEvent(self, event):

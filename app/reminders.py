@@ -45,10 +45,10 @@ def reminder_key(d: Delivery) -> tuple:
 
 def due_reminders(deliveries: list[Delivery], now: datetime, lead_minutes: int,
                   already: set) -> list[Delivery]:
-    """Недоставленные доставки, до которых осталось не больше lead_minutes минут."""
+    """Недоставленные доставки, до которых осталось не больше lead_minutes минут (кроме ждущих удаления)."""
     due = []
     for d in deliveries:
-        if d.delivered or reminder_key(d) in already:
+        if d.delivered or d.delete_requested_at is not None or reminder_key(d) in already:
             continue
         start = parse_start_time(d.time)
         if start is None:

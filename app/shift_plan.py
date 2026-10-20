@@ -56,7 +56,8 @@ def plan_html(db: Database, shift: Shift, change: time, water: WaterSchedule | N
     else:
         parts.append("<p><b>🚚 Доставок за смену нет.</b></p>")
 
-    later = [d for k in range(1, AHEAD_DAYS + 1) for d in db.deliveries_for_shift(shift.day + timedelta(days=k), change)]
+    later = [d for k in range(1, AHEAD_DAYS + 1) for d in db.deliveries_for_shift(shift.day + timedelta(days=k), change)
+             if d.delete_requested_at is None]
     if later:
         first = min(later, key=_sort_key)
         parts.append(f"<p>📅 Заказов на следующие {AHEAD_DAYS} дней: <b>{len(later)}</b> — собирать заранее не нужно. "

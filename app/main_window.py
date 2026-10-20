@@ -34,7 +34,9 @@ from .settings_dialog import (
     writeoff_alert,
 )
 from .shift_dialogs import CabinetDialog, CashOpDialog, CloseShiftDialog, StartShiftDialog, fmt_dt
-from .shifts import PROBLEM_STATUSES, REMIND_BEFORE_MINUTES, Shift, business_day, short_name, window
+from .shifts import (
+    PROBLEM_STATUSES, REMIND_BEFORE_MINUTES, Shift, business_day, opening_business_day, short_name, window,
+)
 from .templates_dialog import load_templates
 from .theme import C
 from .update_ui import UpdateController
@@ -167,9 +169,11 @@ class MainWindow(QMainWindow):
         self._reports_done: set = set()
         self.assembly = AssemblyReminder()  # «Не собрано!» — отдельное окно поверх всех
         self.assembly.assembled.connect(self._assembled_from_reminder)
+        self.assembly.delivered.connect(self._delivered_from_reminder)
         self.assembly.snoozed.connect(self._snooze_assembly)
         self._assembly_snooze_until: datetime | None = None
         self._assembly_seen: set[int] = set()  # о каких уже напоминали: новая — показываем сразу
+        self._assembly_first: dict[int, datetime] = {}  # когда впервые напомнили — хозяевам только после 10 минут
         self._backup_attempt: datetime | None = None
         self._backup_day_pending = ""
         self._really_quit = False
@@ -457,6 +461,13 @@ class MainWindow(QMainWindow):
                                           QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
             if answer != QMessageBox.Yes:
                 return False
+        same_day = self._same_day_shifts()
+        if same_day and QMessageBox.question(
+                self, "Смена уже идёт",
+                f"Смена за сегодня уже идёт: {', '.join(same_day)}. Касса одна — две смены сразу "
+                "запутают расчёт.\n\nВсё равно начать ещё одну смену?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+            return False
         dlg = StartShiftDialog(self, self.db, self.user, change)
         if dlg.exec() != QDialog.Accepted:
             return False
@@ -566,12 +577,24 @@ class MainWindow(QMainWindow):
         else:
             self.close_shift()
 
+    def _same_day_shifts(self) -> list[str]:
+        """Кто уже на смене за тот же день, что сейчас начнётся (передача смены утром — не в счёт)."""
+        now, change = datetime.now(), shift_change()
+        day = opening_business_day(now, change)
+        return [f"{s.user_name or '—'} (с {s.opened_at:%H:%M})" for s in self.active_shifts()
+                if s.day == day and (self.user is None or s.user_id != self.user.id)]
+
     def start_shift(self):
         others = [s.user_name or "—" for s in self.active_shifts() if s.user_id != self.user.id]
-        if others and QMessageBox.question(
-                self, "Начать смену",
-                f"Сейчас на смене: {', '.join(others)}. Ваша смена будет отдельной, их смена не закроется.\n\n"
-                "Начать свою смену?", QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+        same_day = self._same_day_shifts()
+        if same_day:
+            text = (f"Смена за сегодня уже идёт: {', '.join(same_day)}. Касса одна — две смены сразу "
+                    "запутают расчёт.\n\nВсё равно начать ещё одну смену?")
+        else:
+            text = (f"Сейчас на смене: {', '.join(others)}. Ваша смена будет отдельной, их смена не закроется.\n\n"
+                    "Начать свою смену?")
+        if others and QMessageBox.question(self, "Начать смену", text,
+                                           QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
             return
         dlg = StartShiftDialog(self, self.db, self.user, shift_change())
         if dlg.exec() == QDialog.Accepted:
@@ -608,7 +631,7 @@ class MainWindow(QMainWindow):
     def open_cabinet(self):
         CabinetDialog(self, self.db, self.user, shift_change(), grace_minutes(),
                       self.calendar.yearShown(), self.calendar.monthShown(), water_schedule(),
-                      salary_rules, penalty_catalog, self._dispute_made).exec()
+                      salary_rules, penalty_catalog, self._dispute_made, self._penalty_in_app).exec()
 
     def active_shifts(self) -> list[Shift]:
         """Кто сейчас на смене (или ещё может её сдать)."""
@@ -1236,11 +1259,14 @@ class MainWindow(QMainWindow):
         today = now.date()
         candidates = (self.db.for_day(today - timedelta(days=1)) + self.db.for_day(today)
                       + self.db.for_day(today + timedelta(days=1)))
+        due = assembly_due(candidates, now, assembly_minutes())
+        self._assembly_first = {d.id: self._assembly_first.get(d.id, now) for d in due}
         for d in assembly_escalations(candidates, now, assembly_alert_minutes(), self._reminded):
+            if now - self._assembly_first.get(d.id, now) < SNOOZE:
+                continue  # срочный заказ только что приняли — сначала напомнить флористу, хозяевам потом
             self._reminded.add(("assembly",) + reminder_key(d))
             self.telegram.queue(f"💐 Букет ещё не собран, а доставка скоро\n{describe_delivery(d)}",
                                 key=f"assembly:{d.id}:{d.day}:{d.time}")
-        due = assembly_due(candidates, now, assembly_minutes())
         if not due:
             self.assembly.hide()
             self._assembly_seen.clear()
@@ -1271,6 +1297,14 @@ class MainWindow(QMainWindow):
             self._set_assembled(d, True)
         self._check_assembly(datetime.now())
 
+    def _delivered_from_reminder(self, delivery_id: int):
+        d = self.db.get_delivery(delivery_id)
+        if d is not None:
+            self.db.set_delivered(d.id, True, self.user.id if self.user else None, datetime.now())
+            self.audit("Доставка отмечена доставленной", describe_delivery(d))
+            self.refresh_all()
+        self._check_assembly(datetime.now())
+
     def _set_assembled(self, d: Delivery, assembled: bool):
         self.db.set_assembled(d.id, assembled, self.user.id if self.user else None, datetime.now())
         self.audit("Букет собран" if assembled else "Отметка «Собрано» снята", describe_delivery(d))
@@ -1284,6 +1318,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "План на смену", "Сейчас никто не на смене.")
             return
         ShiftPlanDialog(self, self.db, shift, shift_change(), water_schedule(), assembly_minutes()).exec()
+        QTimer.singleShot(0, self.show_unread_announcements)  # пока был открыт план, объявление ждало
 
     # ----- копия базы в Telegram -----
 
@@ -1305,10 +1340,13 @@ class MainWindow(QMainWindow):
         if self._backup_attempt is not None and now - self._backup_attempt < timedelta(hours=1):
             return  # не получилось недавно (нет интернета) — не чаще раза в час
         self._backup_attempt = now
-        result = self.run_backup()
-        if result is not None:
+        last, fresh = last_backup(), backup.latest(backup.local_dir(self.db.path))
+        if fresh is None or last is None or last < window(day, change)[0]:  # свежей (после пересменки) нет
+            result = self.run_backup()
+            fresh = result.local if result is not None else None
+        if fresh is not None:
             self._backup_day_pending = day.isoformat()
-            self.telegram.send_file(backup.zip_copy(result.local, now), self._backup_caption(), "daily")
+            self.telegram.send_file(backup.zip_copy(fresh, now), self._backup_caption(), "daily")
 
     def _backup_file_sent(self, tag: str, errors: list):
         if tag == "daily" and len(errors) < len(telegram.settings()["chats"]):  # хотя бы одному дошло
@@ -1350,6 +1388,14 @@ class MainWindow(QMainWindow):
         self.audit("Санкция оспорена", f"{p.user_name or '—'}, {p.title}, смена {p.shift_day:%d.%m}: {p.dispute_text}")
         self.telegram.queue(telegram.dispute_text(p), key=f"dispute:{p.id}")
         return telegram.configured()
+
+    def _penalty_in_app(self, p, change: str):
+        """Санкцию поставили, сняли или оставили после спора в программе — то же, что из Telegram."""
+        who = (self.user.name or self.user.login) if self.user else ""
+        if change == "kept":
+            self._dispute_kept(p, who)
+        else:
+            self._penalty_changed(p, change == "set", who)
 
     def _dispute_kept(self, p, who: str):
         """Хозяин в Telegram оставил оспоренную санкцию: сотруднику — на экран, второму хозяину — в Telegram."""
