@@ -43,7 +43,7 @@ class DeliveryDialog(QDialog):
         form.addRow("Дата:", self.date_edit)
 
         self.time_edit = QLineEdit(delivery.time)
-        self.time_edit.setPlaceholderText("например 14:00 или 14:00–16:00")
+        self.time_edit.setPlaceholderText("например 14:00 или 14:00–16:00 (по нему придёт напоминание)")
         form.addRow("Время:", self.time_edit)
 
         self.items_edit = QPlainTextEdit(delivery.items)

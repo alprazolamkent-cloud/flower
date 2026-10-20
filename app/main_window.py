@@ -1,17 +1,21 @@
 """Главное окно: календарь на месяц и список доставок на выбранный день."""
 
-from datetime import date
+import sys
+from datetime import date, datetime, timedelta
 
-from PySide6.QtCore import QDate, QLocale, Qt
-from PySide6.QtGui import QBrush, QColor, QFont, QKeySequence, QShortcut, QTextCharFormat
+from PySide6.QtCore import QDate, QLocale, QSettings, Qt, QTimer
+from PySide6.QtGui import QAction, QBrush, QColor, QFont, QKeySequence, QShortcut, QTextCharFormat
 from PySide6.QtWidgets import (
-    QAbstractItemView, QCalendarWidget, QGroupBox, QHBoxLayout, QHeaderView,
-    QLabel, QMainWindow, QMessageBox, QPushButton, QTableWidget,
-    QTableWidgetItem, QVBoxLayout, QWidget,
+    QAbstractItemView, QApplication, QCalendarWidget, QCheckBox, QFormLayout,
+    QGroupBox, QHBoxLayout, QHeaderView, QLabel, QMainWindow, QMenu, QMessageBox,
+    QPushButton, QSpinBox, QSystemTrayIcon, QTableWidget, QTableWidgetItem,
+    QVBoxLayout, QWidget,
 )
 
 from .db import Database, Delivery, Totals
 from .delivery_dialog import DeliveryDialog, money
+from .icon import flower_icon
+from .reminders import due_reminders, reminder_key
 
 MONTHS_GENITIVE = [
     "января", "февраля", "марта", "апреля", "мая", "июня",
@@ -27,6 +31,11 @@ HEADERS = ["✓", "Время", "Что доставить", "Кому", "Тел
            "Взяли", "Курьеру", "Осталось"]
 COL_DONE, COL_TIME, COL_ITEMS, COL_RECIPIENT, COL_PHONE, COL_ADDRESS, \
     COL_PRICE, COL_COURIER, COL_REST = range(len(HEADERS))
+
+REMINDER_CHECK_MS = 30_000
+DEFAULT_LEAD_MINUTES = 20
+AUTOSTART_KEY = r"HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Run"
+AUTOSTART_NAME = "FlowerDeliveries"
 
 DELIVERED_BG = QColor("#e3f4e4")
 PENDING_DAY_BG = QColor("#ffe0b2")  # в этот день есть недоставленные
@@ -53,8 +62,14 @@ class MainWindow(QMainWindow):
         self.deliveries: list[Delivery] = []
         self._marked_days: list[QDate] = []
         self._loading = False
+        self._reminded: set = set()
+        self._really_quit = False
+        self._tray_hint_shown = False
+        self._last_reminded_day: date | None = None
+        self.settings = QSettings("FlowerDeliveries", "FlowerDeliveries")
 
         self.setWindowTitle("Доставки цветов")
+        self.setWindowIcon(flower_icon())
         self.resize(1280, 720)
 
         central = QWidget()
@@ -91,6 +106,7 @@ class MainWindow(QMainWindow):
         self.month_label.setWordWrap(True)
         month_layout.addWidget(self.month_label)
         left.addWidget(self.month_box)
+        left.addWidget(self._build_reminder_box())
         left.addStretch(1)
 
         # Правая часть: доставки за день
@@ -145,8 +161,135 @@ class MainWindow(QMainWindow):
         QShortcut(QKeySequence.New, self, activated=self.add_delivery)
         QShortcut(QKeySequence.Delete, self.table, activated=self.delete_delivery)
 
+        self._setup_tray()
+        self.reminder_timer = QTimer(self)
+        self.reminder_timer.timeout.connect(self.check_reminders)
+        self.reminder_timer.start(REMINDER_CHECK_MS)
+
         self.refresh_month()
         self.refresh_day()
+        QTimer.singleShot(2000, self.check_reminders)
+
+    # ----- напоминания и трей -----
+
+    def _build_reminder_box(self) -> QGroupBox:
+        box = QGroupBox("Напоминания")
+        form = QFormLayout(box)
+
+        self.lead_box = QSpinBox()
+        self.lead_box.setRange(1, 180)
+        self.lead_box.setSuffix(" мин")
+        self.lead_box.setValue(int(self.settings.value("lead_minutes", DEFAULT_LEAD_MINUTES)))
+        self.lead_box.valueChanged.connect(self._on_lead_changed)
+        form.addRow("Напоминать за:", self.lead_box)
+
+        self.autostart_check = QCheckBox("Запускать вместе с Windows")
+        self.autostart_check.setVisible(sys.platform == "win32")
+        self.autostart_check.setChecked(self._autostart_enabled())
+        self.autostart_check.toggled.connect(self._set_autostart)
+        form.addRow(self.autostart_check)
+
+        hint = QLabel("Напоминания приходят, пока программа запущена. "
+                      "Крестик сворачивает её к часам, выход — через значок у часов.")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: gray")
+        form.addRow(hint)
+        return box
+
+    def _on_lead_changed(self, value: int):
+        self.settings.setValue("lead_minutes", value)
+        self.check_reminders()
+
+    def _autostart_settings(self) -> QSettings:
+        return QSettings(AUTOSTART_KEY, QSettings.NativeFormat)
+
+    def _autostart_enabled(self) -> bool:
+        if sys.platform != "win32":
+            return False
+        return self._autostart_settings().contains(AUTOSTART_NAME)
+
+    def _set_autostart(self, enabled: bool):
+        run = self._autostart_settings()
+        if enabled:
+            run.setValue(AUTOSTART_NAME, f'"{sys.executable}" --minimized'
+                         if getattr(sys, "frozen", False) else f'"{sys.executable}" "{sys.argv[0]}" --minimized')
+        else:
+            run.remove(AUTOSTART_NAME)
+
+    def _setup_tray(self):
+        self.tray = QSystemTrayIcon(flower_icon(), self)
+        self.tray.setToolTip("Доставки цветов")
+        menu = QMenu(self)
+        open_action = QAction("Открыть", self)
+        open_action.triggered.connect(self.show_window)
+        quit_action = QAction("Выход", self)
+        quit_action.triggered.connect(self.quit_app)
+        menu.addAction(open_action)
+        menu.addSeparator()
+        menu.addAction(quit_action)
+        self.tray.setContextMenu(menu)
+        self.tray.activated.connect(self._on_tray_activated)
+        self.tray.messageClicked.connect(self._on_message_clicked)
+        self.tray.show()
+
+    def _on_tray_activated(self, reason):
+        if reason in (QSystemTrayIcon.Trigger, QSystemTrayIcon.DoubleClick):
+            self.show_window()
+
+    def _on_message_clicked(self):
+        self.show_window()
+        if self._last_reminded_day is not None:
+            d = self._last_reminded_day
+            self.calendar.setSelectedDate(QDate(d.year, d.month, d.day))
+
+    def show_window(self):
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+        self.refresh_all()
+
+    def quit_app(self):
+        self._really_quit = True
+        self.tray.hide()
+        QApplication.quit()
+
+    def closeEvent(self, event):
+        if self._really_quit or not QSystemTrayIcon.isSystemTrayAvailable():
+            event.accept()
+            QApplication.quit()
+            return
+        event.ignore()
+        self.hide()
+        if not self._tray_hint_shown:
+            self._tray_hint_shown = True
+            self.tray.showMessage(
+                "Доставки цветов",
+                "Программа работает в фоне и напомнит о доставках. "
+                "Выход — правой кнопкой по значку у часов.",
+                QSystemTrayIcon.Information, 5000,
+            )
+
+    def check_reminders(self):
+        now = datetime.now()
+        today = now.date()
+        deliveries = self.db.for_day(today) + self.db.for_day(today + timedelta(days=1))
+        due = due_reminders(deliveries, now, self.lead_box.value(), self._reminded)
+        for d in due:
+            self._reminded.add(reminder_key(d))
+        if not due:
+            return
+
+        lines = []
+        for d in due:
+            what = d.items.splitlines()[0] if d.items else "доставка"
+            line = f"{d.time} — {what}"
+            if d.address:
+                line += f", {d.address}"
+            lines.append(line)
+        title = "Скоро доставка!" if len(due) == 1 else f"Скоро доставки: {len(due)}"
+        self._last_reminded_day = due[0].day
+        self.tray.showMessage(title, "\n".join(lines), QSystemTrayIcon.Warning, 60_000)
+        QApplication.alert(self)
 
     # ----- обновление экрана -----
 
