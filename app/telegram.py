@@ -147,13 +147,14 @@ def shift_started_text(shift: Shift, handover: int | None, prev_name: str) -> st
 
 
 def shift_closed_text(shift: Shift, change: time, late: bool, water: str | None,
-                      missed_duties: list[str]) -> str:
+                      missed_duties: list[str], kinds=(), writeoff_note: str = "") -> str:
     lines = [f"🌸 Смена сдана — {shift.user_name or 'сотрудник'}",
              f"{shift.opened_at:%d.%m %H:%M} → {shift.closed_at:%d.%m %H:%M}"]
     if late:
         lines.append(f"⏰ Сдана с опозданием (пересменка в {change:%H:%M})")
     lines += [
-        f"Приход: {money(shift.revenue)} · Цветы: {money(shift.flowers)}",
+        f"Приход: {money(shift.revenue)} · Цветы: {money(shift.flowers)} · "
+        f"Списано: {money(shift.writeoff)}" + (f" ({writeoff_note})" if writeoff_note else ""),
         f"Терминал: {money(shift.terminal)} · QR: {money(shift.qr)} · Наличные: {money(shift.cash_sales)}",
         f"Касса: должно {money(shift.expected_cash())}, сдали {money(shift.closing_cash or 0)} — "
         f"{diff_words(shift.difference())}",
@@ -171,6 +172,9 @@ def shift_closed_text(shift: Shift, change: time, late: bool, water: str | None,
         lines.append(line)
     if shift.note:
         lines.append(f"💬 {shift.note}")
+    if kinds:  # ссылки: нажать — санкция поставлена; пригодятся и позже, когда выяснится
+        lines += ["", "⚠ Штрафные санкции (нажмите, если нужно):"]
+        lines += [f"/pen_{shift.id}_{k.id} {k.title} — {money(k.amount)}" for k in kinds]
     return "\n".join(lines)
 
 

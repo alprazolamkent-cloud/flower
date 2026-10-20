@@ -15,7 +15,7 @@ from PySide6.QtWidgets import (
 
 from .db import Database, User, UserError
 from .delivery_dialog import MAX_MONEY, money, money_box
-from .salary import SalaryRules, calculate
+from .salary import PenaltyKind, SalaryRules, calculate, shop_writeoff
 from .shifts import (
     KIND_TEXT, PROBLEM_STATUSES, STATUS_TEXT, ChecklistItem, Shift, WaterSchedule, expected_cash,
     revenue_mismatch, window,
@@ -179,6 +179,9 @@ class CloseShiftDialog(QDialog):
         self.flowers_box = count_box("— введите —")
         self.flowers_box.setToolTip("Сколько из прихода — продажа цветов")
         sales_form.addRow("Цветы:", self.flowers_box)
+        self.writeoff_box = money_box()
+        self.writeoff_box.setToolTip("На какую сумму за смену списали цветов: завяли, разбились, испортились")
+        sales_form.addRow("Списано (завяло, разбито):", self.writeoff_box)
         self.terminal_box = money_box()
         sales_form.addRow("Терминал:", self.terminal_box)
         self.qr_box = money_box()
@@ -338,7 +341,7 @@ class CloseShiftDialog(QDialog):
                 self.courier_box.value(), self.note_edit.toPlainText(),
                 revenue=self.revenue_box.value(), flowers=self.flowers_box.value(),
                 terminal=self.terminal_box.value(), qr=self.qr_box.value(),
-                deliveries=self.delivery_box.value())
+                deliveries=self.delivery_box.value(), writeoff=self.writeoff_box.value())
         except UserError as e:
             QMessageBox.warning(self, "Сдача смены", str(e))
             return
@@ -419,11 +422,11 @@ class CashOpDialog(QDialog):
 
 
 CABINET_HEADERS = ["Смена", "Сотрудник", "Открыта", "Сдана", "Статус",
-                   "Приход", "Цветы", "Терминал", "QR-код", "Наличные", "Доставки",
+                   "Приход", "Цветы", "Списано", "Терминал", "QR-код", "Наличные", "Доставки",
                    "Приняли", "При приёме", "Курьерам", "Расходы", "Изъятия",
-                   "Должно быть", "Сдали", "Касса", "Вода", "Обязанности", "Комментарий"]
-(C_STATUS, C_HANDOVER, C_CASH, C_WATER, C_DUTIES, C_NOTE) = (4, 12, 18, 19, 20, 21)
-MONEY_COLS = {5, 6, 7, 8, 9, 10, 11, 13, 14, 15, 16, 17}
+                   "Должно быть", "Сдали", "Касса", "Вода", "Обязанности", "Санкции", "Комментарий"]
+(C_STATUS, C_HANDOVER, C_CASH, C_WATER, C_DUTIES, C_PENALTY, C_NOTE) = (4, 13, 19, 20, 21, 22, 23)
+MONEY_COLS = {5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 16, 17, 18}
 WATER_TEXT = {"done": ("поменяли", "green"), "missed": ("не поменяли", "red"), "planned": ("надо поменять", "orange")}
 
 
@@ -432,10 +435,13 @@ class CabinetDialog(QDialog):
 
     def __init__(self, parent, db: Database, user: User, change: time, grace: int, year: int, month: int,
                  water: WaterSchedule | None = None,
-                 rules: Callable[[int], SalaryRules] | None = None):
+                 rules: Callable[[int], SalaryRules] | None = None,
+                 kinds: Callable[[], list[PenaltyKind]] | None = None):
         super().__init__(parent)
         self.db, self.user, self.change, self.grace, self.water = db, user, change, grace, water
         self.rules = rules  # правила зарплаты для сотрудника (у кого-то могут быть свои ступени)
+        self.kinds = kinds  # список штрафных санкций (из настроек)
+        self.month_shifts: list[Shift] = []
         self.year, self.month = year, month
         self.shifts: list[Shift] = []
         self.setWindowTitle("Личный кабинет")
@@ -478,6 +484,10 @@ class CabinetDialog(QDialog):
         self.adjust_btn = QPushButton("± Аванс / премия / штраф…")
         self.adjust_btn.clicked.connect(self._adjust)
         salary_row.addWidget(self.adjust_btn)
+        self.penalty_btn = QPushButton("⚠ Санкции смены…")
+        self.penalty_btn.setToolTip("Поставить штрафную санкцию за выбранную смену или убрать")
+        self.penalty_btn.clicked.connect(self._penalties)
+        salary_row.addWidget(self.penalty_btn)
         self.salary_box.setVisible(rules is not None)
         layout.addWidget(self.salary_box)
 
@@ -518,7 +528,12 @@ class CabinetDialog(QDialog):
         self.shifts = self.db.shifts_between(first, last, self.person_box.currentData())
         waters = self.db.water_changes_between(first, last)
         now = datetime.now()
-        totals = dict.fromkeys(("revenue", "flowers", "terminal", "qr", "cash"), 0)
+        month_penalties = self.db.penalties_between(first, last, self.person_box.currentData())
+        shift_penalties: dict[int, list] = {}
+        for p in month_penalties:
+            shift_penalties.setdefault(p.shift_id, []).append(p)
+        self.month_shifts = self.db.shifts_between(first, last)  # весь магазин: списания считаются по всем
+        totals = dict.fromkeys(("revenue", "flowers", "terminal", "qr", "cash", "writeoff"), 0)
         stats = {"short": 0, "extra": 0, "late": 0, "not_closed": 0, "handover": 0,
                  "water_days": 0, "water_done": 0}
 
@@ -531,6 +546,7 @@ class CabinetDialog(QDialog):
             if closed:
                 totals["revenue"] += s.revenue
                 totals["flowers"] += s.flowers
+                totals["writeoff"] += s.writeoff
                 totals["terminal"] += s.terminal
                 totals["qr"] += s.qr
                 totals["cash"] += s.cash_sales
@@ -552,12 +568,13 @@ class CabinetDialog(QDialog):
             cells = [
                 f"{start:%d.%m} → {end:%d.%m}", s.user_name or "—", fmt_dt(s.opened_at),
                 fmt_dt(s.closed_at), STATUS_TEXT[status],
-                m(s.revenue), m(s.flowers), m(s.terminal), m(s.qr), m(s.cash_sales), m(s.deliveries),
+                m(s.revenue), m(s.flowers), m(s.writeoff), m(s.terminal), m(s.qr), m(s.cash_sales), m(s.deliveries),
                 money(s.opening_cash), diff_text(handover) if handover is not None else "",
                 m(s.courier_cash), money(s.expenses), money(s.withdrawals),
                 m(s.expected_cash()), m(s.closing_cash or 0), diff_text(diff),
                 WATER_TEXT[water][0] if water else "",
                 f"{s.duties_done} из {s.duties_total}" if s.duties_total else "",
+                ", ".join(f"{p.title} −{money(p.amount)}" for p in shift_penalties.get(s.id, [])),
                 " ".join(s.note.split()),
             ]
             for col, text in enumerate(cells):
@@ -581,6 +598,10 @@ class CabinetDialog(QDialog):
                         item.setForeground(QColor(C.red if missed else C.green))
                     if missed:
                         item.setToolTip("Не сделано: " + ", ".join(missed))
+                if col == C_PENALTY and shift_penalties.get(s.id):
+                    item.setForeground(QColor(C.red))
+                    item.setToolTip("\n".join(f"{p.title}: −{money(p.amount)} ({p.created_by or '—'}, "
+                                               f"{p.created_at:%d.%m %H:%M})" for p in shift_penalties[s.id]))
                 if col == C_NOTE and s.note:
                     item.setToolTip(s.note)
                 self.table.setItem(row, col, item)
@@ -588,6 +609,7 @@ class CabinetDialog(QDialog):
         parts = [f"Смен: <b>{len(self.shifts)}</b>",
                  f"Приход: <b>{money(totals['revenue'])}</b>",
                  f"Цветы: <b>{money(totals['flowers'])}</b>",
+                 f"Списано: <b>{money(totals['writeoff'])}</b>",
                  f"Терминал: <b>{money(totals['terminal'])}</b>",
                  f"QR-код: <b>{money(totals['qr'])}</b>",
                  f"Наличные: <b>{money(totals['cash'])}</b>"]
@@ -621,31 +643,66 @@ class CabinetDialog(QDialog):
             return
         person = self.person_box.currentData()
         self.adjust_btn.setVisible(self.user.is_admin and person is not None)
+        self.penalty_btn.setVisible(self.user.is_admin and self.kinds is not None)
         if person is None:  # все сотрудники — по строчке на каждого
             lines = []
             for u in self.db.users():
                 shifts = [s for s in self.shifts if s.user_id == u.id]
                 if shifts:
-                    sal = calculate(shifts, self.db.adjustments(u.id, self.month_key()), self.rules(u.id))
-                    lines.append(f"{u.name or u.login}: <b>{money(sal.total)}</b>")
+                    sal = self._salary(u.id, shifts)
+                    flag = f" <span style='color:{C.red}'>⚠ без премии</span>" if sal.blocked else ""
+                    lines.append(f"{u.name or u.login}: <b>{money(sal.total)}</b>{flag}")
             self.salary_label.setText(" &nbsp;·&nbsp; ".join(lines) or "Смен за месяц нет.")
             return
         rules = self.rules(person)
-        sal = calculate(self.shifts, self.db.adjustments(person, self.month_key()), rules)
+        sal = self._salary(person, self.shifts)
         parts = [f"Смены: {sal.shifts} × {money(rules.shift_rate)} = {money(sal.base)}"]
         bonus_line = self._bonus_text(sal, rules)
         if sal.shortage:
             parts.append(f"<span style='color:{C.red}'>Недостача: −{money(sal.shortage)}</span>")
+        for p in sal.penalties:
+            parts.append(f"<span style='color:{C.red}'>Санкция «{_html(p.title)}» ({p.shift_day:%d.%m}): "
+                         f"−{money(p.amount)}</span>")
         for a in sal.adjustments:
             sign = "+" if a.amount > 0 else "−"
             parts.append(f"{_html(a.reason)}: {sign}{money(abs(a.amount))}")
         text = " &nbsp;·&nbsp; ".join(parts)
         if bonus_line:
             text += "<br>" + bonus_line
+        text += self._conditions_text(sal, rules)
         text += f"<br><b style='font-size:15px'>Итого: {money(sal.total)}</b>"
         if sal.not_closed:
             text += f" &nbsp;<span style='color:{C.gray}'>(несданные смены не учтены: {sal.not_closed})</span>"
         self.salary_label.setText(text)
+
+    def _salary(self, user_id: int, shifts: list[Shift]):
+        """Зарплата сотрудника за месяц: санкции — его, списания — по всему магазину."""
+        rules = self.rules(user_id)
+        penalties = self.db.penalties_between(*self._month_range(), user_id)
+        return calculate(shifts, self.db.adjustments(user_id, self.month_key()), rules,
+                         penalties, shop_writeoff(self.month_shifts))
+
+    def _month_range(self) -> tuple[date, date]:
+        last = calendar.monthrange(self.year, self.month)[1]
+        return date(self.year, self.month, 1), date(self.year, self.month, last)
+
+    @staticmethod
+    def _conditions_text(sal, rules: SalaryRules) -> str:
+        """Условия премии: санкции и списания — чтобы было понятно, почему премия есть или нет."""
+        lines = []
+        if rules.max_penalties > 0:
+            ok = len(sal.penalties) < rules.max_penalties
+            lines.append(f"<span style='color:{C.green if ok else C.red}'>Санкций за месяц: {len(sal.penalties)} "
+                         f"(для премии меньше {rules.max_penalties})</span>")
+        if sal.writeoff_percent is not None:
+            ok = sal.writeoff_percent < rules.max_writeoff_percent
+            base = "от всех цветов" if rules.writeoff_base == "total" else "от проданных"
+            lines.append(f"<span style='color:{C.green if ok else C.red}'>Списания по магазину: "
+                         f"{sal.writeoff_percent:.1f}% {base} (для премии меньше {rules.max_writeoff_percent:g}%)</span>")
+        if sal.blocked:
+            lines.append(f"<b style='color:{C.red}'>Премия не начислена: " + "; ".join(sal.blocked)
+                         + f". Без этого было бы {money(sal.bonus_earned)}.</b>")
+        return "<br>" + "<br>".join(lines) if lines else ""
 
     @staticmethod
     def _bonus_text(sal, rules: SalaryRules) -> str:
@@ -659,8 +716,9 @@ class CabinetDialog(QDialog):
                      "премии нет</span>")
         else:
             source = "со сверх плана " if rules.above_plan_only else ""
+            paid = "" if not sal.blocked else f" <span style='color:{C.red}'>(не выплачивается)</span>"
             text += (f" → ступень «от {money(sal.tier.per_shift)}»: <b style='color:{C.green}'>"
-                     f"{sal.tier.percent:g}% {source}с {money(sal.bonus_base)} = {money(sal.bonus)}</b>")
+                     f"{sal.tier.percent:g}% {source}с {money(sal.bonus_base)} = {money(sal.bonus_earned)}</b>{paid}")
         if sal.next_tier is not None and sal.shifts:
             short = money(round(sal.next_tier.per_shift - sal.average))
             text += (f"<br><span style='color:{C.gray}'>До ступени «от {money(sal.next_tier.per_shift)}» "
@@ -673,6 +731,14 @@ class CabinetDialog(QDialog):
             AdjustmentDialog(self, self.db, person, self.person_box.currentText(), self.month_key(),
                              self.user).exec()
             self._refresh_salary()
+
+    def _penalties(self):
+        row = self.table.currentRow()
+        if not (0 <= row < len(self.shifts) and self.table.selectionModel().hasSelection()):
+            QMessageBox.information(self, "Санкции", "Выберите смену в таблице.")
+            return
+        PenaltyDialog(self, self.db, self.shifts[row], self.kinds(), self.user).exec()
+        self.refresh()
 
     def _show_ops(self):
         row = self.table.currentRow()
@@ -772,3 +838,76 @@ class AdjustmentDialog(QDialog):
                 self.db.log_action(self.admin, "Доплата / удержание удалены",
                                    f"{self.windowTitle().split(': ', 1)[-1]}: {adj.reason}, {money(adj.amount)}")
                 self.refresh()
+
+
+class PenaltyDialog(QDialog):
+    """Штрафные санкции выбранной смены: поставить из списка или убрать (только админ)."""
+
+    def __init__(self, parent, db: Database, shift: Shift, kinds: list[PenaltyKind], admin: User):
+        super().__init__(parent)
+        self.db, self.shift, self.kinds, self.admin = db, shift, kinds, admin
+        self.items = []
+        self.setWindowTitle(f"Санкции: {shift.user_name or '—'}, смена {shift.day:%d.%m}")
+        self.resize(520, 380)
+        layout = QVBoxLayout(self)
+
+        self.table = QTableWidget(0, 4)
+        self.table.setHorizontalHeaderLabels(["Санкция", "Сумма", "Кто поставил", "Когда"])
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.verticalHeader().setVisible(False)
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(0, QHeaderView.Stretch)
+        layout.addWidget(self.table, 1)
+        remove = QPushButton("🗑 Убрать выбранную")
+        remove.clicked.connect(self._remove)
+        layout.addWidget(remove)
+
+        form = QFormLayout()
+        self.kind_box = QComboBox()
+        for kind in kinds:
+            self.kind_box.addItem(f"{kind.title} — {money(kind.amount)}", kind)
+        form.addRow("Поставить:", self.kind_box)
+        layout.addLayout(form)
+        add = QPushButton("⚠ Поставить санкцию")
+        add.clicked.connect(self._add)
+        layout.addWidget(add)
+        close = QDialogButtonBox(QDialogButtonBox.Close)
+        close.button(QDialogButtonBox.Close).setText("Готово")
+        close.rejected.connect(self.accept)
+        layout.addWidget(close)
+        self.refresh()
+
+    def refresh(self):
+        self.items = self.db.penalties_for_shift(self.shift.id)
+        self.table.setRowCount(len(self.items))
+        for row, p in enumerate(self.items):
+            for col, text in enumerate((p.title, f"−{money(p.amount)}", p.created_by or "—", f"{p.created_at:%d.%m %H:%M}")):
+                item = QTableWidgetItem(text)
+                if col == 1:
+                    item.setForeground(QColor(C.red))
+                    item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                self.table.setItem(row, col, item)
+
+    def _add(self):
+        kind = self.kind_box.currentData()
+        if kind is None:
+            return
+        who = self.admin.name or self.admin.login
+        penalty = self.db.add_penalty(self.shift.id, kind.id, kind.title, kind.amount, who, datetime.now())
+        if penalty is None:
+            QMessageBox.information(self, "Санкции", "Такая санкция за эту смену уже поставлена.")
+            return
+        self.db.log_action(self.admin, "Штрафная санкция поставлена",
+                           f"{self.shift.user_name or '—'}, смена {self.shift.day:%d.%m}: {kind.title}, −{money(kind.amount)}")
+        self.refresh()
+
+    def _remove(self):
+        row = self.table.currentRow()
+        if 0 <= row < len(self.items) and self.table.selectionModel().hasSelection():
+            p = self.db.delete_penalty(self.items[row].id)
+            if p is not None:
+                self.db.log_action(self.admin, "Штрафная санкция снята",
+                                   f"{p.user_name or '—'}, смена {p.shift_day:%d.%m}: {p.title}, −{money(p.amount)}")
+            self.refresh()

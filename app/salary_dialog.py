@@ -1,12 +1,14 @@
 """Настройка ступеней премии: общие и свои для отдельных сотрудников."""
 
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFormLayout, QGridLayout,
-    QLabel, QSpinBox, QVBoxLayout, QWidget,
+    QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFormLayout,
+    QGridLayout, QHBoxLayout, QHeaderView, QLabel, QPushButton, QSpinBox, QTableWidget,
+    QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
 from .db import Database
-from .salary import MAX_TIERS, Tier
+from .salary import MAX_TIERS, PenaltyKind, Tier
 
 
 class TiersEditor(QWidget):
@@ -99,3 +101,68 @@ class EmployeeTiersDialog(QDialog):
     def accept(self):
         self._store_current()
         super().accept()
+
+
+class PenaltyCatalogEditor(QWidget):
+    """Список штрафных санкций: название и сумма. У каждой есть постоянный номер — по нему работают
+    ссылки в Telegram, поэтому переименование и порядок их не ломают."""
+
+    def __init__(self, kinds: list[PenaltyKind]):
+        super().__init__()
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self.table = QTableWidget(0, 2)
+        self.table.setHorizontalHeaderLabels(["Санкция", "Сумма, ₽"])
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.table.verticalHeader().setVisible(False)
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        layout.addWidget(self.table)
+        row = QHBoxLayout()
+        add = QPushButton("➕ Добавить")
+        add.clicked.connect(lambda: self._add_row(None, "Новая санкция", 500))
+        remove = QPushButton("🗑 Убрать")
+        remove.clicked.connect(self._remove)
+        row.addWidget(add)
+        row.addWidget(remove)
+        row.addStretch(1)
+        layout.addLayout(row)
+        for kind in kinds:
+            self._add_row(kind.id, kind.title, kind.amount)
+
+    def _add_row(self, kind_id: int | None, title: str, amount: int):
+        row = self.table.rowCount()
+        self.table.insertRow(row)
+        name = QTableWidgetItem(title)
+        name.setData(Qt.UserRole, kind_id)
+        self.table.setItem(row, 0, name)
+        spin = QSpinBox()
+        spin.setRange(0, 1_000_000)
+        spin.setSingleStep(100)
+        spin.setGroupSeparatorShown(True)
+        spin.setValue(amount)
+        self.table.setCellWidget(row, 1, spin)
+
+    def _remove(self):
+        row = self.table.currentRow()
+        if row >= 0:
+            self.table.removeRow(row)
+
+    def kinds(self) -> list[PenaltyKind]:
+        """Новые санкции получают следующий свободный номер; убранные номера не используются повторно."""
+        existing = [self.table.item(r, 0).data(Qt.UserRole) for r in range(self.table.rowCount())]
+        next_id = max([i for i in existing if i] + [self.max_used_id]) + 1
+        result = []
+        for r in range(self.table.rowCount()):
+            title = self.table.item(r, 0).text().strip()
+            if not title:
+                continue
+            kind_id = self.table.item(r, 0).data(Qt.UserRole)
+            if kind_id is None:
+                kind_id, next_id = next_id, next_id + 1
+            result.append(PenaltyKind(kind_id, title, self.table.cellWidget(r, 1).value()))
+        return result
+
+    max_used_id = 0  # наибольший номер, который уже использовался (даже убранный)

@@ -8,7 +8,7 @@ from datetime import date, datetime, time
 from PySide6.QtCore import QDate, QSettings, Qt, QTime, QTimer, QUrl
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QDateEdit, QDialog, QDialogButtonBox, QFileDialog, QFormLayout,
+    QCheckBox, QComboBox, QDateEdit, QDialog, QDialogButtonBox, QDoubleSpinBox, QFileDialog, QFormLayout,
     QGroupBox, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMessageBox, QPushButton,
     QSpinBox, QTabWidget, QTimeEdit, QVBoxLayout, QWidget,
 )
@@ -17,8 +17,8 @@ from . import autostart, backup, telegram, theme
 from .audit_dialog import AuditDialog
 from .db import UserError
 from .duties_dialog import DutiesEditor
-from .salary import SalaryRules, Tier
-from .salary_dialog import EmployeeTiersDialog, TiersEditor
+from .salary import DEFAULT_PENALTY_KINDS, WRITEOFF_BASES, PenaltyKind, SalaryRules, Tier
+from .salary_dialog import EmployeeTiersDialog, PenaltyCatalogEditor, TiersEditor
 from .shifts import DEFAULT_CHANGE, DEFAULT_GRACE_MINUTES, WaterSchedule
 from .templates_dialog import TemplatesDialog
 from .theme import C
@@ -94,6 +94,23 @@ def _dump_tiers(tiers: list[Tier]) -> list:
     return [[t.per_shift, t.percent] for t in tiers]
 
 
+def penalty_catalog() -> list[PenaltyKind]:
+    """Список штрафных санкций; пока админ его не менял — четыре стандартные."""
+    raw = str(_settings().value("penalty_catalog", ""))
+    if not raw:
+        return [PenaltyKind(k.id, k.title, k.amount) for k in DEFAULT_PENALTY_KINDS]
+    try:
+        return [PenaltyKind(int(i), str(t), int(a)) for i, t, a in json.loads(raw)]
+    except (ValueError, TypeError):
+        return [PenaltyKind(k.id, k.title, k.amount) for k in DEFAULT_PENALTY_KINDS]
+
+
+def penalty_max_id() -> int:
+    """Наибольший номер санкции за всё время: убранный номер не отдаём новой санкции — старые ссылки
+    в Telegram не должны вдруг поставить другую санкцию."""
+    return int(_settings().value("penalty_max_id", max([k.id for k in penalty_catalog()] + [0])))
+
+
 def salary_rules(user_id: int | None = None) -> SalaryRules:
     """Правила зарплаты; для сотрудника со своими ступенями — его ступени."""
     s = _settings()
@@ -103,6 +120,10 @@ def salary_rules(user_id: int | None = None) -> SalaryRules:
         tiers=tiers if tiers is not None else bonus_tiers(),
         above_plan_only=str(s.value("bonus_above_plan", "false")) == "true",
         deduct_shortage=str(s.value("salary_deduct", "true")) == "true",
+        max_penalties=int(s.value("bonus_max_penalties", 3)),
+        max_writeoff_percent=float(s.value("bonus_max_writeoff", 15)),
+        writeoff_base=str(s.value("writeoff_base", "total")) if str(s.value("writeoff_base", "total")) in WRITEOFF_BASES
+        else "total",
     )
 
 
@@ -177,13 +198,14 @@ class SettingsDialog(QDialog):
         self.main = window
         self.db = window.db
         self.setWindowTitle("Настройки")
-        self.setMinimumWidth(600)
+        self.setMinimumWidth(740)  # чтобы все вкладки помещались без стрелок прокрутки
         layout = QVBoxLayout(self)
 
         self.tabs = QTabWidget()
         self.tabs.addTab(self._main_tab(), "Основное")
         self.tabs.addTab(self._shop_tab(), "Магазин")
         self.tabs.addTab(self._salary_tab(), "Зарплата")
+        self.tabs.addTab(self._penalty_tab(), "Санкции и списания")
         self.tabs.addTab(self._telegram_tab(), "Telegram")
         self.tabs.addTab(self._backup_tab(), "Резервные копии")
         self.tabs.addTab(self._program_tab(), "Программа")
@@ -333,6 +355,48 @@ class SettingsDialog(QDialog):
         dlg = EmployeeTiersDialog(self, self.db, self.tiers_editor.tiers(), self.overrides)
         if dlg.exec() == QDialog.Accepted:
             self.overrides = dlg.overrides
+
+    def _penalty_tab(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        rules = salary_rules()
+
+        conditions = QGroupBox("Когда премия выдаётся")
+        form = QFormLayout(conditions)
+        self.max_pen_box = QSpinBox()
+        self.max_pen_box.setRange(0, 50)
+        self.max_pen_box.setSpecialValueText("не проверять")
+        self.max_pen_box.setValue(rules.max_penalties)
+        form.addRow("Штрафных санкций за месяц меньше:", self.max_pen_box)
+        self.max_wo_box = QDoubleSpinBox()
+        self.max_wo_box.setRange(0, 100)
+        self.max_wo_box.setDecimals(1)
+        self.max_wo_box.setSuffix(" %")
+        self.max_wo_box.setSpecialValueText("не проверять")
+        self.max_wo_box.setValue(rules.max_writeoff_percent)
+        form.addRow("Списаний по магазину за месяц меньше:", self.max_wo_box)
+        self.wo_base_box = QComboBox()
+        for key, title in WRITEOFF_BASES.items():
+            self.wo_base_box.addItem(title, key)
+        self.wo_base_box.setCurrentIndex(max(self.wo_base_box.findData(rules.writeoff_base), 0))
+        form.addRow("Процент списаний считать:", self.wo_base_box)
+        form.addRow(_gray_label("Штрафы считаются у каждого сотрудника свои, списания — общие по магазину.\n"
+                                "«Меньше» значит строго: при «меньше 3» премия есть у тех, у кого 0, 1 или 2 санкции.\n"
+                                "Пример: продано цветов на 85 000 ₽, списано на 15 000 ₽ — по первому способу\n"
+                                "15 000 ÷ 100 000 = 15%, по второму 15 000 ÷ 85 000 = 17,6%."))
+        layout.addWidget(conditions)
+
+        catalog = QGroupBox("Штрафные санкции (вычитаются из зарплаты)")
+        catalog_layout = QVBoxLayout(catalog)
+        self.catalog_editor = PenaltyCatalogEditor(penalty_catalog())
+        self.catalog_editor.max_used_id = penalty_max_id()
+        catalog_layout.addWidget(self.catalog_editor)
+        catalog_layout.addWidget(_gray_label("Санкцию ставит администратор: после сдачи смены в Telegram приходят ссылки\n"
+                                             "по этому списку, или командой /санкция Имя Номер. Одну и ту же санкцию\n"
+                                             "за одну смену дважды поставить нельзя."))
+        layout.addWidget(catalog)
+        layout.addStretch(1)
+        return page
 
     def _telegram_tab(self) -> QWidget:
         page = QWidget()
@@ -548,6 +612,12 @@ class SettingsDialog(QDialog):
             ("ставка за смену", rules.shift_rate, self.rate_box.value(), False),
             ("вычитать недостачу", rules.deduct_shortage, self.deduct_check.isChecked(), False),
             ("процент сверх плана", rules.above_plan_only, bool(self.above_box.currentData()), False),
+            ("премия, если санкций меньше", rules.max_penalties, self.max_pen_box.value(), False),
+            ("премия, если списаний меньше (%)", rules.max_writeoff_percent, self.max_wo_box.value(), False),
+            ("списания считать", rules.writeoff_base, self.wo_base_box.currentData(), False),
+            ("список штрафных санкций",
+             "; ".join(f"{k.title} {k.amount}" for k in penalty_catalog()),
+             "; ".join(f"{k.title} {k.amount}" for k in self.catalog_editor.kinds()), False),
             ("ступени премии", json.dumps(_dump_tiers(bonus_tiers())), json.dumps(_dump_tiers(self.tiers_editor.tiers())), True),
             ("свои ступени сотрудников", json.dumps({str(k): _dump_tiers(v) for k, v in bonus_overrides().items()}),
              json.dumps({str(k): _dump_tiers(v) for k, v in self.overrides.items()}), True),
@@ -577,6 +647,12 @@ class SettingsDialog(QDialog):
         settings.setValue("salary_deduct", _bool(self.deduct_check.isChecked()))
         settings.setValue("bonus_tiers", json.dumps(_dump_tiers(self.tiers_editor.tiers())))
         settings.setValue("bonus_above_plan", _bool(self.above_box.currentData()))
+        settings.setValue("bonus_max_penalties", self.max_pen_box.value())
+        settings.setValue("bonus_max_writeoff", self.max_wo_box.value())
+        settings.setValue("writeoff_base", self.wo_base_box.currentData())
+        kinds = self.catalog_editor.kinds()
+        settings.setValue("penalty_catalog", json.dumps([[k.id, k.title, k.amount] for k in kinds], ensure_ascii=False))
+        settings.setValue("penalty_max_id", max([k.id for k in kinds] + [self.catalog_editor.max_used_id]))
         settings.setValue("bonus_overrides", json.dumps(
             {str(uid): _dump_tiers(tiers) for uid, tiers in self.overrides.items()}))
         if self.token_edit.text().strip() != telegram.settings()["token"]:

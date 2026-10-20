@@ -6,7 +6,7 @@ from datetime import date, datetime, time, timedelta
 
 from .auth import hash_password, verify_password
 from .shifts import (
-    KIND_TEXT, Adjustment, CashOp, ChecklistItem, Duty, Shift, delivery_business_day,
+    KIND_TEXT, Adjustment, CashOp, ChecklistItem, Duty, Penalty, Shift, delivery_business_day,
     opening_business_day,
 )
 
@@ -165,6 +165,19 @@ CREATE TABLE IF NOT EXISTS audit_log (
     details   TEXT    NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_audit_time ON audit_log(at);
+CREATE TABLE IF NOT EXISTS penalties (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    shift_id   INTEGER NOT NULL,
+    user_id    INTEGER,
+    kind_id    INTEGER NOT NULL DEFAULT 0,
+    title      TEXT    NOT NULL,
+    amount     INTEGER NOT NULL,
+    note       TEXT    NOT NULL DEFAULT '',
+    created_at TEXT    NOT NULL,
+    created_by TEXT    NOT NULL DEFAULT '',
+    UNIQUE (shift_id, title)
+);
+CREATE INDEX IF NOT EXISTS idx_penalties_user ON penalties(user_id);
 CREATE TABLE IF NOT EXISTS announcements (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     update_id  INTEGER UNIQUE,
@@ -189,7 +202,7 @@ CREATE TABLE IF NOT EXISTS shift_duties (
 # Столбцы смен, добавленные позже.
 SHIFT_MIGRATIONS = {
     column: f"ALTER TABLE shifts ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0"
-    for column in ("revenue", "flowers", "terminal", "qr", "deliveries")
+    for column in ("revenue", "flowers", "terminal", "qr", "deliveries", "writeoff")
 }
 
 SHIFT_SELECT = """
@@ -204,7 +217,8 @@ SELECT s.id, s.user_id, COALESCE(NULLIF(u.name, ''), u.login, ''), s.day, s.open
                  WHERE sd.shift_id = s.id AND sd.done_at IS NOT NULL AND d.active = 1)
             ELSE (SELECT COUNT(*) FROM shift_duties sd WHERE sd.shift_id = s.id AND sd.done_at IS NOT NULL) END,
        CASE WHEN s.closed_at IS NULL THEN (SELECT COUNT(*) FROM duties WHERE active = 1)
-            ELSE (SELECT COUNT(*) FROM shift_duties sd WHERE sd.shift_id = s.id) END
+            ELSE (SELECT COUNT(*) FROM shift_duties sd WHERE sd.shift_id = s.id) END,
+       s.writeoff
 FROM shifts s LEFT JOIN users u ON u.id = s.user_id
 """
 
@@ -220,7 +234,7 @@ def _row_to_shift(r) -> Shift:
         closed_at=datetime.fromisoformat(r[6]) if r[6] else None, closing_cash=r[7],
         cash_sales=r[8], delivery_cash=r[9], courier_cash=r[10], note=r[11],
         expenses=r[12], withdrawals=r[13], revenue=r[14], flowers=r[15], terminal=r[16], qr=r[17],
-        deliveries=r[18], duties_done=r[19], duties_total=r[20],
+        deliveries=r[18], duties_done=r[19], duties_total=r[20], writeoff=r[21],
     )
 
 # Столбцы, добавленные после первой версии: старые базы дополняются при запуске.
@@ -478,6 +492,7 @@ class Database:
         self.conn.execute("UPDATE water_changes SET user_id=NULL WHERE user_id=?", (user_id,))
         self.conn.execute("DELETE FROM salary_adjustments WHERE user_id=?", (user_id,))
         self.conn.execute("DELETE FROM announcement_reads WHERE user_id=?", (user_id,))
+        self.conn.execute("UPDATE penalties SET user_id=NULL WHERE user_id=?", (user_id,))
         self.conn.execute("DELETE FROM users WHERE id=?", (user_id,))
         self.conn.commit()
 
@@ -522,16 +537,17 @@ class Database:
 
     def close_shift(self, shift_id: int, now: datetime, closing_cash: int, cash_sales: int,
                     courier_cash: int, note: str = "", revenue: int = 0, flowers: int = 0,
-                    terminal: int = 0, qr: int = 0, deliveries: int = 0) -> Shift:
-        if min(closing_cash, cash_sales, courier_cash, revenue, flowers, terminal, qr, deliveries) < 0:
+                    terminal: int = 0, qr: int = 0, deliveries: int = 0, writeoff: int = 0) -> Shift:
+        if min(closing_cash, cash_sales, courier_cash, revenue, flowers, terminal, qr, deliveries, writeoff) < 0:
             raise UserError("Суммы не могут быть отрицательными.")
         if flowers > revenue:
             raise UserError("Цветов не может быть продано больше, чем весь приход.")
         cur = self.conn.execute(
             "UPDATE shifts SET closed_at=?, closing_cash=?, cash_sales=?, delivery_cash=0, courier_cash=?,"
-            " note=?, revenue=?, flowers=?, terminal=?, qr=?, deliveries=? WHERE id=? AND closed_at IS NULL",
+            " note=?, revenue=?, flowers=?, terminal=?, qr=?, deliveries=?, writeoff=?"
+            " WHERE id=? AND closed_at IS NULL",
             (_ts(now), closing_cash, cash_sales, courier_cash, note.strip(), revenue, flowers,
-             terminal, qr, deliveries, shift_id),
+             terminal, qr, deliveries, writeoff, shift_id),
         )
         self.conn.commit()
         if cur.rowcount == 0:
@@ -813,3 +829,63 @@ class Database:
     def audit_people(self) -> list[str]:
         return [r[0] for r in self.conn.execute(
             "SELECT DISTINCT user_name FROM audit_log WHERE user_name <> '' ORDER BY user_name").fetchall()]
+
+    # ----- штрафные санкции -----
+
+    PENALTY_SELECT = (
+        "SELECT p.id, p.shift_id, p.user_id, p.kind_id, p.title, p.amount, p.created_at, p.created_by, p.note,"
+        " s.day, COALESCE(NULLIF(u.name, ''), u.login, '') FROM penalties p"
+        " JOIN shifts s ON s.id = p.shift_id LEFT JOIN users u ON u.id = p.user_id")
+
+    @staticmethod
+    def _row_to_penalty(r) -> Penalty:
+        return Penalty(id=r[0], shift_id=r[1], user_id=r[2], kind_id=r[3], title=r[4], amount=r[5],
+                       created_at=datetime.fromisoformat(r[6]), created_by=r[7], note=r[8],
+                       shift_day=date.fromisoformat(r[9]), user_name=r[10])
+
+    def add_penalty(self, shift_id: int, kind_id: int, title: str, amount: int, by: str, now: datetime,
+                    note: str = "") -> Penalty | None:
+        """Поставить санкцию за смену. Такая же за ту же смену уже есть — None (чтобы два хозяина
+        не наказали дважды за одно и то же)."""
+        shift = self.get_shift(shift_id)
+        if shift is None:
+            raise UserError("Такой смены нет.")
+        if amount < 0:
+            raise UserError("Сумма не может быть отрицательной.")
+        cur = self.conn.execute(
+            "INSERT OR IGNORE INTO penalties (shift_id, user_id, kind_id, title, amount, note, created_at, created_by)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (shift_id, shift.user_id, kind_id, title, amount, note.strip(), _ts(now), by))
+        self.conn.commit()
+        return self.get_penalty(cur.lastrowid) if cur.rowcount else None
+
+    def get_penalty(self, penalty_id: int) -> Penalty | None:
+        row = self.conn.execute(self.PENALTY_SELECT + " WHERE p.id = ?", (penalty_id,)).fetchone()
+        return self._row_to_penalty(row) if row else None
+
+    def delete_penalty(self, penalty_id: int) -> Penalty | None:
+        penalty = self.get_penalty(penalty_id)
+        if penalty is not None:
+            self.conn.execute("DELETE FROM penalties WHERE id = ?", (penalty_id,))
+            self.conn.commit()
+        return penalty
+
+    def penalties_between(self, first: date, last: date, user_id: int | None = None) -> list[Penalty]:
+        """Санкции за смены с first по last (месяц считается по дню смены, а не по дню постановки)."""
+        sql = self.PENALTY_SELECT + " WHERE s.day BETWEEN ? AND ?"
+        params: list = [first.isoformat(), last.isoformat()]
+        if user_id is not None:
+            sql += " AND p.user_id = ?"
+            params.append(user_id)
+        rows = self.conn.execute(sql + " ORDER BY s.day, p.id", params).fetchall()
+        return [self._row_to_penalty(r) for r in rows]
+
+    def penalties_for_shift(self, shift_id: int) -> list[Penalty]:
+        rows = self.conn.execute(self.PENALTY_SELECT + " WHERE p.shift_id = ? ORDER BY p.id", (shift_id,)).fetchall()
+        return [self._row_to_penalty(r) for r in rows]
+
+    def last_shift_of(self, user_id: int) -> Shift | None:
+        """Последняя смена сотрудника (идущая или сданная) — к ней относится санкция «после смены»."""
+        row = self.conn.execute(SHIFT_SELECT + " WHERE s.user_id = ? ORDER BY s.opened_at DESC, s.id DESC LIMIT 1",
+                                (user_id,)).fetchone()
+        return _row_to_shift(row) if row else None

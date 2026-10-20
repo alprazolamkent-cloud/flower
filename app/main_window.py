@@ -1,5 +1,6 @@
 """Главное окно: календарь на месяц и список доставок на выбранный день."""
 
+import calendar
 import copy
 from datetime import date, datetime, timedelta
 
@@ -27,7 +28,7 @@ from .version import VERSION
 from .duties_dialog import ChecklistDialog
 from .settings_dialog import (
     SettingsDialog, backup_dir, backup_keep, grace_minutes, last_backup, late_minutes, lead_minutes,
-    salary_rules, set_last_backup, shift_change, theme_mode, water_schedule,
+    penalty_catalog, salary_rules, set_last_backup, shift_change, theme_mode, water_schedule,
 )
 from .shift_dialogs import CabinetDialog, CashOpDialog, CloseShiftDialog, StartShiftDialog, fmt_dt
 from .shifts import PROBLEM_STATUSES, REMIND_BEFORE_MINUTES, Shift, business_day, short_name, window
@@ -35,6 +36,7 @@ from .templates_dialog import load_templates
 from .theme import C
 from .update_ui import UpdateController
 from .reminders import due_reminders, overdue_deliveries, reminder_key
+from .salary import shop_writeoff
 from .users_dialog import LoginDialog, PasswordDialog, UserFormDialog, UsersDialog
 
 MONTHS_GENITIVE = [
@@ -450,7 +452,8 @@ class MainWindow(QMainWindow):
                                             datetime.now(), change)
             missed = [i.text for i in self.db.checklist(shift) if not i.done]
             late = shift.status(datetime.now(), change, grace_minutes()) == "late"
-            self.telegram.queue(telegram.shift_closed_text(shift, change, late, water, missed),
+            self.telegram.queue(telegram.shift_closed_text(shift, change, late, water, missed, penalty_catalog(),
+                                                           self._writeoff_note(shift)),
                                 key=f"close:{shift.id}")
         self.run_backup()
 
@@ -569,7 +572,7 @@ class MainWindow(QMainWindow):
     def open_cabinet(self):
         CabinetDialog(self, self.db, self.user, shift_change(), grace_minutes(),
                       self.calendar.yearShown(), self.calendar.monthShown(), water_schedule(),
-                      salary_rules).exec()
+                      salary_rules, penalty_catalog).exec()
 
     def active_shifts(self) -> list[Shift]:
         """Кто сейчас на смене (или ещё может её сдать)."""
@@ -687,7 +690,8 @@ class MainWindow(QMainWindow):
         return BotContext(
             db=self.db, now=datetime.now(), change=shift_change(), grace=grace_minutes(),
             water=water_schedule(), rules=salary_rules, version=VERSION, last_backup=last_backup(),
-            backup_now=self._bot_backup, decided=self._delete_decided, audit=self._audit_telegram)
+            backup_now=self._bot_backup, decided=self._delete_decided, audit=self._audit_telegram,
+            penalty_kinds=penalty_catalog(), penalty_changed=self._penalty_changed)
 
     def audit(self, action: str, details: str = ""):
         """Запись в журнал действий от имени вошедшего сотрудника."""
@@ -1126,6 +1130,27 @@ class MainWindow(QMainWindow):
         self.db.cancel_delete_request(d.id)
         self.audit("Удаление доставки отклонено", f"{describe_delivery(d)}; просил(а) {d.delete_requested_by_name or '—'}")
         self.refresh_all()
+
+    def _penalty_changed(self, p, set_: bool, who: str):
+        """Админ поставил или снял санкцию в Telegram: обновить экран, сказать сотрудникам, сообщить второму хозяину."""
+        self.refresh_all()
+        what = f"{p.title} −{money(p.amount)} ({p.user_name or '—'}, смена {p.shift_day:%d.%m})"
+        self.tray.showMessage("Штрафная санкция" if set_ else "Санкция снята", what, QSystemTrayIcon.Warning, 60_000)
+        verb = "поставил(а) санкцию" if set_ else "снял(а) санкцию"
+        self.telegram.queue(f"ℹ️ {who or 'Администратор'} {verb}: {what}",
+                            key=f"pen:{p.id}:{int(set_)}:{datetime.now():%Y%m%d%H%M%S}",
+                            except_chat=self._current_bot_chat)
+
+    def _writeoff_note(self, shift) -> str:
+        """Списания по магазину за месяц смены — для итогов в Telegram."""
+        first = shift.day.replace(day=1)
+        last = shift.day.replace(day=calendar.monthrange(shift.day.year, shift.day.month)[1])
+        rules = salary_rules()
+        percent = shop_writeoff(self.db.shifts_between(first, last)).percent(rules.writeoff_base)
+        note = f"за месяц по магазину {percent:.1f}%"
+        if rules.max_writeoff_percent > 0 and percent >= rules.max_writeoff_percent:
+            note += f" ❗ для премии нужно меньше {rules.max_writeoff_percent:g}%"
+        return note
 
     def _delete_decided(self, d: Delivery, approved: bool, who: str):
         """Решение пришло из Telegram: обновить экран, сказать сотрудникам, сообщить второму хозяину."""

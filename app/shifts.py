@@ -105,6 +105,22 @@ class Adjustment:
 
 
 @dataclass
+class Penalty:
+    """Штрафная санкция за смену. Название и сумма сохраняются как были при постановке."""
+    id: int
+    shift_id: int
+    user_id: int | None
+    kind_id: int
+    title: str
+    amount: int
+    created_at: datetime
+    created_by: str = ""  # кто поставил (имя; из Telegram — «Мария (Telegram)»)
+    note: str = ""
+    shift_day: date | None = None
+    user_name: str = ""
+
+
+@dataclass
 class Duty:
     id: int
     text: str
@@ -142,6 +158,7 @@ class Shift:
     deliveries: int = 0  # взяли за доставки (перевод / QR), в кассу не идёт
     duties_done: int = 0
     duties_total: int = 0
+    writeoff: int = 0  # списано цветов за смену, ₽ (завяли, разбились)
     expenses: int = 0
     withdrawals: int = 0
 
