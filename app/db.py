@@ -30,6 +30,8 @@ class Delivery:
     source: str = ""  # откуда заказ: WhatsApp, Telegram, ВК …
     customer_contact: str = ""  # телефон, @логин или ссылка заказчика
     messages: str = ""  # какие сообщения уже отправляли: «departed,delivered»
+    delete_requested_at: datetime | None = None  # сотрудник попросил удалить — ждёт решения администратора
+    delete_requested_by_name: str = ""
 
     def sent(self, kind: str) -> bool:
         return kind in self.messages.split(",")
@@ -154,6 +156,15 @@ CREATE TABLE IF NOT EXISTS notifications (
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_notifications_time ON notifications(created_at);
+CREATE TABLE IF NOT EXISTS audit_log (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    at        TEXT    NOT NULL,
+    user_id   INTEGER,
+    user_name TEXT    NOT NULL DEFAULT '',
+    action    TEXT    NOT NULL,
+    details   TEXT    NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_audit_time ON audit_log(at);
 CREATE TABLE IF NOT EXISTS announcements (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     update_id  INTEGER UNIQUE,
@@ -219,14 +230,18 @@ MIGRATIONS = {
     "source": "ALTER TABLE deliveries ADD COLUMN source TEXT NOT NULL DEFAULT ''",
     "customer_contact": "ALTER TABLE deliveries ADD COLUMN customer_contact TEXT NOT NULL DEFAULT ''",
     "messages": "ALTER TABLE deliveries ADD COLUMN messages TEXT NOT NULL DEFAULT ''",
+    "delete_requested_by": "ALTER TABLE deliveries ADD COLUMN delete_requested_by INTEGER",
+    "delete_requested_at": "ALTER TABLE deliveries ADD COLUMN delete_requested_at TEXT",
 }
 
 COLUMNS = ("d.id, d.day, d.time, d.items, d.recipient, d.phone, d.address, d.price,"
            " d.courier_pay, d.delivered, d.created_by, d.delivered_by,"
            " COALESCE(NULLIF(uc.name, ''), uc.login, ''), COALESCE(NULLIF(ud.name, ''), ud.login, ''),"
-           " d.source, d.customer_contact, d.messages")
+           " d.source, d.customer_contact, d.messages, d.delete_requested_at,"
+           " COALESCE(NULLIF(ur.name, ''), ur.login, '')")
 FROM = ("deliveries d LEFT JOIN users uc ON uc.id = d.created_by"
-        " LEFT JOIN users ud ON ud.id = d.delivered_by")
+        " LEFT JOIN users ud ON ud.id = d.delivered_by"
+        " LEFT JOIN users ur ON ur.id = d.delete_requested_by")
 
 
 def _row_to_delivery(row) -> Delivery:
@@ -248,6 +263,8 @@ def _row_to_delivery(row) -> Delivery:
         source=row[14],
         customer_contact=row[15],
         messages=row[16],
+        delete_requested_at=datetime.fromisoformat(row[17]) if row[17] else None,
+        delete_requested_by_name=row[18],
     )
 
 
@@ -340,6 +357,21 @@ class Database:
         if kind not in kinds:
             kinds.append(kind)
         self.conn.execute("UPDATE deliveries SET messages=? WHERE id=?", (",".join(kinds), delivery_id))
+        self.conn.commit()
+
+    def get_delivery(self, delivery_id: int) -> Delivery | None:
+        row = self.conn.execute(f"SELECT {COLUMNS} FROM {FROM} WHERE d.id=?", (delivery_id,)).fetchone()
+        return _row_to_delivery(row) if row else None
+
+    def request_delete(self, delivery_id: int, user_id: int | None, now: datetime):
+        """Сотрудник просит удалить доставку: она остаётся, пока администратор не решит."""
+        self.conn.execute("UPDATE deliveries SET delete_requested_by=?, delete_requested_at=? WHERE id=?",
+                          (user_id, _ts(now), delivery_id))
+        self.conn.commit()
+
+    def cancel_delete_request(self, delivery_id: int):
+        self.conn.execute("UPDATE deliveries SET delete_requested_by=NULL, delete_requested_at=NULL WHERE id=?",
+                          (delivery_id,))
         self.conn.commit()
 
     def delete(self, delivery_id: int):
@@ -754,3 +786,30 @@ class Database:
             "SELECT created_at, title, text FROM notifications WHERE created_at >= ?"
             " ORDER BY created_at DESC, id DESC", (_ts(since),)).fetchall()
         return [(datetime.fromisoformat(r[0]), r[1], r[2]) for r in rows]
+
+    # ----- журнал действий (кто и что менял) -----
+
+    def log_action(self, user: "User | None", action: str, details: str, now: datetime | None = None,
+                   who: str = "", keep_days: int = 180):
+        """Записать действие. who — имя, если действует не сотрудник программы (например «логин при неудачном входе»)."""
+        now = now or datetime.now()
+        name = (user.name or user.login) if user else who
+        self.conn.execute("INSERT INTO audit_log (at, user_id, user_name, action, details) VALUES (?, ?, ?, ?, ?)",
+                          (_ts(now), user.id if user else None, name, action, details))
+        self.conn.execute("DELETE FROM audit_log WHERE at < ?", (_ts(now - timedelta(days=keep_days)),))
+        self.conn.commit()
+
+    def audit_entries(self, since: datetime, who: str | None = None, limit: int = 1000
+                      ) -> list[tuple[datetime, str, str, str]]:
+        """(когда, кто, действие, подробности), новые сверху. who — только действия этого человека (по имени)."""
+        sql = "SELECT at, user_name, action, details FROM audit_log WHERE at >= ?"
+        params: list = [_ts(since)]
+        if who is not None:
+            sql += " AND user_name = ?"
+            params.append(who)
+        rows = self.conn.execute(sql + " ORDER BY at DESC, id DESC LIMIT ?", (*params, limit)).fetchall()
+        return [(datetime.fromisoformat(r[0]), r[1], r[2], r[3]) for r in rows]
+
+    def audit_people(self) -> list[str]:
+        return [r[0] for r in self.conn.execute(
+            "SELECT DISTINCT user_name FROM audit_log WHERE user_name <> '' ORDER BY user_name").fetchall()]

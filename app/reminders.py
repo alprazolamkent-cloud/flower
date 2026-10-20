@@ -28,6 +28,16 @@ def parse_start_time(text: str) -> time | None:
     return time(h, mi)
 
 
+def parse_deadline_time(text: str) -> time | None:
+    """Крайнее время доставки: для «14:00–16:00» это 16:00, для «14:00» — 14:00."""
+    last = None
+    for m in TIME_RE.finditer(text):
+        h, mi = int(m.group(1)), int(m.group(2))
+        if h <= 23 and mi <= 59:
+            last = time(h, mi)
+    return last or parse_start_time(text)
+
+
 def reminder_key(d: Delivery) -> tuple:
     # Если поменяли дату или время — напомним заново.
     return (d.id, d.day, d.time)
@@ -47,3 +57,24 @@ def due_reminders(deliveries: list[Delivery], now: datetime, lead_minutes: int,
         if timedelta(0) <= left <= timedelta(minutes=lead_minutes):
             due.append(d)
     return due
+
+
+OVERDUE_MAX_AGE = timedelta(hours=6)  # про совсем старые не напоминаем: скорее всего просто забыли отметить
+
+
+def overdue_deliveries(deliveries: list[Delivery], now: datetime, minutes: int, already: set) -> list[Delivery]:
+    """Доставки, которые не отмечены «Доставлено» уже minutes минут после крайнего времени.
+    minutes = 0 — не напоминать. Те, что ждут удаления, пропускаем."""
+    if minutes <= 0:
+        return []
+    late = []
+    for d in deliveries:
+        if d.delivered or d.delete_requested_at is not None or ("late",) + reminder_key(d) in already:
+            continue
+        deadline = parse_deadline_time(d.time)
+        if deadline is None:
+            continue
+        overdue = now - (datetime.combine(d.day, deadline) + timedelta(minutes=minutes))
+        if timedelta(0) <= overdue <= OVERDUE_MAX_AGE:
+            late.append(d)
+    return late

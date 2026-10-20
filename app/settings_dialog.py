@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (
 )
 
 from . import autostart, backup, telegram, theme
+from .audit_dialog import AuditDialog
 from .db import UserError
 from .duties_dialog import DutiesEditor
 from .salary import SalaryRules, Tier
@@ -27,6 +28,11 @@ DEFAULT_LEAD_MINUTES = 20
 
 def _settings() -> QSettings:
     return QSettings("FlowerDeliveries", "FlowerDeliveries")
+
+
+def late_minutes() -> int:
+    """Через сколько минут после времени доставки сообщать, что она не отмечена (0 — не сообщать)."""
+    return int(_settings().value("late_minutes", 20))
 
 
 def lead_minutes() -> int:
@@ -212,6 +218,14 @@ class SettingsDialog(QDialog):
         self.lead_box.setSuffix(" мин")
         self.lead_box.setValue(lead_minutes())
         form.addRow("Напоминать за:", self.lead_box)
+        self.late_box = QSpinBox()
+        self.late_box.setRange(0, 240)
+        self.late_box.setSuffix(" мин")
+        self.late_box.setSpecialValueText("не сообщать")
+        self.late_box.setValue(late_minutes())
+        form.addRow("Доставка не отмечена через:", self.late_box)
+        form.addRow(_gray_label("Если после времени доставки (для «14:00–16:00» — после 16:00) прошло столько минут,\n"
+                                "а «Доставлено» не отмечено — сотрудник получит уведомление, а хозяева — сообщение в Telegram."))
         layout.addWidget(reminders)
 
         shifts = QGroupBox("Смены")
@@ -259,6 +273,8 @@ class SettingsDialog(QDialog):
                  self._open_users),
                 ("📋 Обязанности смены…", "Список дел, которые сотрудник отмечает за смену",
                  self._open_duties),
+                ("🧾 Журнал действий…", "Кто и что менял: доставки, деньги, сотрудники, настройки",
+                 lambda: AuditDialog(self, self.db).exec()),
                 ("💬 Тексты сообщений заказчику…", "«Курьер выехал», «доставлено», «просьба об отзыве»",
                  lambda: TemplatesDialog(self).exec())):
             button = QPushButton(text)
@@ -513,12 +529,46 @@ class SettingsDialog(QDialog):
         except UserError as e:
             QMessageBox.warning(self, "Восстановление", str(e))
             return
+        # журнал тоже вернулся к состоянию копии — эта запись осталась бы единственным следом восстановления
+        self.db.log_action(self.main.user, "Данные восстановлены из копии", os.path.basename(path))
         self.reject()
         QTimer.singleShot(0, self.main.after_restore)
 
+    def _log_changes(self):
+        """Что именно поменяли в настройках — в журнал действий (секреты не пишем)."""
+        rules, schedule = salary_rules(), water_schedule()
+        old_tg = telegram.settings()
+        rows = [
+            ("напоминать о доставке за (мин)", lead_minutes(), self.lead_box.value(), False),
+            ("доставка не отмечена через (мин)", late_minutes(), self.late_box.value(), False),
+            ("пересменка", shift_change().strftime("%H:%M"), self.change_edit.time().toString("HH:mm"), False),
+            ("сдать смену ещё (мин)", grace_minutes(), self.grace_box.value(), False),
+            ("вода раз в (дн.)", schedule.every, self.water_every.value(), False),
+            ("день замены воды", schedule.anchor.isoformat(), self.water_anchor.date().toString("yyyy-MM-dd"), False),
+            ("ставка за смену", rules.shift_rate, self.rate_box.value(), False),
+            ("вычитать недостачу", rules.deduct_shortage, self.deduct_check.isChecked(), False),
+            ("процент сверх плана", rules.above_plan_only, bool(self.above_box.currentData()), False),
+            ("ступени премии", json.dumps(_dump_tiers(bonus_tiers())), json.dumps(_dump_tiers(self.tiers_editor.tiers())), True),
+            ("свои ступени сотрудников", json.dumps({str(k): _dump_tiers(v) for k, v in bonus_overrides().items()}),
+             json.dumps({str(k): _dump_tiers(v) for k, v in self.overrides.items()}), True),
+            ("тема", theme_mode(), self.theme_box.currentData(), False),
+            ("токен Telegram-бота", old_tg["token"], self.token_edit.text().strip(), True),
+            ("чаты Telegram", ", ".join(old_tg["chats"]), ", ".join(telegram.chat_ids(self.chat_edit.text())), False),
+            ("сообщать о начале смены", old_tg["on_start"], self.tg_start.isChecked(), False),
+            ("итоги при сдаче", old_tg["on_close"], self.tg_close.isChecked(), False),
+            ("флешка / папка для копий", backup_dir(), self.backup_edit.text().strip(), False),
+            ("хранить копий", backup_keep(), self.keep_box.value(), False),
+        ]
+        changes = [f"{title}: изменено" if hidden else f"{title}: {old} → {new}"
+                   for title, old, new, hidden in rows if str(old) != str(new)]
+        if changes:
+            self.db.log_action(self.main.user, "Настройки изменены", "; ".join(changes))
+
     def accept(self):
+        self._log_changes()
         settings = _settings()
         settings.setValue("lead_minutes", self.lead_box.value())
+        settings.setValue("late_minutes", self.late_box.value())
         settings.setValue("shift_change", self.change_edit.time().toString("HH:mm"))
         settings.setValue("grace_minutes", self.grace_box.value())
         settings.setValue("water_every", self.water_every.value())

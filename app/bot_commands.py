@@ -10,7 +10,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta
 
-from .db import Database, User, UserError
+from .db import Database, Delivery, User, UserError
 from .delivery_dialog import money
 from .salary import SalaryRules, calculate
 from .shifts import STATUS_TEXT, Shift, WaterSchedule, business_day, window
@@ -56,6 +56,7 @@ ALIASES = {
     "статус": "status",
     "копия": "backup", "бэкап": "backup", "бекап": "backup",
     "аванс": "advance", "премия": "bonus", "штраф": "fine",
+    "удалить": "del", "оставить": "keep",
     "да": "yes", "yes": "yes", "ок": "yes", "нет": "no", "no": "no", "отмена": "no", "cancel": "no",
 }
 ADJUSTMENTS = {"advance": ("Аванс", -1, "аванс"), "bonus": ("Премия", 1, "премия"), "fine": ("Штраф", -1, "штраф")}
@@ -72,6 +73,9 @@ class BotContext:
     version: str = ""
     last_backup: datetime | None = None
     backup_now: Callable[[], str] | None = None
+    author: str = ""  # кто из хозяев пишет — для журнала и сообщения второму
+    decided: Callable[[Delivery, bool, str], None] | None = None  # (доставка, удалена?, кто решил)
+    audit: Callable[[str, str], None] | None = None  # (действие, подробности) — запись в журнал действий
 
 
 # ----- общие помощники -----
@@ -83,6 +87,9 @@ def parse_command(text: str) -> tuple[str, str] | None:
         return None
     word, _, args = text.partition(" ")
     word = word.lstrip("/").split("@")[0].lower()
+    m = re.fullmatch(r"(del|keep)_(\d+)", word)  # ссылки из сообщения о запросе: /del_17, /keep_17
+    if m and text.startswith("/"):
+        return m.group(1), m.group(2)
     if not text.startswith("/") and word not in ("да", "нет", "yes", "no", "ок", "отмена"):
         return None  # не команда (кроме ответов «да» / «нет» на вопрос бота)
     return ALIASES.get(word, word), args.strip()
@@ -172,7 +179,8 @@ def _deliveries_totals(db: Database, first: date, last: date) -> tuple[int, int,
 def cmd_help(ctx: BotContext, args: str) -> str:
     lines = ["🌸 Что я умею (можно писать по-русски: /касса, /зарплата Анна):", ""]
     lines += [f"/{name} — {text}" for name, text in MENU]
-    lines += ["", "Записать: /аванс Анна 5000 на ремонт, /премия Анна 3000 за праздники, "
+    lines += ["", "Когда сотрудник просит удалить доставку, придёт сообщение со ссылками: удалить /del_N, оставить /keep_N.",
+              "Записать: /аванс Анна 5000 на ремонт, /премия Анна 3000 за праздники, "
                   "/штраф Анна 500 разбила вазу — сначала спрошу «да / нет».",
               "Объявление сотрудникам: напишите сообщение, начав с «!»."]
     return "\n".join(lines)
@@ -449,7 +457,44 @@ def cmd_backup(ctx: BotContext, args: str) -> str:
     return "💾 " + ctx.backup_now()
 
 
+def _delivery_title(d: Delivery) -> str:
+    what = d.items.splitlines()[0] if d.items else "—"
+    return f"№{d.id}: {d.day:%d.%m} {d.time or '—'}, {what}, {d.address or 'адрес не указан'}" \
+           + (f" ({money(d.price)})" if d.price else "")
+
+
+def _decide_delete(ctx: BotContext, args: str, approve: bool) -> str:
+    try:
+        delivery_id = int(args.strip())
+    except ValueError:
+        return "Укажите номер доставки, например: /del_17 (ссылка есть в сообщении о запросе)."
+    d = ctx.db.get_delivery(delivery_id)
+    if d is None:
+        return "Такой доставки уже нет (возможно, её уже удалили)."
+    if d.delete_requested_at is None:
+        return "На эту доставку нет запроса на удаление (возможно, уже решён)."
+    if approve:
+        ctx.db.delete(delivery_id)
+    else:
+        ctx.db.cancel_delete_request(delivery_id)
+    if ctx.audit:
+        ctx.audit("Удаление доставки подтверждено" if approve else "Удаление доставки отклонено",
+                  f"{_delivery_title(d)}; просил(а) {d.delete_requested_by_name or '—'}, решил(а) {ctx.author or 'Telegram'}")
+    if ctx.decided:
+        ctx.decided(d, approve, ctx.author)
+    return ("🗑 Удалено: " if approve else "↩ Оставлено: ") + _delivery_title(d)
+
+
+def cmd_del(ctx: BotContext, args: str) -> str:
+    return _decide_delete(ctx, args, True)
+
+
+def cmd_keep(ctx: BotContext, args: str) -> str:
+    return _decide_delete(ctx, args, False)
+
+
 COMMANDS: dict[str, Callable[[BotContext, str], str]] = {
+    "del": cmd_del, "keep": cmd_keep,
     "help": cmd_help, "shift": cmd_shift, "cash": cmd_cash, "revenue": cmd_revenue, "today": cmd_today,
     "shifts": cmd_shifts, "staff": cmd_staff, "salary": cmd_salary, "problems": cmd_problems,
     "deliveries": cmd_deliveries, "water": cmd_water, "duties": cmd_duties, "ann": cmd_ann,
@@ -479,6 +524,7 @@ class BotHandler:
         parsed = parse_command(text)
         if parsed is None:
             return None
+        ctx.author = author
         name, args = parsed
         if name in ("yes", "no"):
             return self._answer(name == "yes", ctx, chat)
@@ -518,6 +564,9 @@ class BotHandler:
                 db.add_adjustment(user.id, month, sign * amount, f"{reason} ({source})", None, now)
             except UserError as e:
                 return f"Не записано: {e}"
+            if ctx.audit:
+                ctx.audit(f"{title} сотруднику", f"{user.name or user.login}: {'+' if sign > 0 else '−'}{money(amount)}, "
+                                                 f"{reason} ({source})")
             return f"✅ Записано: {title.lower()} {user.name or user.login} {'+' if sign > 0 else '−'}{money(amount)} " \
                    f"({reason}). Видно в кабинете за {month[5:]}.{month[:4]}."
 

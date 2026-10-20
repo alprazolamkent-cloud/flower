@@ -56,6 +56,8 @@ class LoginDialog(QDialog):
     def accept(self):
         user = self.db.authenticate(self.login_edit.text(), self.password_edit.text())
         if user is None:
+            self.db.log_action(None, "Неудачный вход", f"логин: {self.login_edit.text().strip() or '—'}",
+                               who=self.login_edit.text().strip() or "—")
             QMessageBox.warning(self, "Не удалось войти", "Неверный логин или пароль.")
             self.password_edit.clear()
             self.password_edit.setFocus()
@@ -115,10 +117,11 @@ class UserFormDialog(QDialog):
 class PasswordDialog(QDialog):
     """Смена пароля. Свой пароль — со вводом старого; админ сбрасывает чужой без него."""
 
-    def __init__(self, parent, db: Database, user: User, need_old: bool):
+    def __init__(self, parent, db: Database, user: User, need_old: bool, actor: User | None = None):
         super().__init__(parent)
         self.db = db
         self.user = user
+        self.actor = actor or user  # кто меняет: сам сотрудник или администратор
         self.need_old = need_old
         self.setWindowTitle(f"Пароль: {user.name or user.login}")
         self.setMinimumWidth(340)
@@ -145,6 +148,9 @@ class PasswordDialog(QDialog):
         except UserError as e:
             QMessageBox.warning(self, "Ошибка", str(e))
             return
+        who = self.user.name or self.user.login
+        self.db.log_action(self.actor, "Пароль изменён" if self.actor.id == self.user.id else "Пароль сброшен",
+                           f"сотрудник: {who}")  # сам пароль, конечно, не записывается
         super().accept()
 
 
@@ -203,13 +209,17 @@ class UsersDialog(QDialog):
         return None
 
     def add_user(self):
-        if UserFormDialog(self, self.db).exec() == QDialog.Accepted:
+        dlg = UserFormDialog(self, self.db)
+        if dlg.exec() == QDialog.Accepted:
+            u = dlg.user
+            self.db.log_action(self.current, "Сотрудник создан",
+                               f"{u.name or u.login} (логин {u.login}){', администратор' if u.is_admin else ''}")
             self.refresh()
 
     def reset_password(self):
         u = self.selected()
         if u:
-            dlg = PasswordDialog(self, self.db, u, need_old=False)
+            dlg = PasswordDialog(self, self.db, u, need_old=False, actor=self.current)
             if dlg.exec() == QDialog.Accepted:
                 QMessageBox.information(self, "Готово", f"Пароль для «{u.login}» изменён.")
 
@@ -219,6 +229,8 @@ class UsersDialog(QDialog):
             return
         try:
             self.db.update_user(u.id, u.name, not u.is_admin)
+            self.db.log_action(self.current, "Права изменены",
+                               f"{u.name or u.login}: " + ("теперь сотрудник" if u.is_admin else "теперь администратор"))
         except UserError as e:
             QMessageBox.warning(self, "Ошибка", str(e))
         self.refresh()
@@ -239,6 +251,7 @@ class UsersDialog(QDialog):
             return
         try:
             self.db.delete_user(u.id)
+            self.db.log_action(self.current, "Сотрудник удалён", f"{u.name or u.login} (логин {u.login})")
         except UserError as e:
             QMessageBox.warning(self, "Ошибка", str(e))
         self.refresh()

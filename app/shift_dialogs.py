@@ -413,6 +413,8 @@ class CashOpDialog(QDialog):
         except UserError as e:
             QMessageBox.warning(self, "Касса", str(e))
             return
+        self.db.log_action(self.user, f"{KIND_TEXT[self.kind_box.currentData()]} из кассы",
+                           f"{money(self.amount_box.value())}: {self.reason_edit.text().strip()}")
         super().accept()
 
 
@@ -754,6 +756,9 @@ class AdjustmentDialog(QDialog):
         except UserError as e:
             QMessageBox.warning(self, "Зарплата", str(e))
             return
+        self.db.log_action(self.admin, f"{self.KINDS[self.kind_box.currentIndex()][0].split(' (')[0]} сотруднику",
+                           f"{self.windowTitle().split(': ', 1)[-1]}: {'+' if sign > 0 else '−'}"
+                           f"{money(self.amount_box.value())}, {self.reason_edit.text().strip()}")
         self.amount_box.setValue(0)
         self.refresh()
 
@@ -762,5 +767,8 @@ class AdjustmentDialog(QDialog):
         if 0 <= row < len(self.items) and self.table.selectionModel().hasSelection():
             if QMessageBox.question(self, "Удалить", f"Удалить «{self.items[row].reason}»?",
                                     QMessageBox.Yes | QMessageBox.No, QMessageBox.No) == QMessageBox.Yes:
-                self.db.delete_adjustment(self.items[row].id)
+                adj = self.items[row]
+                self.db.delete_adjustment(adj.id)
+                self.db.log_action(self.admin, "Доплата / удержание удалены",
+                                   f"{self.windowTitle().split(': ', 1)[-1]}: {adj.reason}, {money(adj.amount)}")
                 self.refresh()

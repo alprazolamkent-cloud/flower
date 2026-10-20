@@ -292,15 +292,16 @@ class TelegramSender(QObject):
         self.timer.timeout.connect(self.flush)
         self.timer.start(FLUSH_EVERY_MS)
 
-    def queue(self, text: str, key: str | None = None, chat: str | None = None):
-        """Поставить сообщение в очередь: chat — одному чату, иначе всем настроенным (каждому отдельной строкой,
-        чтобы недоступность одного чата не мешала остальным)."""
+    def queue(self, text: str, key: str | None = None, chat: str | None = None, except_chat: str | None = None):
+        """Поставить сообщение в очередь: chat — одному чату, иначе всем настроенным, кроме except_chat
+        (например, тому, кто сам только что решил вопрос). Каждому — отдельной строкой,
+        чтобы недоступность одного чата не мешала остальным."""
         if len(text) > MAX_TEXT:  # иначе Telegram откажет и сообщение застопорит очередь
             text = text[:MAX_TEXT - 1] + "…"
         if not configured():
             return
         queued = False
-        for target in ([str(chat)] if chat else settings()["chats"]):
+        for target in ([str(chat)] if chat else [c for c in settings()["chats"] if c != str(except_chat or "")]):
             queued |= self.db.queue_message(text, datetime.now(), f"{key}|{target}" if key else None, target)
         if queued:
             QTimer.singleShot(0, self.flush)

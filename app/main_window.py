@@ -1,5 +1,6 @@
 """Главное окно: календарь на месяц и список доставок на выбранный день."""
 
+import copy
 from datetime import date, datetime, timedelta
 
 from PySide6.QtCore import QDate, QLocale, QSettings, Qt, QTimer, QUrl
@@ -25,15 +26,15 @@ from .bot_commands import BotContext, BotHandler, chunk
 from .version import VERSION
 from .duties_dialog import ChecklistDialog
 from .settings_dialog import (
-    SettingsDialog, backup_dir, backup_keep, grace_minutes, last_backup, lead_minutes, salary_rules,
-    set_last_backup, shift_change, theme_mode, water_schedule,
+    SettingsDialog, backup_dir, backup_keep, grace_minutes, last_backup, late_minutes, lead_minutes,
+    salary_rules, set_last_backup, shift_change, theme_mode, water_schedule,
 )
 from .shift_dialogs import CabinetDialog, CashOpDialog, CloseShiftDialog, StartShiftDialog, fmt_dt
 from .shifts import PROBLEM_STATUSES, REMIND_BEFORE_MINUTES, Shift, business_day, short_name, window
 from .templates_dialog import load_templates
 from .theme import C
 from .update_ui import UpdateController
-from .reminders import due_reminders, reminder_key
+from .reminders import due_reminders, overdue_deliveries, reminder_key
 from .users_dialog import LoginDialog, PasswordDialog, UserFormDialog, UsersDialog
 
 MONTHS_GENITIVE = [
@@ -61,6 +62,30 @@ ANNOUNCE_FOR = timedelta(days=7)  # сколько дней новое объя�
 
 def to_date(qd: QDate) -> date:
     return date(qd.year(), qd.month(), qd.day())
+
+
+def describe_delivery(d: Delivery) -> str:
+    """Доставка одной строкой — для журнала и сообщений."""
+    what = d.items.splitlines()[0] if d.items else "—"
+    return (f"№{d.id}: {d.day:%d.%m} {d.time or '—'}, {what}, {d.address or 'адрес не указан'}"
+            + (f" ({money(d.price)})" if d.price else "")).replace("№None: ", "")
+
+
+DELIVERY_FIELDS = (("day", "дата"), ("time", "время"), ("items", "что доставить"), ("recipient", "получатель"),
+                   ("phone", "телефон"), ("address", "адрес"), ("price", "взяли"), ("courier_pay", "курьеру"),
+                   ("delivered", "доставлено"), ("source", "откуда заказ"), ("customer_contact", "контакт заказчика"))
+
+
+def delivery_changes(old: Delivery, new: Delivery) -> str:
+    """Что поменяли в доставке: «адрес: «а» → «б»; взяли: 500 → 700»."""
+    parts = []
+    for field, title in DELIVERY_FIELDS:
+        a, b = getattr(old, field), getattr(new, field)
+        if a != b:
+            fmt = (lambda v: ("да" if v else "нет") if isinstance(v, bool) else
+                   f"{v:%d.%m.%Y}" if isinstance(v, date) else f"«{v}»" if isinstance(v, str) else str(v))
+            parts.append(f"{title}: {fmt(a)} → {fmt(b)}")
+    return "; ".join(parts)
 
 
 class LoggingTray(QSystemTrayIcon):
@@ -143,7 +168,17 @@ class MainWindow(QMainWindow):
         self.inbox = telegram.TelegramInbox(db, self)
         self.inbox.arrived.connect(self._on_announcements)
         self.bot = BotHandler()
-        self.inbox.handler = lambda text, chat, author: self.bot.handle(text, self._bot_context(), chat, author)
+        self._current_bot_chat = None  # чат того, чью команду обрабатываем сейчас
+        self._current_bot_author = ""
+
+        def handle(text, chat, author):
+            self._current_bot_chat, self._current_bot_author = chat, author
+            try:
+                return self.bot.handle(text, self._bot_context(), chat, author)
+            finally:
+                self._current_bot_chat, self._current_bot_author = None, ""
+
+        self.inbox.handler = handle
         self.inbox.reply = self._bot_reply
         self.settings = QSettings("FlowerDeliveries", "FlowerDeliveries")
 
@@ -255,6 +290,9 @@ class MainWindow(QMainWindow):
         self.edit_btn.clicked.connect(self.edit_delivery)
         self.delete_btn = QPushButton("🗑 Удалить")
         self.delete_btn.clicked.connect(self.delete_delivery)
+        self.keep_btn = QPushButton("↩ Оставить")
+        self.keep_btn.setToolTip("Отклонить запрос сотрудника на удаление этой доставки")
+        self.keep_btn.clicked.connect(self.keep_delivery)
         self.write_btn = QPushButton("💬 Написать заказчику")
         self.write_btn.setToolTip("Сообщение заказчику в его мессенджер")
         write_menu = QMenu(self.write_btn)
@@ -262,7 +300,7 @@ class MainWindow(QMainWindow):
             action = write_menu.addAction(title)
             action.triggered.connect(lambda _=False, k=kind: self.write_to_customer(k))
         self.write_btn.setMenu(write_menu)
-        for b in (add_btn, self.edit_btn, self.delete_btn, self.write_btn):
+        for b in (add_btn, self.edit_btn, self.delete_btn, self.keep_btn, self.write_btn):
             b.setMinimumHeight(32)
             buttons.addWidget(b)
         buttons.addStretch(1)
@@ -601,7 +639,7 @@ class MainWindow(QMainWindow):
             self.show_window()
 
     def change_password(self):
-        if PasswordDialog(self, self.db, self.user, need_old=True).exec() == QDialog.Accepted:
+        if PasswordDialog(self, self.db, self.user, need_old=True, actor=self.user).exec() == QDialog.Accepted:
             QMessageBox.information(self, "Готово", "Пароль изменён.")
 
     def manage_users(self):
@@ -649,7 +687,21 @@ class MainWindow(QMainWindow):
         return BotContext(
             db=self.db, now=datetime.now(), change=shift_change(), grace=grace_minutes(),
             water=water_schedule(), rules=salary_rules, version=VERSION, last_backup=last_backup(),
-            backup_now=self._bot_backup)
+            backup_now=self._bot_backup, decided=self._delete_decided, audit=self._audit_telegram)
+
+    def audit(self, action: str, details: str = ""):
+        """Запись в журнал действий от имени вошедшего сотрудника."""
+        try:
+            self.db.log_action(self.user, action, details)
+        except Exception:  # noqa: BLE001 — журнал не должен ломать работу
+            pass
+
+    def _audit_telegram(self, action: str, details: str):
+        try:
+            who = f"{self._current_bot_author} (Telegram)" if self._current_bot_author else "Telegram"
+            self.db.log_action(None, action, details, who=who)
+        except Exception:  # noqa: BLE001
+            pass
 
     def _bot_reply(self, text: str, chat: str):
         """Ответ на команду уходит только тому, кто спросил."""
@@ -772,6 +824,7 @@ class MainWindow(QMainWindow):
         self.check_shift()
         now = datetime.now()
         today = now.date()
+        self._check_overdue(now)
         deliveries = self.db.for_day(today) + self.db.for_day(today + timedelta(days=1))
         due = due_reminders(deliveries, now, lead_minutes(), self._reminded)
         for d in due:
@@ -790,6 +843,18 @@ class MainWindow(QMainWindow):
         self._last_reminded_day = due[0].day
         self.tray.showMessage(title, "\n".join(lines), QSystemTrayIcon.Warning, 60_000)
         QApplication.alert(self)
+
+    def _check_overdue(self, now: datetime):
+        """Доставка не отмечена через N минут после времени — сказать сотруднику и хозяевам в Telegram."""
+        today = now.date()
+        candidates = self.db.for_day(today - timedelta(days=1)) + self.db.for_day(today)
+        for d in overdue_deliveries(candidates, now, late_minutes(), self._reminded):
+            self._reminded.add(("late",) + reminder_key(d))
+            text = describe_delivery(d)
+            self.tray.showMessage("Доставка не отмечена", f"Время прошло, а доставка не отмечена: {text}",
+                                  QSystemTrayIcon.Warning, 60_000)
+            self.telegram.queue(f"⏰ Доставка не отмечена вовремя\n{text}"
+                                + (f"\nТелефон: {d.phone}" if d.phone else ""), key=f"late:{d.id}:{d.day}:{d.time}")
 
     # ----- обновление экрана -----
 
@@ -871,7 +936,7 @@ class MainWindow(QMainWindow):
             cells = {
                 COL_DONE: done,
                 COL_TIME: QTableWidgetItem(d.time),
-                COL_ITEMS: QTableWidgetItem(d.items),
+                COL_ITEMS: QTableWidgetItem(("🗑 ждёт удаления · " if d.delete_requested_at else "") + d.items),
                 COL_RECIPIENT: QTableWidgetItem(d.recipient),
                 COL_PHONE: QTableWidgetItem(d.phone),
                 COL_ADDRESS: QTableWidgetItem(d.address),
@@ -895,6 +960,11 @@ class MainWindow(QMainWindow):
                 self.table.setItem(row, col, item)
             if d.remainder < 0:
                 cells[COL_REST].setForeground(QColor(C.red))
+            if d.delete_requested_at:
+                cells[COL_ITEMS].setForeground(QColor(C.orange))
+                cells[COL_ITEMS].setToolTip(
+                    f"{d.delete_requested_by_name or 'Сотрудник'} попросил(а) удалить эту доставку "
+                    f"({d.delete_requested_at:%d.%m %H:%M}). Ждёт решения администратора.")
         self.table.resizeRowsToContents()
         self._loading = False
 
@@ -910,6 +980,12 @@ class MainWindow(QMainWindow):
         self.edit_btn.setEnabled(has)
         self.delete_btn.setEnabled(has)
         self.write_btn.setEnabled(has)
+        d = self.current_delivery()
+        self.keep_btn.setVisible(bool(self.user and self.user.is_admin and d and d.delete_requested_at))
+        pending = bool(d and d.delete_requested_at)
+        self.delete_btn.setText("🗑 Удалить" if not pending or (self.user and self.user.is_admin)
+                                else "🗑 Ждёт решения")
+        self.delete_btn.setEnabled(has and not (pending and self.user and not self.user.is_admin))
 
     # ----- действия -----
 
@@ -925,6 +1001,7 @@ class MainWindow(QMainWindow):
         d = self.deliveries[item.row()]
         delivered = item.checkState() == Qt.Checked
         self.db.set_delivered(d.id, delivered, self.user.id)
+        self.audit("Доставка отмечена доставленной" if delivered else "Отметка «Доставлено» снята", describe_delivery(d))
         self.refresh_all()
         if delivered and d.customer_contact and not d.sent("delivered"):
             QTimer.singleShot(0, lambda: self._offer_delivered_message(d))
@@ -975,6 +1052,7 @@ class MainWindow(QMainWindow):
         d = Delivery(day=self.selected_day(), created_by=self.user.id, delivered_by=self.user.id)
         if self._open_dialog(d):
             self.db.add(d)
+            self.audit("Доставка создана", describe_delivery(d))
             self._show_day(d.day)
 
     def edit_delivery(self):
@@ -982,10 +1060,14 @@ class MainWindow(QMainWindow):
         if d is None:
             return
         was_delivered = d.delivered
+        before = copy.copy(d)  # окно правит доставку на месте — запоминаем, что было
         if self._open_dialog(d):
             if d.delivered and not was_delivered:
                 d.delivered_by = self.user.id
             self.db.update(d)
+            changes = delivery_changes(before, d)
+            if changes:
+                self.audit("Доставка изменена", f"{describe_delivery(before)}: {changes}")
             self._show_day(d.day)
         else:
             self.refresh_day()  # отменили — вернуть исходные значения
@@ -995,11 +1077,61 @@ class MainWindow(QMainWindow):
         if d is None:
             return
         what = d.items.splitlines()[0] if d.items else d.address
+        if not self.user.is_admin:
+            self._request_delete(d, what)
+            return
+        approving = d.delete_requested_at is not None
         answer = QMessageBox.question(
             self, "Удалить доставку",
-            f"Удалить доставку «{what}»?",
+            (f"{d.delete_requested_by_name or 'Сотрудник'} просил(а) удалить доставку «{what}». Удалить?"
+             if approving else f"Удалить доставку «{what}»?"),
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
         )
         if answer == QMessageBox.Yes:
             self.db.delete(d.id)
+            self.audit("Удаление доставки подтверждено" if approving else "Доставка удалена", describe_delivery(d))
             self.refresh_all()
+
+    def _request_delete(self, d: Delivery, what: str):
+        """Сотрудник не удаляет сам: доставка остаётся, а администратор решает в Telegram (или в программе)."""
+        if d.delete_requested_at is not None:
+            QMessageBox.information(self, "Удаление доставки", "Запрос уже отправлен администратору, ждём решения.")
+            return
+        answer = QMessageBox.question(
+            self, "Запрос на удаление",
+            f"Удалять доставки может только администратор.\n\nОтправить ему запрос на удаление «{what}»? "
+            "Доставка останется в списке, пока он не решит.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
+        if answer != QMessageBox.Yes:
+            return
+        asked_at = datetime.now()
+        self.db.request_delete(d.id, self.user.id, asked_at)
+        self.audit("Запрос на удаление доставки", describe_delivery(d))
+        who = self.user.name or self.user.login
+        self.telegram.queue(
+            f"🗑 {who} просит удалить доставку\n{describe_delivery(d)}\n\n"
+            f"Удалить: /del_{d.id}\nОставить: /keep_{d.id}", key=f"del:{d.id}:{asked_at:%Y%m%d%H%M%S}")
+        configured = telegram.configured()
+        QMessageBox.information(
+            self, "Запрос отправлен",
+            "Администратор получил запрос в Telegram и решит." if configured
+            else "Администратор увидит запрос в программе и решит.")
+        self.refresh_all()
+
+    def keep_delivery(self):
+        """Админ отклоняет запрос на удаление (кнопка «Оставить»)."""
+        d = self.current_delivery()
+        if d is None or d.delete_requested_at is None:
+            return
+        self.db.cancel_delete_request(d.id)
+        self.audit("Удаление доставки отклонено", f"{describe_delivery(d)}; просил(а) {d.delete_requested_by_name or '—'}")
+        self.refresh_all()
+
+    def _delete_decided(self, d: Delivery, approved: bool, who: str):
+        """Решение пришло из Telegram: обновить экран, сказать сотрудникам, сообщить второму хозяину."""
+        self.refresh_all()
+        verdict = "подтверждено" if approved else "отклонено"
+        self.tray.showMessage(f"Удаление доставки {verdict}", describe_delivery(d), QSystemTrayIcon.Information, 30_000)
+        self.telegram.queue(f"ℹ️ {who or 'Администратор'}: удаление {verdict} — {describe_delivery(d)}",
+                            key=f"deldone:{d.id}:{verdict}:{datetime.now():%Y%m%d%H%M%S}",
+                            except_chat=self._current_bot_chat)
