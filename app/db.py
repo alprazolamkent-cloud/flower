@@ -953,10 +953,11 @@ class Database:
             (first.isoformat(), last.isoformat())).fetchall()
         return dict(rows)
 
-    def recent_writeoff_average(self, shift: Shift, count: int = 14) -> float | None:
-        """Сколько в среднем списывали за смену раньше (последние count сданных смен до этой), None — смен не было."""
+    def recent_writeoff_average(self, shift: Shift, count: int = 14, at_least: int = 3) -> float | None:
+        """Сколько в среднем списывали за смену раньше (последние count сданных смен до этой).
+        None — сданных смен раньше было меньше at_least: сравнивать не с чем, тревогу не поднимаем."""
         row = self.conn.execute(
             "SELECT AVG(writeoff), COUNT(*) FROM (SELECT writeoff FROM shifts WHERE closed_at IS NOT NULL"
             " AND id <> ? AND opened_at < ? ORDER BY opened_at DESC LIMIT ?)",
             (shift.id, _ts(shift.opened_at), count)).fetchone()
-        return row[0] if row and row[1] else None
+        return row[0] if row and row[1] >= max(at_least, 1) else None

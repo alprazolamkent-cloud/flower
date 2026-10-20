@@ -12,7 +12,9 @@ from datetime import date, datetime, time, timedelta
 
 from .db import Database, Delivery, User, UserError
 from .delivery_dialog import money
-from .salary import KIND_TITLES, PenaltyKind, SalaryRules, calculate, forecast, monthly_ranking, shop_writeoff
+from .salary import (
+    KIND_TITLES, PenaltyKind, SalaryRules, calculate, forecast, monthly_ranking, shifts_word, shop_writeoff,
+)
 from .shifts import STATUS_TEXT, Penalty, Shift, WaterSchedule, business_day, window
 
 CONFIRM_FOR = timedelta(minutes=5)
@@ -29,7 +31,7 @@ MENU = [
     ("month", "Выручка за месяц"),
     ("shifts", "Последние смены"),
     ("staff", "Сотрудники: смены и приход за месяц"),
-    ("salary", "Зарплата за месяц: все или /salary Анна"),
+    ("salary", "Зарплата: все, /salary Анна, /salary Анна прошлый"),
     ("problems", "Проблемы: недостачи, несданные смены"),
     ("deliveries", "Доставки: сегодня, завтра или дата"),
     ("water", "График смены воды"),
@@ -83,6 +85,7 @@ class BotContext:
     audit: Callable[[str, str], None] | None = None  # (действие, подробности) — запись в журнал действий
     penalty_kinds: list[PenaltyKind] = field(default_factory=list)  # список санкций из настроек
     penalty_changed: Callable[[Penalty, bool, str], None] | None = None  # (санкция, поставлена?, кто)
+    dispute_kept: Callable[[Penalty, str], None] | None = None  # (санкция, кто решил оставить)
 
 
 # ----- общие помощники -----
@@ -254,7 +257,7 @@ def revenue_text(ctx: BotContext, first: date, last: date, title: str) -> str:
     shifts = ctx.db.shifts_between(first, last)
     closed = [s for s in shifts if s.closed_at is not None]
     if not shifts:
-        return f"Смен {title} нет."
+        return f"📊 Выручка {title}: смен не было."
     total = {k: sum(getattr(s, k) for s in closed) for k in ("revenue", "flowers", "terminal", "qr", "cash_sales")}
     lines = [f"📊 Выручка {title}", f"Сдано смен: {len(closed)} из {len(shifts)}"]
     if closed:
@@ -361,7 +364,7 @@ def _salary_detail(ctx: BotContext, user: User, first: date, last: date, month: 
     today = ctx.now.date()
     plan = forecast(sal, rules, today) if first <= today <= last else None
     if plan is not None:
-        lines.append(f"🎯 Прогноз: ещё ~{plan.remaining_shifts} смен; для «от {money(plan.target.per_shift)}» нужно "
+        lines.append(f"🎯 Прогноз: ещё ~{shifts_word(plan.remaining_shifts)}; для «от {money(plan.target.per_shift)}» нужно "
                      f"в среднем {money(plan.needed_average)} за смену")
     if sal.shortage:
         lines.append(f"Недостача: −{money(sal.shortage)}")
@@ -378,8 +381,14 @@ def _salary_detail(ctx: BotContext, user: User, first: date, last: date, month: 
 
 
 def cmd_salary(ctx: BotContext, args: str) -> str:
-    first, last, _ = _period("месяц", ctx.now, ctx.change)
-    if args.strip():
+    """/зарплата, /зарплата Анна; «прошлый» в конце — за прошлый месяц (1-го числа, когда месяц закрыт)."""
+    args = args.strip()
+    period = "месяц"
+    m = re.fullmatch(r"(.*?)\s*прошл\w*(?:\s+месяц\w*)?", args, re.IGNORECASE)
+    if m:
+        args, period = m.group(1).strip(), "прошлый"
+    first, last, _ = _period(period, ctx.now, ctx.change)
+    if args:
         user, error = find_user(ctx.db, args)
         return error if user is None else _salary_detail(ctx, user, first, last, f"{first:%Y-%m}")
     return salary_overview(ctx, first, last)
@@ -387,15 +396,16 @@ def cmd_salary(ctx: BotContext, args: str) -> str:
 
 def salary_overview(ctx: BotContext, first: date, last: date) -> str:
     month = f"{first:%Y-%m}"
-    lines = [f"💰 Зарплата, {month[5:]}.{month[:4]}" + (" (на сейчас):" if last >= ctx.now.date() else ":")]
+    past = last < business_day(ctx.now, ctx.change)
+    lines = [f"💰 Зарплата, {month[5:]}.{month[:4]}" + (":" if past else " (на сейчас):")]
     for u in ctx.db.users():
         shifts = ctx.db.shifts_between(first, last, u.id)
         if shifts:
             sal = _calc(ctx, u.id, first, last, month)
             lines.append(f"• {u.name or u.login}: {money(sal.total)}" + ("  ⚠ без премии" if sal.blocked else ""))
     if len(lines) == 1:
-        return "В этом месяце смен ещё не было."
-    return "\n".join(lines) + "\nПодробнее: /зарплата Имя"
+        return f"За {MONTHS[first.month - 1]} смен не было."
+    return "\n".join(lines) + ("\nПодробнее: /зарплата Имя прошлый" if past else "\nПодробнее: /зарплата Имя")
 
 
 def writeoff_text(ctx: BotContext, first: date, last: date, title: str) -> str:
@@ -669,12 +679,20 @@ def cmd_unpen(ctx: BotContext, args: str) -> str:
 
 
 def cmd_pok(ctx: BotContext, args: str) -> str:
+    """/pok_N — оставить оспоренную санкцию в силе."""
     try:
-        penalty = ctx.db.resolve_dispute(int(args.strip()))
+        penalty = ctx.db.get_penalty(int(args.strip()))
     except ValueError:
         return "Укажите номер санкции."
     if penalty is None:
-        return "Такой санкции уже нет (возможно, вы её уже сняли)."
+        return "Такой санкции уже нет (возможно, её уже сняли)."
+    if penalty.disputed_at is None:
+        return "Эту санкцию не оспаривали — решать нечего."
+    if penalty.dispute_result:
+        return f"Спор уже решён: санкция «{penalty.title}» ({_name(penalty.user_name)}) остаётся."
+    penalty = ctx.db.resolve_dispute(penalty.id)
+    if ctx.dispute_kept:
+        ctx.dispute_kept(penalty, ctx.author)
     if ctx.audit:
         ctx.audit("Спор по санкции: оставлена", f"{_name(penalty.user_name)}, смена {penalty.shift_day:%d.%m}: "
                   f"{penalty.title}; решил(а) {ctx.author or 'Telegram'}")
@@ -696,6 +714,11 @@ def cmd_penalties(ctx: BotContext, args: str) -> str:
         user, error = find_user(ctx.db, args)
         if user is None:
             return error
+    return penalties_text(ctx, first, last, user) + "\n\n" + _catalog_lines(ctx)
+
+
+def penalties_text(ctx: BotContext, first: date, last: date, user: User | None = None) -> str:
+    """Санкции за месяц по сотрудникам, споры и условие списаний (для /штрафы и месячного отчёта)."""
     items = ctx.db.penalties_between(first, last, user.id if user else None)
     lines = [f"⚠ Штрафные санкции за {MONTHS[first.month - 1]}"]
     if not items:
@@ -713,6 +736,8 @@ def cmd_penalties(ctx: BotContext, args: str) -> str:
             lines.append(f"    {p.shift_day:%d.%m} {p.title} −{money(p.amount)} (отменить /unpen_{p.id})")
             if p.disputed_at and not p.dispute_result:
                 lines.append(f"      ✋ оспорено: «{p.dispute_text}» — оставить /pok_{p.id}")
+            elif p.dispute_result:
+                lines.append("      спор решён: санкция оставлена")
     rules = ctx.rules(None)
     if rules.max_writeoff_percent > 0:
         shop = shop_writeoff(ctx.db.shifts_between(first, last))
@@ -720,7 +745,6 @@ def cmd_penalties(ctx: BotContext, args: str) -> str:
         mark = "✅" if percent < rules.max_writeoff_percent else "❌ премий не будет"
         lines.append(f"\nСписания по магазину: {money(shop.writeoff)} = {percent:.1f}% "
                      f"(для премий меньше {rules.max_writeoff_percent:g}%) {mark}")
-    lines += ["", _catalog_lines(ctx)]
     return "\n".join(lines)
 
 

@@ -449,16 +449,21 @@ class MainWindow(QMainWindow):
 
     def _after_shift_closed(self, shift: Shift):
         """Итоги — в Telegram, данные — в резервную копию."""
-        if shift is not None and shift.closed_at is not None and telegram.settings()["on_close"]:
-            change = shift_change()
-            water = water_schedule().status(shift.day, self.db.water_change(shift.day) is not None,
-                                            datetime.now(), change)
-            missed = [i.text for i in self.db.checklist(shift) if not i.done]
-            late = shift.status(datetime.now(), change, grace_minutes()) == "late"
-            self.telegram.queue(telegram.shift_closed_text(
-                shift, change, late, water, missed, penalty_catalog(), self._writeoff_note(shift),
-                self.db.writeoff_items_for_shift(shift.id), self._writeoff_alert(shift)),
-                key=f"close:{shift.id}")
+        if shift is not None and shift.closed_at is not None:
+            alert = self._writeoff_alert(shift)
+            if telegram.settings()["on_close"]:
+                change = shift_change()
+                water = water_schedule().status(shift.day, self.db.water_change(shift.day) is not None,
+                                                datetime.now(), change)
+                missed = [i.text for i in self.db.checklist(shift) if not i.done]
+                late = shift.status(datetime.now(), change, grace_minutes()) == "late"
+                self.telegram.queue(telegram.shift_closed_text(
+                    shift, change, late, water, missed, penalty_catalog(), self._writeoff_note(shift),
+                    self.db.writeoff_items_for_shift(shift.id), alert),
+                    key=f"close:{shift.id}")
+            elif alert:  # итоги смен выключены, но о большом списании хозяева узнают всё равно
+                self.telegram.queue(f"{alert}\n{shift.user_name or 'Сотрудник'}, смена {shift.day:%d.%m}",
+                                    key=f"writeoff_alert:{shift.id}")
         self.run_backup()
 
     def update_shift_box(self):
@@ -695,7 +700,7 @@ class MainWindow(QMainWindow):
             db=self.db, now=datetime.now(), change=shift_change(), grace=grace_minutes(),
             water=water_schedule(), rules=salary_rules, version=VERSION, last_backup=last_backup(),
             backup_now=self._bot_backup, decided=self._delete_decided, audit=self._audit_telegram,
-            penalty_kinds=penalty_catalog(), penalty_changed=self._penalty_changed)
+            penalty_kinds=penalty_catalog(), penalty_changed=self._penalty_changed, dispute_kept=self._dispute_kept)
 
     def audit(self, action: str, details: str = ""):
         """Запись в журнал действий от имени вошедшего сотрудника."""
@@ -1150,13 +1155,16 @@ class MainWindow(QMainWindow):
         """Утренний, недельный и месячный отчёты хозяевам в Telegram — по одному разу за период."""
         if not telegram.configured():
             return
-        for report in due_reports(now, shift_change(), report_settings()):
+        for report in due_reports(now, shift_change(), report_settings(), grace_minutes()):
             if report.key in self._reports_done:
                 continue
-            self._reports_done.add(report.key)
-            ctx = self._bot_context()
-            text = report_text(report, ctx)
-            self.telegram.queue(text, key=report.key)
+            self._reports_done.add(report.key)  # даже если не получилось — не пытаться каждые 30 секунд
+            try:
+                text = report_text(report, self._bot_context())
+            except Exception:  # noqa: BLE001 — отчёт не должен мешать напоминаниям о доставках
+                continue
+            for i, part in enumerate(chunk(text)):
+                self.telegram.queue(part, key=report.key if i == 0 else f"{report.key}:{i}")
 
     def _writeoff_alert(self, shift) -> str:
         """Тревога, если за смену списали заметно больше обычного (среднего по последним сменам магазина)."""
@@ -1171,10 +1179,19 @@ class MainWindow(QMainWindow):
                     f"~{money(round(usual))} за смену")
         return ""
 
-    def _dispute_made(self, p):
-        """Сотрудник оспорил санкцию: хозяевам — в Telegram, на экране — уведомление."""
+    def _dispute_made(self, p) -> bool:
+        """Сотрудник оспорил санкцию: хозяевам — в Telegram, в журнал — для админа в программе.
+        True — ушло в Telegram."""
         self.audit("Санкция оспорена", f"{p.user_name or '—'}, {p.title}, смена {p.shift_day:%d.%m}: {p.dispute_text}")
         self.telegram.queue(telegram.dispute_text(p), key=f"dispute:{p.id}")
+        return telegram.configured()
+
+    def _dispute_kept(self, p, who: str):
+        """Хозяин в Telegram оставил оспоренную санкцию: сотруднику — на экран, второму хозяину — в Telegram."""
+        what = f"{p.title} ({p.user_name or '—'}, смена {p.shift_day:%d.%m})"
+        self.tray.showMessage("Спор по санкции решён", f"Санкция остаётся: {what}", QSystemTrayIcon.Information, 60_000)
+        self.telegram.queue(f"ℹ️ {who or 'Администратор'} оставил(а) санкцию после спора: {what}",
+                            key=f"pok:{p.id}", except_chat=self._current_bot_chat)
 
     def _writeoff_note(self, shift) -> str:
         """Списания по магазину за месяц смены — для итогов в Telegram."""

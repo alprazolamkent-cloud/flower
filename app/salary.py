@@ -7,7 +7,7 @@
 Сами штрафные санкции вычитаются из зарплаты.
 
 Праздничные смены: выручка в расчёт премии не идёт (ни в сумму, ни в средний приход за смену), зато за них
-платится своя ставка. Выходные (суббота, воскресенье) тоже могут иметь свою ставку.
+может платиться своя ставка. В обычные выходные (суббота, воскресенье) всё как в будни.
 """
 
 import calendar
@@ -79,27 +79,24 @@ class SalaryRules:
     max_penalties: int = 3  # премия, только если санкций за месяц МЕНЬШЕ этого числа (0 — не проверять)
     max_writeoff_percent: float = 15.0  # и списаний по магазину МЕНЬШЕ этого процента (0 — не проверять)
     writeoff_base: str = "total"  # от чего считать процент списаний, см. WRITEOFF_BASES
-    weekend_rate: int = 0  # ставка за смену в субботу и воскресенье (0 — как обычная)
     holiday_rate: int = 0  # ставка за праздничную смену (0 — как обычная)
     holidays: Holidays = field(default_factory=Holidays)
 
     def shift_kind(self, day: date) -> str:
-        """holiday, weekend или normal — праздник важнее выходного."""
-        if self.holidays.is_holiday(day):
-            return "holiday"
-        return "weekend" if day.weekday() >= 5 else "normal"
+        """holiday или normal (обычные выходные — как будни)."""
+        return "holiday" if self.holidays.is_holiday(day) else "normal"
 
     def rate_for(self, day: date) -> int:
-        kind = self.shift_kind(day)
-        rate = {"holiday": self.holiday_rate, "weekend": self.weekend_rate}.get(kind, 0)
-        return rate or self.shift_rate
+        if self.shift_kind(day) == "holiday" and self.holiday_rate:
+            return self.holiday_rate
+        return self.shift_rate
 
     def active_tiers(self) -> list[Tier]:
         """Заполненные ступени по возрастанию."""
         return sorted((t for t in self.tiers if t.percent > 0), key=lambda t: t.per_shift)
 
 
-KIND_TITLES = {"normal": "обычные", "weekend": "выходные", "holiday": "праздничные"}
+KIND_TITLES = {"normal": "обычные", "holiday": "праздничные"}
 
 
 @dataclass
@@ -149,7 +146,7 @@ def calculate(shifts: list[Shift], adjustments: list[Adjustment], rules: SalaryR
     revenue = sum(s.revenue for s in counted)
     average = revenue / len(counted) if counted else 0.0
     base_parts = []
-    for kind in ("normal", "weekend", "holiday"):
+    for kind in ("normal", "holiday"):
         group = [s for s in closed if rules.shift_kind(s.day) == kind]
         if group:
             base_parts.append((kind, len(group), rules.rate_for(group[0].day)))
@@ -197,6 +194,15 @@ def calculate(shifts: list[Shift], adjustments: list[Adjustment], rules: SalaryR
         writeoff=shop or ShopWriteoff(),
         writeoff_percent=percent,
     )
+
+
+def shifts_word(n: int) -> str:
+    """1 смена, 3 смены, 5 смен."""
+    if n % 10 == 1 and n % 100 != 11:
+        return f"{n} смена"
+    if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14:
+        return f"{n} смены"
+    return f"{n} смен"
 
 
 @dataclass

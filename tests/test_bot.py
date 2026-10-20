@@ -108,7 +108,7 @@ def test_revenue_periods(shop):
 
 
 def test_revenue_nothing(db):
-    assert "нет" in ask(db, "/выручка вчера")
+    assert "смен не было" in ask(db, "/выручка вчера")
 
 
 def test_staff_and_salary(shop):

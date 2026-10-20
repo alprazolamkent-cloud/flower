@@ -9,7 +9,7 @@ from app import reports, telegram
 from app.bot_commands import BotContext, BotHandler, parse_command
 from app.db import Database, UserError
 from app.holidays import DEFAULT_TEXT, Holidays, parse_holidays
-from app.salary import SalaryRules, Tier, calculate, forecast, monthly_ranking
+from app.salary import SalaryRules, Tier, calculate, forecast, monthly_ranking, shifts_word
 from app.shifts import WaterSchedule
 
 CH = time(8, 0)
@@ -43,13 +43,14 @@ def test_parse_holidays():
 
 
 def test_holiday_shift_has_own_rate_and_no_bonus_revenue():
-    rules = SalaryRules(2000, [Tier(30000, 5)], holiday_rate=3000, weekend_rate=2500,
-                        holidays=Holidays(yearly={(8, 3)}))
+    rules = SalaryRules(2000, [Tier(30000, 5)], holiday_rate=3000, holidays=Holidays(yearly={(8, 3)}))
     shifts = [fake(date(2026, 3, 6), 40000),   # пятница — обычная
-              fake(date(2026, 3, 7), 40000),   # суббота — выходная
+              fake(date(2026, 3, 7), 40000),   # суббота — как будни
               fake(date(2026, 3, 8), 90000)]   # праздник
     sal = calculate(shifts, [], rules)
-    assert sal.base == 2000 + 2500 + 3000
+    assert sal.base == 2000 + 2000 + 3000
+    assert sal.base_parts == [("normal", 2, 2000), ("holiday", 1, 3000)]
+    assert rules.shift_kind(date(2026, 3, 7)) == "normal"
     assert sal.holiday_shifts == 1 and sal.holiday_revenue == 90000
     assert sal.revenue == 80000 and sal.bonus_shifts == 2 and sal.average == 40000
     assert sal.bonus == 4000  # 5% только с 80 000, праздничные 90 000 не в счёт
@@ -154,7 +155,13 @@ def test_due_reports():
     assert first[1].key == "report:monthly:2026-10"
     off = {**cfg, "morning": False, "weekly": False, "monthly": False}
     assert reports.due_reports(datetime(2026, 11, 2, 9, 0), CH, off) == []
-    assert reports.parse_time("bad").hour == 8
+    assert reports.parse_time("bad").hour == 9
+    # время на сдачу вчерашней смены ещё не вышло (пересменка 8:00 + 30 мин) — утренний отчёт ждёт
+    early = {**cfg, "time": "08:00"}
+    assert reports.due_reports(datetime(2026, 10, 20, 8, 10), CH, early) == []
+    assert [r.kind for r in reports.due_reports(datetime(2026, 10, 20, 8, 31), CH, early)] == ["morning"]
+    # программу включили только вечером — «доброе утро» уже не шлём
+    assert reports.due_reports(datetime(2026, 10, 20, 20, 0), CH, cfg) == []
 
 
 def test_report_texts(db):
@@ -169,3 +176,70 @@ def test_report_texts(db):
     ctx.now = datetime(2026, 11, 1, 9, 0)
     text = reports.report_text(month, ctx)
     assert "Отчёт за октябрь" in text and "Зарплата" in text and "Рейтинг" in text and "Анна" in text
+
+
+def test_shifts_word():
+    assert [shifts_word(n) for n in (1, 3, 5, 11, 12, 21, 22, 25)] == \
+        ["1 смена", "3 смены", "5 смен", "11 смен", "12 смен", "21 смена", "22 смены", "25 смен"]
+
+
+def test_writeoff_alert_needs_history(db):
+    anna = db.add_user("anna", "Анна", "1")
+    sh(db, anna, date(2026, 10, 1), writeoff=500)
+    second = sh(db, anna, date(2026, 10, 2), writeoff=9000)
+    assert db.recent_writeoff_average(second) is None  # одна прошлая смена — сравнивать не с чем
+
+
+def test_pok_only_for_disputed(db):
+    anna = db.add_user("anna", "Анна", "1")
+    s = sh(db, anna, date(2026, 10, 18))
+    p = db.add_penalty(s.id, 4, "Нет ценников", 1000, "Мария", datetime(2026, 10, 19, 9))
+    kept = []
+    ctx = make_ctx(db)
+    ctx.dispute_kept = lambda pen, who: kept.append(pen.id)
+    assert "не оспаривали" in BotHandler().handle(f"/pok_{p.id}", ctx)
+    db.dispute_penalty(p.id, "упали", NOW)
+    assert "Спор закрыт" in BotHandler().handle(f"/pok_{p.id}", ctx) and kept == [p.id]
+    assert "уже решён" in BotHandler().handle(f"/pok_{p.id}", ctx) and kept == [p.id]
+    assert "спор решён" in BotHandler().handle("/штрафы", ctx)
+
+
+def test_salary_last_month(db):
+    anna = db.add_user("anna", "Анна", "1")
+    sh(db, anna, date(2026, 9, 10), revenue=40000)
+    ctx = make_ctx(db)
+    assert "За октябрь смен не было" in BotHandler().handle("/зарплата", ctx)
+    last = BotHandler().handle("/зарплата прошлый", ctx)
+    assert "09.2026:" in last and "/зарплата Имя прошлый" in last
+    detail = BotHandler().handle("/зарплата Анна прошлый", ctx)
+    assert "Анна, 09.2026" in detail and "Итого" in detail
+
+
+def test_monthly_report_takes_last_month_penalties(db):
+    anna = db.add_user("anna", "Анна", "1")
+    s = sh(db, anna, date(2026, 10, 30))
+    db.add_penalty(s.id, 4, "Нет ценников", 1000, "Мария", datetime(2026, 10, 31, 9))
+    ctx = make_ctx(db)
+    ctx.now = datetime(2026, 11, 1, 9, 0)
+    cfg = {"morning": False, "time": "09:00", "weekly": False, "monthly": True}
+    month = reports.due_reports(ctx.now, CH, cfg)[0]
+    assert "Нет ценников" in reports.report_text(month, ctx)
+
+
+def test_penalty_dialog_keep_dispute(db, monkeypatch, request):
+    import shiboken6
+    from PySide6.QtWidgets import QMessageBox
+    from app.shift_dialogs import PenaltyDialog
+    monkeypatch.setattr(QMessageBox, "information", lambda *a, **k: None)
+    admin = db.add_user("boss", "Мария", "1", is_admin=True)
+    anna = db.add_user("anna", "Анна", "1")
+    s = sh(db, anna, date(2026, 10, 18))
+    p = db.add_penalty(s.id, 4, "Нет ценников", 1000, "Мария", datetime(2026, 10, 19, 9))
+    db.dispute_penalty(p.id, "упали", NOW)
+    dlg = PenaltyDialog(None, db, s, [], admin)
+    request.addfinalizer(lambda: shiboken6.delete(dlg))  # иначе окно переживёт приложение и уронит выход
+    assert dlg.table.item(0, 4).text() == "✋ оспорено: «упали»"
+    dlg.table.selectRow(0)
+    dlg._keep()
+    assert db.get_penalty(p.id).dispute_result == "kept"
+    assert dlg.table.item(0, 4).text() == "спор решён: санкция оставлена"

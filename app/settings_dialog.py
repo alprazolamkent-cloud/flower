@@ -20,6 +20,7 @@ from .duties_dialog import DutiesEditor
 from .salary import DEFAULT_PENALTY_KINDS, WRITEOFF_BASES, PenaltyKind, SalaryRules, Tier
 from .holidays import DEFAULT_TEXT as DEFAULT_HOLIDAYS
 from .holidays import Holidays, parse_holidays
+from .reports import parse_time
 from .salary_dialog import EmployeeTiersDialog, HolidaysDialog, PenaltyCatalogEditor, TiersEditor
 from .shifts import DEFAULT_CHANGE, DEFAULT_GRACE_MINUTES, WaterSchedule
 from .templates_dialog import TemplatesDialog
@@ -108,7 +109,7 @@ def report_settings() -> dict:
     """Автоматические отчёты в Telegram: утренний, недельный, месячный."""
     s = _settings()
     on = lambda key, default="true": str(s.value(key, default)) == "true"
-    return {"morning": on("report_morning"), "time": str(s.value("report_time", "08:30")),
+    return {"morning": on("report_morning"), "time": str(s.value("report_time", "09:00")),
             "weekly": on("report_weekly"), "monthly": on("report_monthly")}
 
 
@@ -144,7 +145,6 @@ def salary_rules(user_id: int | None = None) -> SalaryRules:
         tiers=tiers if tiers is not None else bonus_tiers(),
         above_plan_only=str(s.value("bonus_above_plan", "false")) == "true",
         deduct_shortage=str(s.value("salary_deduct", "true")) == "true",
-        weekend_rate=int(s.value("salary_weekend_rate", 0)),
         holiday_rate=int(s.value("salary_holiday_rate", 0)),
         holidays=holidays_calendar(),
         max_penalties=int(s.value("bonus_max_penalties", 3)),
@@ -349,14 +349,6 @@ class SettingsDialog(QDialog):
         self.rate_box.setSuffix(" ₽")
         self.rate_box.setValue(rules.shift_rate)
         base_form.addRow("За каждую сданную смену:", self.rate_box)
-        self.weekend_box = QSpinBox()
-        self.weekend_box.setRange(0, 100_000)
-        self.weekend_box.setSingleStep(100)
-        self.weekend_box.setGroupSeparatorShown(True)
-        self.weekend_box.setSuffix(" ₽")
-        self.weekend_box.setSpecialValueText("как обычная")
-        self.weekend_box.setValue(rules.weekend_rate)
-        base_form.addRow("Смена в субботу и воскресенье:", self.weekend_box)
         self.holiday_box = QSpinBox()
         self.holiday_box.setRange(0, 100_000)
         self.holiday_box.setSingleStep(100)
@@ -419,8 +411,8 @@ class SettingsDialog(QDialog):
         form.addRow(self.rep_morning)
         self.rep_time = QTimeEdit()
         self.rep_time.setDisplayFormat("HH:mm")
-        hour, minute = (int(x) for x in reports["time"].split(":"))
-        self.rep_time.setTime(QTime(hour, minute))
+        at = parse_time(reports["time"])
+        self.rep_time.setTime(QTime(at.hour, at.minute))
         form.addRow("Во сколько присылать:", self.rep_time)
         self.rep_weekly = QCheckBox("По понедельникам — итоги недели")
         self.rep_weekly.setChecked(reports["weekly"])
@@ -716,7 +708,6 @@ class SettingsDialog(QDialog):
             ("вода раз в (дн.)", schedule.every, self.water_every.value(), False),
             ("день замены воды", schedule.anchor.isoformat(), self.water_anchor.date().toString("yyyy-MM-dd"), False),
             ("ставка за смену", rules.shift_rate, self.rate_box.value(), False),
-            ("ставка в выходные", rules.weekend_rate, self.weekend_box.value(), False),
             ("ставка в праздники", rules.holiday_rate, self.holiday_box.value(), False),
             ("праздничные дни", " ".join(holidays_text().split()), " ".join(self.holidays_text.split()), True),
             ("утренний отчёт", report_settings()["morning"], self.rep_morning.isChecked(), False),
@@ -759,7 +750,6 @@ class SettingsDialog(QDialog):
         settings.setValue("water_every", self.water_every.value())
         settings.setValue("water_anchor", self.water_anchor.date().toString("yyyy-MM-dd"))
         settings.setValue("salary_rate", self.rate_box.value())
-        settings.setValue("salary_weekend_rate", self.weekend_box.value())
         settings.setValue("salary_holiday_rate", self.holiday_box.value())
         settings.setValue("holidays_text", self.holidays_text)
         settings.setValue("report_morning", _bool(self.rep_morning.isChecked()))
