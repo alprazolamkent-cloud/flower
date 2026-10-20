@@ -2,6 +2,9 @@ name: Build Windows exe
 
 on:
   push:
+    paths-ignore:  # правки описания и картинок не выпускают новую версию
+      - "README.md"
+      - "docs/**"
   workflow_dispatch:
 
 permissions:
