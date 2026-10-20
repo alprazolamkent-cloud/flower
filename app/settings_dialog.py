@@ -253,7 +253,8 @@ class SettingsDialog(QDialog):
         self.tg_close.setChecked(cfg["on_close"])
         form.addRow(self.tg_close)
         form.addRow(_gray_label("О проблемах (несданная смена, расхождение кассы при приёме) бот пишет всегда.\n"
-                                "Нет интернета — сообщения дождутся связи и уйдут позже."))
+                                "Нет интернета — сообщения дождутся связи и уйдут позже.\n"
+                                "Объявление сотрудникам: напишите боту сообщение, начиная с «!»."))
         layout.addLayout(form)
         test = QPushButton("Отправить проверку")
         test.clicked.connect(self._test_telegram)
@@ -409,6 +410,8 @@ class SettingsDialog(QDialog):
         settings.setValue("salary_rate", self.rate_box.value())
         settings.setValue("salary_percent", self.percent_box.value())
         settings.setValue("salary_deduct", _bool(self.deduct_check.isChecked()))
+        if self.token_edit.text().strip() != telegram.settings()["token"]:
+            settings.remove("tg_offset")  # другой бот — читать его сообщения с начала
         settings.setValue("tg_token", self.token_edit.text().strip())
         settings.setValue("tg_chat_id", self.chat_edit.text().strip())
         settings.setValue("tg_on_start", _bool(self.tg_start.isChecked()))

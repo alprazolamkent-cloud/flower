@@ -1,7 +1,7 @@
 """Хранение доставок, сотрудников и смен в SQLite."""
 
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta
 
 from .auth import hash_password, verify_password
@@ -46,6 +46,14 @@ class User:
     login: str
     name: str
     is_admin: bool
+
+
+@dataclass
+class Announcement:
+    id: int
+    text: str
+    created_at: datetime
+    readers: list[tuple[str, datetime]] = field(default_factory=list)  # (кто, когда прочитал)
 
 
 @dataclass
@@ -133,6 +141,18 @@ CREATE TABLE IF NOT EXISTS duties (
     text     TEXT    NOT NULL,
     position INTEGER NOT NULL DEFAULT 0,
     active   INTEGER NOT NULL DEFAULT 1
+);
+CREATE TABLE IF NOT EXISTS announcements (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    update_id  INTEGER UNIQUE,
+    text       TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS announcement_reads (
+    announcement_id INTEGER NOT NULL,
+    user_id         INTEGER NOT NULL,
+    read_at         TEXT    NOT NULL,
+    PRIMARY KEY (announcement_id, user_id)
 );
 CREATE TABLE IF NOT EXISTS shift_duties (
     shift_id INTEGER NOT NULL,
@@ -410,6 +430,7 @@ class Database:
         self.conn.execute("UPDATE cash_ops SET created_by=NULL WHERE created_by=?", (user_id,))
         self.conn.execute("UPDATE water_changes SET user_id=NULL WHERE user_id=?", (user_id,))
         self.conn.execute("DELETE FROM salary_adjustments WHERE user_id=?", (user_id,))
+        self.conn.execute("DELETE FROM announcement_reads WHERE user_id=?", (user_id,))
         self.conn.execute("DELETE FROM users WHERE id=?", (user_id,))
         self.conn.commit()
 
@@ -643,4 +664,47 @@ class Database:
             "INSERT INTO shift_duties (shift_id, duty_id, text, done_at) VALUES (?, ?, ?, ?)"
             " ON CONFLICT (shift_id, duty_id) DO UPDATE SET done_at = excluded.done_at",
             (shift_id, duty_id, text, _ts(now) if done else None))
+        self.conn.commit()
+
+    # ----- объявления для сотрудников -----
+
+    def add_announcement(self, text: str, created_at: datetime, update_id: int | None = None) -> int | None:
+        """Новое объявление; None — пустое или уже было (то же сообщение Telegram)."""
+        text = text.strip()
+        if not text:
+            return None
+        cur = self.conn.execute(
+            "INSERT OR IGNORE INTO announcements (update_id, text, created_at) VALUES (?, ?, ?)",
+            (update_id, text, _ts(created_at)))
+        self.conn.commit()
+        return cur.lastrowid if cur.rowcount else None
+
+    def unread_announcements(self, user_id: int, since: datetime) -> list[Announcement]:
+        rows = self.conn.execute(
+            "SELECT id, text, created_at FROM announcements a WHERE created_at >= ? AND NOT EXISTS"
+            " (SELECT 1 FROM announcement_reads r WHERE r.announcement_id = a.id AND r.user_id = ?)"
+            " ORDER BY created_at, id", (_ts(since), user_id)).fetchall()
+        return [Announcement(r[0], r[1], datetime.fromisoformat(r[2])) for r in rows]
+
+    def mark_announcements_read(self, ids: list[int], user_id: int, now: datetime):
+        self.conn.executemany(
+            "INSERT OR IGNORE INTO announcement_reads (announcement_id, user_id, read_at) VALUES (?, ?, ?)",
+            [(i, user_id, _ts(now)) for i in ids])
+        self.conn.commit()
+
+    def announcements(self, limit: int = 100) -> list[Announcement]:
+        """Последние объявления, новые сверху, с теми, кто прочитал."""
+        items = [Announcement(r[0], r[1], datetime.fromisoformat(r[2])) for r in self.conn.execute(
+            "SELECT id, text, created_at FROM announcements ORDER BY created_at DESC, id DESC LIMIT ?",
+            (limit,)).fetchall()]
+        for item in items:
+            item.readers = [(r[0], datetime.fromisoformat(r[1])) for r in self.conn.execute(
+                "SELECT COALESCE(NULLIF(u.name, ''), u.login, ''), r.read_at FROM announcement_reads r"
+                " LEFT JOIN users u ON u.id = r.user_id WHERE r.announcement_id = ? ORDER BY r.read_at",
+                (item.id,)).fetchall()]
+        return items
+
+    def delete_announcement(self, announcement_id: int):
+        self.conn.execute("DELETE FROM announcement_reads WHERE announcement_id = ?", (announcement_id,))
+        self.conn.execute("DELETE FROM announcements WHERE id = ?", (announcement_id,))
         self.conn.commit()

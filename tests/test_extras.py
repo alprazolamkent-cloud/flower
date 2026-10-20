@@ -194,3 +194,60 @@ def test_long_telegram_text_is_shortened(db, monkeypatch):
     sender.queue("x" * 10_000)
     [(_, text)] = db.unsent_messages()
     assert len(text) <= telegram.MAX_TEXT
+
+
+# ----- объявления из Telegram -----
+
+def _update(update_id, chat_id, text, ts=1_760_000_000):
+    return {"update_id": update_id, "message": {"chat": {"id": chat_id}, "text": text, "date": ts}}
+
+
+def test_parse_announcements_only_owner_and_prefix():
+    updates = [
+        _update(1, 777, "! С понедельника розы по 150 ₽"),
+        _update(2, 777, "ок"),  # обычный ответ — не объявление
+        _update(3, 999, "! я чужой"),  # чужой чат
+        _update(4, 777, "!   "),  # пустое
+        _update(5, 777, "!Скотч в шкафу снизу\nспасибо"),
+    ]
+    found = telegram.parse_announcements(updates, "777")
+    assert [(u, t) for u, t, _ in found] == [(1, "С понедельника розы по 150 ₽"), (5, "Скотч в шкафу снизу\nспасибо")]
+
+
+def test_announcement_reads(db):
+    anna, oleg = db.add_user("anna", "Анна", "1"), db.add_user("oleg", "Олег", "1")
+    a = db.add_announcement("Розы по 150", datetime(2026, 10, 20, 9, 0), update_id=10)
+    assert db.add_announcement("Розы по 150", datetime(2026, 10, 20, 9, 0), update_id=10) is None  # повтор
+    assert db.add_announcement("   ", datetime(2026, 10, 20, 9, 0)) is None
+    old = db.add_announcement("Старое", datetime(2026, 9, 1, 9, 0))
+    since = datetime(2026, 10, 13)
+    assert [x.id for x in db.unread_announcements(anna.id, since)] == [a]  # старое уже не всплывает
+    db.mark_announcements_read([a], anna.id, datetime(2026, 10, 20, 9, 15))
+    assert db.unread_announcements(anna.id, since) == []
+    assert [x.id for x in db.unread_announcements(oleg.id, since)] == [a]
+    [first, second] = db.announcements()
+    assert first.id == a and first.readers == [("Анна", datetime(2026, 10, 20, 9, 15))]
+    assert second.id == old and second.readers == []
+    db.delete_announcement(a)
+    assert [x.id for x in db.announcements()] == [old]
+
+
+def test_inbox_skips_old_messages_on_first_connect(db, monkeypatch):
+    from PySide6.QtCore import QSettings
+    store = {}
+    monkeypatch.setattr(QSettings, "value", lambda self, key, default=None: store.get(key, default))
+    monkeypatch.setattr(QSettings, "setValue", lambda self, key, value: store.__setitem__(key, value))
+    monkeypatch.setattr(telegram, "settings", lambda: {"token": "t", "chat_id": "777", "on_start": True, "on_close": True})
+    inbox = telegram.TelegramInbox.__new__(telegram.TelegramInbox)  # без таймера и потоков
+    inbox.db, inbox.busy = db, False
+    arrived = []
+    inbox.arrived = type("S", (), {"emit": lambda self, ids: arrived.append(ids)})()
+
+    inbox._on_fetched([], "")  # бот пустой при подключении
+    assert store["tg_offset"] == 0 and arrived == []
+    inbox._on_fetched([_update(5, 777, "! Первое объявление")], "")
+    assert len(arrived) == 1 and store["tg_offset"] == 6  # первое настоящее объявление не потерялось
+
+    store.clear()  # новый бот, а в нём старый «привет» и даже «!» до подключения
+    inbox._on_fetched([_update(1, 777, "! написано до подключения")], "")
+    assert len(arrived) == 1 and store["tg_offset"] == 2

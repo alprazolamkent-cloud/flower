@@ -19,6 +19,7 @@ from .delivery_dialog import DeliveryDialog, money
 from .icon import flower_icon
 from .messaging import KINDS, SHORT, build_action, render
 from . import backup, telegram
+from .announcements_dialog import HistoryDialog, UnreadDialog, short
 from .duties_dialog import ChecklistDialog
 from .settings_dialog import (
     SettingsDialog, backup_dir, backup_keep, grace_minutes, last_backup, lead_minutes, salary_rules,
@@ -56,6 +57,7 @@ DONE_DAY_BG = QColor("#c8e6c9")  # всё доставлено
 WATER_COLORS = {"planned": "#1e88e5", "done": "#1e88e5", "missed": "#c62828"}
 WATER_REMIND_AFTER = timedelta(hours=4)  # через сколько после начала смены напомнить про воду
 BACKUP_EVERY = timedelta(hours=24)
+ANNOUNCE_FOR = timedelta(days=7)  # сколько дней новое объявление всплывает тем, кто его не прочитал
 
 
 def to_date(qd: QDate) -> date:
@@ -127,6 +129,8 @@ class MainWindow(QMainWindow):
         self._water_reminded: set[date] = set()
         self._backup_warned: date | None = None
         self.telegram = telegram.TelegramSender(db, self)
+        self.inbox = telegram.TelegramInbox(db, self)
+        self.inbox.arrived.connect(self._on_announcements)
         self.settings = QSettings("FlowerDeliveries", "FlowerDeliveries")
 
         self.setWindowTitle("Доставки цветов")
@@ -218,6 +222,9 @@ class MainWindow(QMainWindow):
         top.addWidget(self.day_title, 1)
         self.user_label = QLabel()
         top.addWidget(self.user_label)
+        self.ann_btn = QPushButton("📢 Объявления")
+        self.ann_btn.clicked.connect(self.open_announcements)
+        top.addWidget(self.ann_btn)
         self.settings_btn = QPushButton("⚙ Настройки")
         self.settings_btn.clicked.connect(self.open_settings)
         password_btn = QPushButton("🔑 Сменить пароль")
@@ -572,6 +579,7 @@ class MainWindow(QMainWindow):
         self.user_label.setText(f"Вы вошли: <b>{user.name or user.login}</b> ({role})")
         self.settings_btn.setVisible(user.is_admin)
         self.update_shift_box()
+        self._update_ann_button()
 
     def logout(self):
         self.set_user(None)
@@ -601,6 +609,7 @@ class MainWindow(QMainWindow):
         self.activateWindow()
         self.refresh_all()
         self.updater.show_pending()
+        QTimer.singleShot(0, self.show_unread_announcements)
 
     def quit_app(self):
         self._really_quit = True
@@ -640,6 +649,44 @@ class MainWindow(QMainWindow):
             self.tray.showMessage("Резервная копия",
                                   f"На флешку не скопировано ({result.extra_error}). "
                                   "Копия сохранена только на компьютере.", QSystemTrayIcon.Warning, 30_000)
+
+    # ----- объявления -----
+
+    def _unread(self) -> list:
+        if self.user is None or self.user.is_admin:
+            return []  # объявления пишет хозяин — показываем их сотрудникам
+        return self.db.unread_announcements(self.user.id, datetime.now() - ANNOUNCE_FOR)
+
+    def _update_ann_button(self):
+        count = len(self._unread())
+        self.ann_btn.setText(f"📢 Объявления ({count})" if count else "📢 Объявления")
+        self.ann_btn.setStyleSheet("font-weight: bold; color: #c62828" if count else "")
+
+    def _on_announcements(self, ids: list):
+        for item in self.db.announcements(limit=len(ids) + 5):
+            if item.id in ids:
+                self.telegram.queue(f"✅ Принято, покажу сотрудникам: «{short(item.text)}»", key=f"ann:{item.id}")
+                self.tray.showMessage("📢 Объявление", item.text, QSystemTrayIcon.Information, 60_000)
+        self._update_ann_button()
+        if self.isVisible() and QApplication.activeModalWidget() is None:
+            self.show_unread_announcements()
+
+    def show_unread_announcements(self):
+        items = self._unread()
+        if not items or not self.isVisible() or QApplication.activeModalWidget() is not None:
+            return
+        name = self.user.name or self.user.login
+        if UnreadDialog(self, items, name).exec() == QDialog.Accepted:
+            now = datetime.now()
+            self.db.mark_announcements_read([i.id for i in items], self.user.id, now)
+            for item in items:
+                self.telegram.queue(f"👀 {name} прочитал(а) в {now:%H:%M}: «{short(item.text)}»",
+                                    key=f"read:{item.id}:{self.user.id}")
+        self._update_ann_button()
+
+    def open_announcements(self):
+        HistoryDialog(self, self.db, self.user).exec()
+        self._update_ann_button()
 
     def after_restore(self):
         QMessageBox.information(self, "Восстановление", "Данные восстановлены из копии. Войдите заново.")

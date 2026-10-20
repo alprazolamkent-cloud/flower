@@ -16,6 +16,7 @@ API = "https://api.telegram.org/bot{token}/{method}"
 TIMEOUT = 15
 FLUSH_EVERY_MS = 60_000
 MAX_TEXT = 4000  # предел Telegram — 4096 знаков
+POLL_EVERY_MS = 30_000
 
 
 class TelegramError(Exception):
@@ -55,6 +56,32 @@ def find_chats(token: str) -> list[tuple[str, str]]:
                 x for x in (chat.get("first_name"), chat.get("last_name")) if x) or chat.get("username", "")
             chats[str(chat["id"])] = title
     return list(chats.items())
+
+
+ANNOUNCE_PREFIX = "!"
+
+
+def get_updates(token: str, offset: int | None) -> list[dict]:
+    params = {"timeout": 0}
+    if offset is not None:
+        params["offset"] = offset  # подтверждает получение всего, что раньше
+    return _call(token, "getUpdates", params).get("result", [])
+
+
+def parse_announcements(updates: list[dict], chat_id: str) -> list[tuple[int, str, datetime]]:
+    """Объявления из сообщений хозяина: только из его чата и только начинающиеся с «!»."""
+    found = []
+    for update in updates:
+        message = update.get("message") or {}
+        if str((message.get("chat") or {}).get("id")) != str(chat_id):
+            continue  # чужой человек нашёл бота — игнорируем
+        text = (message.get("text") or message.get("caption") or "").strip()
+        if not text.startswith(ANNOUNCE_PREFIX):
+            continue  # обычный ответ боту («ок», «понял») — не объявление
+        text = text[len(ANNOUNCE_PREFIX):].strip()
+        if text:
+            found.append((update["update_id"], text, datetime.fromtimestamp(message.get("date", 0))))
+    return found
 
 
 # ----- настройки -----
@@ -124,6 +151,55 @@ def not_closed_text(shift: Shift) -> str:
 
 
 # ----- отправка в фоне -----
+
+class TelegramInbox(QObject):
+    """Раз в полминуты забирает новые сообщения бота и сохраняет объявления хозяина."""
+
+    fetched = Signal(list, str)  # (обновления, текст ошибки) — из фонового потока
+    arrived = Signal(list)  # id новых объявлений — для главного окна
+
+    def __init__(self, db, parent=None):
+        super().__init__(parent)
+        self.db = db
+        self.busy = False
+        self.fetched.connect(self._on_fetched)
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.poll)
+        self.timer.start(POLL_EVERY_MS)
+
+    @staticmethod
+    def _offset() -> int | None:
+        value = QSettings("FlowerDeliveries", "FlowerDeliveries").value("tg_offset", "")
+        return int(value) if str(value).lstrip("-").isdigit() else None
+
+    def poll(self):
+        cfg = settings()
+        if self.busy or not (cfg["token"] and cfg["chat_id"]):
+            return
+        self.busy = True
+        threading.Thread(target=self._fetch, args=(cfg["token"], self._offset()), daemon=True).start()
+
+    def _fetch(self, token: str, offset: int | None):
+        try:
+            self.fetched.emit(get_updates(token, offset), "")
+        except TelegramError as e:
+            self.fetched.emit([], str(e))
+
+    def _on_fetched(self, updates: list, error: str):
+        self.busy = False
+        if error:
+            return
+        first_time = self._offset() is None
+        offset = max((u["update_id"] for u in updates), default=-1) + 1
+        if updates or first_time:  # 0 — «подключились, старых сообщений не было»
+            QSettings("FlowerDeliveries", "FlowerDeliveries").setValue("tg_offset", offset)
+        if first_time:
+            return  # старые сообщения, написанные до подключения (например «привет»), не показываем
+        new_ids = [i for update_id, text, date in parse_announcements(updates, settings()["chat_id"])
+                   if (i := self.db.add_announcement(text, date, update_id)) is not None]
+        if new_ids:
+            self.arrived.emit(new_ids)
+
 
 class TelegramSender(QObject):
     """Раз в минуту отправляет накопившиеся сообщения. Нет интернета — попробует позже."""
