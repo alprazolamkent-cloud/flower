@@ -79,11 +79,12 @@ def test_salary_calculation(db):
     shifts = db.shifts_between(date(2026, 10, 1), date(2026, 10, 31), anna.id)
     tiers = [Tier(30000, 7), Tier(20000, 3), Tier(25000, 5)]  # порядок не важен
     sal = calculate(shifts, db.adjustments(anna.id, "2026-10"), SalaryRules(2000, tiers, False, True))
-    assert (sal.shifts, sal.base, sal.revenue, sal.average) == (2, 4000, 50000, 25000)
+    # ставка — за все три смены (несданную тоже оплачиваем), премия — по двум сданным
+    assert (sal.shifts, sal.base, sal.revenue, sal.average) == (3, 6000, 50000, 25000)
     assert sal.tier == Tier(25000, 5) and sal.next_tier == Tier(30000, 7) and sal.plan == 20000
     assert (sal.bonus_base, sal.bonus) == (50000, 2500)  # 5% со всего прихода
     assert (sal.shortage, sal.not_closed, sal.adjustments_total) == (300, 1, -4000)
-    assert sal.total == 4000 + 2500 - 300 - 4000
+    assert sal.total == 6000 + 2500 - 300 - 4000
 
     above = calculate(shifts, [], SalaryRules(2000, tiers, True, False))
     # сверх плана: 50 000 − 2 смены × 20 000 = 10 000, 5% = 500; недостачу не вычитаем

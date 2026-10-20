@@ -115,11 +115,11 @@ def test_staff_and_salary(shop):
     staff = ask(shop, "/сотрудники")
     assert "Анна: смен 1, приход 36 000 ₽" in staff and "Олег Иванов: смен 1, приход 28 000 ₽" in staff
     everyone = ask(shop, "/зарплата")
-    assert "• Анна: 3 800 ₽" in everyone and "• Олег Иванов: 1 700 ₽" in everyone and "/зарплата Имя" in everyone
+    assert "• Анна: 5 800 ₽" in everyone and "• Олег Иванов: 1 700 ₽" in everyone and "/зарплата Имя" in everyone
     detail = ask(shop, "/зарплата Анна")
-    # смена 2000 + 5% с 36 000 = 1800
-    assert "Смены: 1 × 2 000 ₽ = 2 000 ₽" in detail and "5% с 36 000 ₽ = 1 800 ₽" in detail
-    assert "Итого: 3 800 ₽" in detail and "До «от 40 000 ₽» (7%) не хватает 4 000 ₽" in detail
+    # 2 смены × 2000 (идущая тоже оплачивается) + 5% с 36 000 (только сданная) = 1800
+    assert "Смены: 2 × 2 000 ₽ = 4 000 ₽" in detail and "5% с 36 000 ₽ = 1 800 ₽" in detail
+    assert "Итого: 5 800 ₽" in detail and "несданных смен 1" in detail and "До «от 40 000 ₽» (7%) не хватает 4 000 ₽" in detail
     oleg = ask(shop, "/зарплата Олег")
     assert "План не выполнен" in oleg and "Недостача: −300 ₽" in oleg and "Итого: 1 700 ₽" in oleg
     assert "Такого сотрудника нет" in ask(shop, "/зарплата Мария")
@@ -188,11 +188,17 @@ def test_bonus_and_fine_signs(shop):
     handler = BotHandler()
     handler.handle("/премия Олег Иванов 3000 за праздники", make_ctx(shop))
     handler.handle("да", make_ctx(shop))
-    handler.handle("/штраф Олег 500", make_ctx(shop))
-    handler.handle("да", make_ctx(shop))
+    question = handler.handle("/штраф Олег 500 разбил вазу", make_ctx(shop))
+    assert "Записать санкцию: Олег Иванов, смена 19.10 — «Разбил вазу», −500 ₽" in question
+    assert "Санкция записана" in handler.handle("да", make_ctx(shop))
     adjustments = shop.adjustments(2, "2026-10")
-    assert [(a.amount, a.reason) for a in adjustments] == \
-        [(3000, "за праздники (из Telegram)"), (-500, "штраф (из Telegram)")]
+    assert [(a.amount, a.reason) for a in adjustments] == [(3000, "за праздники (из Telegram)")]
+    [penalty] = shop.penalties_between(date(2026, 10, 1), date(2026, 10, 31), 2)  # штраф — это санкция
+    assert (penalty.title, penalty.amount, penalty.shift_day) == ("Разбил вазу", 500, date(2026, 10, 19))
+    handler.handle("/штраф Олег 300", make_ctx(shop))
+    handler.handle("да", make_ctx(shop))
+    assert [p.title for p in shop.penalties_between(date(2026, 10, 1), date(2026, 10, 31), 2)] == \
+        ["Разбил вазу", "Штраф"]
 
 
 def test_adjustment_cancel_expire_and_errors(shop):

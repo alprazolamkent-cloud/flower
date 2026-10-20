@@ -123,7 +123,7 @@ class Salary:
     bonus_earned: int = 0  # сколько было бы без условий — чтобы видеть, что потеряно
     blocked: list[str] = field(default_factory=list)  # почему премии нет (штрафы, списания)
     shortage: int = 0
-    not_closed: int = 0  # несданные смены в расчёт не входят
+    not_closed: int = 0  # несданные: ставка начислена, но выручки нет — в премию не идут
     adjustments: list[Adjustment] = field(default_factory=list)
     penalties: list[Penalty] = field(default_factory=list)
     writeoff: ShopWriteoff = field(default_factory=ShopWriteoff)
@@ -151,9 +151,9 @@ def calculate(shifts: list[Shift], adjustments: list[Adjustment], rules: SalaryR
     counted = [s for s in closed if rules.shift_kind(s.day) != "holiday"]  # премия — без праздничных смен
     revenue = sum(s.revenue for s in counted)
     average = revenue / len(counted) if counted else 0.0
-    base_parts = []
+    base_parts = []  # ставка — за все смены, в том числе несданные: смену отработали, просто не сдали
     for kind in ("normal", "holiday"):
-        group = [s for s in closed if rules.shift_kind(s.day) == kind]
+        group = [s for s in shifts if rules.shift_kind(s.day) == kind]
         if group:
             base_parts.append((kind, len(group), rules.rate_for(group[0].day)))
     shortage = sum(-d for s in closed if (d := s.difference()) is not None and d < 0)
@@ -178,7 +178,7 @@ def calculate(shifts: list[Shift], adjustments: list[Adjustment], rules: SalaryR
             blocked.append(f"списания по магазину {pct(percent)} (для премии нужно меньше {pct(rules.max_writeoff_percent, None)})")
 
     return Salary(
-        shifts=len(closed),
+        shifts=len(shifts),
         base=sum(count * rate for _, count, rate in base_parts),
         base_parts=base_parts,
         holiday_shifts=len(holiday),

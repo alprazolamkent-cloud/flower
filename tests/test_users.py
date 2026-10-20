@@ -14,7 +14,7 @@ def db():
 
 def test_first_admin_and_login(db):
     assert not db.has_users()
-    admin = db.add_user("admin", "Хозяйка", "secret", is_admin=True)
+    admin = db.add_user("admin", "Мария", "secret", is_admin=True)
     assert db.has_users()
     assert db.authenticate("admin", "secret") == admin
     assert db.authenticate("ADMIN", "secret") == admin  # логин без учёта регистра

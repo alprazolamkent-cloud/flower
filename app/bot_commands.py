@@ -1,7 +1,7 @@
 """Команды Telegram-боту: администратор пишет /касса, /выручка, /зарплата Анна… — бот отвечает данными из программы.
 
 Логика без Qt и без сети: на вход текст и контекст, на выход текст ответа. Команды, которые что-то
-записывают (аванс, премия, штраф), сначала переспрашивают.
+записывают (аванс, премия, штраф — он записывается санкцией), сначала переспрашивают.
 """
 
 import calendar
@@ -203,7 +203,8 @@ def cmd_help(ctx: BotContext, args: str) -> str:
               "Списания по причинам: /списания (или /списания неделя). Рейтинг месяца: /рейтинг.",
               "Когда сотрудник просит удалить доставку, придёт сообщение со ссылками: удалить /del_N, оставить /keep_N.",
               "Записать: /аванс Анна 5000 на ремонт, /премия Анна 3000 за праздники, "
-                  "/штраф Анна 500 разбила вазу — сначала спрошу «да / нет».",
+                  "/штраф Анна 500 разбила вазу — сначала спрошу «да / нет». Штраф записывается санкцией "
+                  "за последнюю смену и считается в лимит для премии.",
               "Объявление сотрудникам: напишите сообщение, начав с «!»."]
     return "\n".join(lines)
 
@@ -376,7 +377,7 @@ def _salary_detail(ctx: BotContext, user: User, first: date, last: date, month: 
         lines.append(f"{a.reason}: {'+' if a.amount > 0 else '−'}{money(abs(a.amount))}")
     lines.append(f"Итого: {money(sal.total)}")
     if sal.not_closed:
-        lines.append(f"(несданные смены не учтены: {sal.not_closed})")
+        lines.append(f"(несданных смен {sal.not_closed}: ставка начислена, выручка в премию не идёт)")
     return "\n".join(lines)
 
 
@@ -814,6 +815,8 @@ class BotHandler:
             return error
         reason = re.sub(r"^\s*\d[\d\s]*(?:[.,]\d+)?\s*(?:к|k|тыс\w*)?\s*(?:₽|р\b|руб\w*)?\s*", "", rest,
                         flags=re.IGNORECASE).strip() or default_reason
+        if kind == "fine":
+            return self._ask_fine(user, amount, reason, ctx, chat)
         month = f"{business_day(ctx.now, ctx.change):%Y-%m}"
         db, now = ctx.db, ctx.now
         source = f"из Telegram: {author}" if author else "из Telegram"
@@ -832,6 +835,19 @@ class BotHandler:
         self.pending[chat] = Pending(ctx.now + CONFIRM_FOR, run)
         return (f"Записать: {title.lower()} {user.name or user.login} {'+' if sign > 0 else '−'}{money(amount)} "
                 f"за {MONTHS[int(month[5:]) - 1]} («{reason}»)?\nОтветьте «да» или «нет» (действует 5 минут).")
+
+
+    def _ask_fine(self, user: User, amount: int, reason: str, ctx: BotContext, chat: str) -> str:
+        """/штраф — это санкция за последнюю смену сотрудника: идёт в лимит санкций для премии, её можно
+        оспорить и отменить, как санкции из списка."""
+        shift = ctx.db.last_shift_of(user.id)
+        if shift is None:
+            return f"У {user.name or user.login} ещё не было смен — штраф не к чему привязать."
+        title = "Штраф" if reason == ADJUSTMENTS["fine"][2] else reason[:1].upper() + reason[1:]
+        kind = PenaltyKind(0, title, amount)
+        self.pending[chat] = Pending(ctx.now + CONFIRM_FOR, lambda: _apply_penalty(ctx, shift, kind))
+        return (f"Записать санкцию: {user.name or user.login}, смена {shift.day:%d.%m} — «{title}», −{money(amount)}?\n"
+                "Она считается в лимит санкций для премии.\nОтветьте «да» или «нет» (действует 5 минут).")
 
 
 def kind_ru(kind: str) -> str:

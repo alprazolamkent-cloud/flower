@@ -61,7 +61,8 @@ def calc_html(sal: Salary, rules: SalaryRules) -> str:
     total = (f"<tr><td colspan='2'><hr></td></tr>"
              f"<tr><td><b style='font-size:15px'>К выплате</b></td>"
              f"<td align='right' style='white-space:nowrap'><b style='font-size:18px'>{money(sal.total)}</b></td></tr>")
-    note = (f"<p style='color:{C.gray}; font-size:11px'>Несданные смены не учтены: {sal.not_closed}</p>"
+    note = (f"<p style='color:{C.gray}; font-size:11px'>Несданных смен: {sal.not_closed} — ставка начислена, "
+            "но их выручка неизвестна и в премию не идёт</p>"
             if sal.not_closed else "")
     return f"<table width='100%' cellspacing='0' cellpadding='2'>{''.join(rows)}{total}</table>{note}"
 

@@ -289,3 +289,24 @@ def test_second_shift_same_day_asks(window, monkeypatch):
     oleg = db.add_user("oleg", "Олег", "1")
     db.open_shift(oleg.id, 5000, datetime.now(), CH)
     assert w._same_day_shifts() and "Олег" in w._same_day_shifts()[0]
+
+
+def test_custom_fine_in_app_is_penalty(db, app, monkeypatch, request):
+    import shiboken6
+    from app.shift_dialogs import PenaltyDialog
+    from app.salary import PenaltyKind
+    monkeypatch.setattr(QMessageBox, "information", lambda *a, **k: None)
+    admin, anna = db.add_user("boss", "Мария", "1", is_admin=True), db.add_user("anna", "Анна", "1")
+    shift = db.open_shift(anna.id, 0, datetime(2026, 10, 20, 8, 5), CH)
+    changes = []
+    dlg = PenaltyDialog(None, db, shift, [PenaltyKind(1, "Нет ценников", 1000)], admin, lambda p, c: changes.append(c))
+    request.addfinalizer(lambda: shiboken6.delete(dlg))
+    dlg.kind_box.setCurrentIndex(dlg.kind_box.count() - 1)  # «Другое»
+    assert not dlg.other_row.isHidden()
+    dlg._add()
+    assert db.penalties_for_shift(shift.id) == []  # без причины и суммы — не записываем
+    dlg.other_reason.setText("разбила вазу")
+    dlg.other_amount.setValue(700)
+    dlg._add()
+    [p] = db.penalties_for_shift(shift.id)
+    assert (p.title, p.amount, p.kind_id) == ("Разбила вазу", 700, 0) and changes == ["set"]

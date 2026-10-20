@@ -10,7 +10,7 @@ from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QGridLayout, QGroupBox,
     QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMessageBox, QPlainTextEdit, QPushButton,
-    QSpinBox, QTableWidget, QTableWidgetItem, QVBoxLayout,
+    QSpinBox, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
 from .db import Database, User, UserError
@@ -506,7 +506,7 @@ class CabinetDialog(QDialog):
         layout.addWidget(self.summary)
 
         self.salary_panel = SalaryPanel()
-        self.adjust_btn = QPushButton("± Аванс / премия / штраф…")
+        self.adjust_btn = QPushButton("± Аванс / премия / доплата…")
         self.adjust_btn.clicked.connect(self._adjust)
         self.penalty_btn = QPushButton("⚠ Санкции смены…")
         self.penalty_btn.setToolTip("Поставить штрафную санкцию за выбранную смену или убрать")
@@ -753,8 +753,9 @@ class CabinetDialog(QDialog):
 class AdjustmentDialog(QDialog):
     """Аванс, премия, штраф — доплаты и удержания к зарплате за месяц (только админ)."""
 
+    # Штрафа здесь нет: штраф — это санкция («⚠ Санкции смены…»), он считается в лимит для премии.
     KINDS = (("Аванс (выдали заранее)", -1, "аванс"), ("Премия", 1, "премия"),
-             ("Штраф", -1, "штраф"), ("Доплата", 1, "доплата"), ("Удержание", -1, "удержание"))
+             ("Доплата", 1, "доплата"), ("Удержание (не штраф)", -1, "удержание"))
 
     def __init__(self, parent, db: Database, user_id: int, name: str, month: str, admin: User):
         super().__init__(parent)
@@ -878,8 +879,20 @@ class PenaltyDialog(QDialog):
         self.kind_box = QComboBox()
         for kind in kinds:
             self.kind_box.addItem(f"{kind.title} — {money(kind.amount)}", kind)
+        self.kind_box.addItem("Другое — своя сумма и причина (штраф)", None)
+        self.kind_box.currentIndexChanged.connect(self._kind_changed)
         form.addRow("Поставить:", self.kind_box)
+        self.other_reason = QLineEdit()
+        self.other_reason.setPlaceholderText("за что, например «разбила вазу»")
+        self.other_amount = money_box()
+        self.other_row = QWidget()
+        other = QHBoxLayout(self.other_row)
+        other.setContentsMargins(0, 0, 0, 0)
+        other.addWidget(self.other_reason, 1)
+        other.addWidget(self.other_amount)
+        form.addRow("", self.other_row)
         layout.addLayout(form)
+        self._kind_changed()
         add = QPushButton("⚠ Поставить санкцию")
         add.clicked.connect(self._add)
         layout.addWidget(add)
@@ -906,10 +919,17 @@ class PenaltyDialog(QDialog):
                 self.table.setItem(row, col, item)
         self.table.resizeRowsToContents()
 
+    def _kind_changed(self, *_):
+        self.other_row.setVisible(self.kind_box.currentData() is None)
+
     def _add(self):
         kind = self.kind_box.currentData()
-        if kind is None:
-            return
+        if kind is None:  # своя санкция: штраф с суммой и причиной
+            reason = self.other_reason.text().strip()
+            if not reason or self.other_amount.value() <= 0:
+                QMessageBox.information(self, "Санкции", "Напишите, за что, и сумму.")
+                return
+            kind = PenaltyKind(0, reason[:1].upper() + reason[1:], self.other_amount.value())
         who = self.admin.name or self.admin.login
         penalty = self.db.add_penalty(self.shift.id, kind.id, kind.title, kind.amount, who, datetime.now())
         if penalty is None:
