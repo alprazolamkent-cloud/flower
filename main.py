@@ -55,8 +55,12 @@ def main():
         return 1
 
     window = MainWindow(db)
+    # При автозапуске окно (и вход) появятся, когда откроют программу из трея.
     if "--minimized" not in sys.argv:
-        window.show()
+        if not window.login():
+            db.close()
+            return 0
+        window.show_window()
 
     QLocalServer.removeServer(INSTANCE_NAME)  # остаток после аварийного завершения
     server = QLocalServer()

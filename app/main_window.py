@@ -6,16 +6,17 @@ from datetime import date, datetime, timedelta
 from PySide6.QtCore import QDate, QLocale, QSettings, Qt, QTimer
 from PySide6.QtGui import QAction, QBrush, QColor, QFont, QKeySequence, QShortcut, QTextCharFormat
 from PySide6.QtWidgets import (
-    QAbstractItemView, QApplication, QCalendarWidget, QCheckBox, QFormLayout,
+    QAbstractItemView, QApplication, QCalendarWidget, QCheckBox, QDialog, QFormLayout,
     QGroupBox, QHBoxLayout, QHeaderView, QLabel, QMainWindow, QMenu, QMessageBox,
     QPushButton, QSpinBox, QSystemTrayIcon, QTableWidget, QTableWidgetItem,
     QVBoxLayout, QWidget,
 )
 
-from .db import Database, Delivery, Totals
+from .db import Database, Delivery, Totals, User
 from .delivery_dialog import DeliveryDialog, money
 from .icon import flower_icon
 from .reminders import due_reminders, reminder_key
+from .users_dialog import LoginDialog, PasswordDialog, UserFormDialog, UsersDialog
 
 MONTHS_GENITIVE = [
     "января", "февраля", "марта", "апреля", "мая", "июня",
@@ -28,9 +29,9 @@ MONTHS = [
 WEEKDAYS = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
 
 HEADERS = ["✓", "Время", "Что доставить", "Кому", "Телефон", "Адрес",
-           "Взяли", "Курьеру", "Осталось"]
+           "Взяли", "Курьеру", "Осталось", "Добавил", "Отметил"]
 COL_DONE, COL_TIME, COL_ITEMS, COL_RECIPIENT, COL_PHONE, COL_ADDRESS, \
-    COL_PRICE, COL_COURIER, COL_REST = range(len(HEADERS))
+    COL_PRICE, COL_COURIER, COL_REST, COL_CREATED_BY, COL_DELIVERED_BY = range(len(HEADERS))
 
 REMINDER_CHECK_MS = 30_000
 DEFAULT_LEAD_MINUTES = 20
@@ -62,6 +63,7 @@ class MainWindow(QMainWindow):
         self.deliveries: list[Delivery] = []
         self._marked_days: list[QDate] = []
         self._loading = False
+        self.user: User | None = None
         self._reminded: set = set()
         self._really_quit = False
         self._tray_hint_shown = False
@@ -118,7 +120,21 @@ class MainWindow(QMainWindow):
         title_font.setPointSize(15)
         title_font.setBold(True)
         self.day_title.setFont(title_font)
-        right.addWidget(self.day_title)
+
+        top = QHBoxLayout()
+        top.addWidget(self.day_title, 1)
+        self.user_label = QLabel()
+        top.addWidget(self.user_label)
+        self.users_btn = QPushButton("👥 Сотрудники")
+        self.users_btn.clicked.connect(self.manage_users)
+        password_btn = QPushButton("🔑 Сменить пароль")
+        password_btn.clicked.connect(self.change_password)
+        logout_btn = QPushButton("🚪 Выйти")
+        logout_btn.setToolTip("Выйти из профиля, чтобы вошёл другой сотрудник")
+        logout_btn.clicked.connect(self.logout)
+        for b in (self.users_btn, password_btn, logout_btn):
+            top.addWidget(b)
+        right.addLayout(top)
 
         buttons = QHBoxLayout()
         add_btn = QPushButton("➕ Добавить доставку")
@@ -242,7 +258,51 @@ class MainWindow(QMainWindow):
             d = self._last_reminded_day
             self.calendar.setSelectedDate(QDate(d.year, d.month, d.day))
 
+    # ----- вход и сотрудники -----
+
+    def login(self) -> bool:
+        """Спросить логин и пароль (или создать первого админа). True — вошли."""
+        if not self.db.has_users():
+            dlg = UserFormDialog(self, self.db, first_admin=True)
+        else:
+            dlg = LoginDialog(self, self.db)
+        if dlg.exec() != QDialog.Accepted:
+            return False
+        self.set_user(dlg.user)
+        return True
+
+    def set_user(self, user: User | None):
+        self.user = user
+        if user is None:
+            self.user_label.setText("")
+            return
+        role = "админ" if user.is_admin else "сотрудник"
+        self.user_label.setText(f"Вы вошли: <b>{user.name or user.login}</b> ({role})")
+        self.users_btn.setVisible(user.is_admin)
+
+    def logout(self):
+        self.set_user(None)
+        self.hide()
+        if self.login():
+            self.show_window()
+
+    def change_password(self):
+        if PasswordDialog(self, self.db, self.user, need_old=True).exec() == QDialog.Accepted:
+            QMessageBox.information(self, "Готово", "Пароль изменён.")
+
+    def manage_users(self):
+        UsersDialog(self, self.db, self.user).exec()
+        # Могли переименовать или снять права с текущего пользователя
+        current = next((u for u in self.db.users() if u.id == self.user.id), None)
+        if current is None:
+            self.logout()
+        else:
+            self.set_user(current)
+            self.refresh_day()
+
     def show_window(self):
+        if self.user is None and not self.login():
+            return
         self.showNormal()
         self.raise_()
         self.activateWindow()
@@ -344,6 +404,8 @@ class MainWindow(QMainWindow):
                 COL_PRICE: QTableWidgetItem(money(d.price)),
                 COL_COURIER: QTableWidgetItem(money(d.courier_pay)),
                 COL_REST: QTableWidgetItem(money(d.remainder)),
+                COL_CREATED_BY: QTableWidgetItem(d.created_by_name),
+                COL_DELIVERED_BY: QTableWidgetItem(d.delivered_by_name if d.delivered else ""),
             }
             for col in (COL_PRICE, COL_COURIER, COL_REST):
                 cells[col].setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
@@ -380,7 +442,7 @@ class MainWindow(QMainWindow):
         if self._loading or item.column() != COL_DONE:
             return
         d = self.deliveries[item.row()]
-        self.db.set_delivered(d.id, item.checkState() == Qt.Checked)
+        self.db.set_delivered(d.id, item.checkState() == Qt.Checked, self.user.id)
         self.refresh_all()
 
     def _on_double_click(self, item: QTableWidgetItem):
@@ -398,7 +460,7 @@ class MainWindow(QMainWindow):
         self.refresh_all()
 
     def add_delivery(self):
-        d = Delivery(day=self.selected_day())
+        d = Delivery(day=self.selected_day(), created_by=self.user.id, delivered_by=self.user.id)
         if self._open_dialog(d):
             self.db.add(d)
             self._show_day(d.day)
@@ -407,7 +469,10 @@ class MainWindow(QMainWindow):
         d = self.current_delivery()
         if d is None:
             return
+        was_delivered = d.delivered
         if self._open_dialog(d):
+            if d.delivered and not was_delivered:
+                d.delivered_by = self.user.id
             self.db.update(d)
             self._show_day(d.day)
         else:
