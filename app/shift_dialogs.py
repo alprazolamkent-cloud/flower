@@ -1,13 +1,14 @@
 """Окна смен: начало, сдача, расходы и изъятия, личный кабинет."""
 
 import calendar
+import html
 from datetime import date, datetime, time
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QAbstractItemView, QComboBox, QDialog, QDialogButtonBox, QFormLayout,
-    QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMessageBox, QPushButton,
+    QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMessageBox, QPlainTextEdit, QPushButton,
     QSpinBox, QTableWidget, QTableWidgetItem, QVBoxLayout,
 )
 
@@ -34,6 +35,11 @@ def diff_text(diff: int | None) -> str:
 
 def diff_color(diff: int | None) -> str:
     return GRAY if diff is None else (GREEN if diff == 0 else RED)
+
+
+def _html(text: str) -> str:
+    """Текст сотрудника для QLabel: без разметки, с переносами строк."""
+    return html.escape(text).replace("\n", "<br>")
 
 
 def count_box() -> QSpinBox:
@@ -86,6 +92,11 @@ class StartShiftDialog(QDialog):
         info_label = QLabel(info)
         info_label.setWordWrap(True)
         form.addRow(info_label)
+        if self.prev is not None and self.prev.note:
+            note = QLabel(f"<b>Комментарий предыдущей смены:</b><br>{_html(self.prev.note)}")
+            note.setWordWrap(True)
+            note.setStyleSheet("background: #fff8e1; border: 1px solid #ffe082; padding: 6px")
+            form.addRow(note)
 
         self.cash_box = count_box()
         self.cash_box.valueChanged.connect(self._update)
@@ -170,9 +181,12 @@ class CloseShiftDialog(QDialog):
         form.addRow("Фактически в кассе (пересчитайте):", self.cash_box)
         self.diff_label = QLabel()
         form.addRow("Разница:", self.diff_label)
-        self.note_edit = QLineEdit()
-        self.note_edit.setPlaceholderText("необязательно, например почему не сходится")
-        form.addRow("Комментарий:", self.note_edit)
+        self.note_edit = QPlainTextEdit()
+        self.note_edit.setPlaceholderText("Что важно знать: почему не сходится касса, что случилось "
+                                          "за смену, что передать следующей смене")
+        self.note_edit.setFixedHeight(70)
+        form.addRow("Комментарий к смене\n(по желанию):", self.note_edit)
+        form.addRow("", _gray("Комментарий увидит администратор и следующая смена."))
         form.addRow(_buttons(self, "Сдать смену"))
 
         for box in (self.sales_box, self.delivery_box, self.courier_box, self.cash_box):
@@ -218,7 +232,7 @@ class CloseShiftDialog(QDialog):
         try:
             self.shift = self.db.close_shift(
                 self.shift.id, datetime.now(), self.cash_box.value(), self.sales_box.value(),
-                self.delivery_box.value(), self.courier_box.value(), self.note_edit.text())
+                self.delivery_box.value(), self.courier_box.value(), self.note_edit.toPlainText())
         except UserError as e:
             QMessageBox.warning(self, "Сдача смены", str(e))
             return
@@ -296,7 +310,7 @@ class CashOpDialog(QDialog):
 
 CABINET_HEADERS = ["Смена", "Сотрудник", "Открыта", "Сдана", "Статус", "Приняли", "При приёме",
                    "Продажи нал.", "За доставки", "Курьерам", "Расходы", "Изъятия",
-                   "Должно быть", "Сдали", "Касса"]
+                   "Должно быть", "Сдали", "Касса", "Комментарий"]
 MONEY_COLS = {5, 7, 8, 9, 10, 11, 12, 13}
 
 
@@ -309,7 +323,7 @@ class CabinetDialog(QDialog):
         self.year, self.month = year, month
         self.shifts: list[Shift] = []
         self.setWindowTitle("Личный кабинет")
-        self.resize(1320, 640)
+        self.resize(1440, 640)
         layout = QVBoxLayout(self)
 
         top = QHBoxLayout()
@@ -318,8 +332,6 @@ class CabinetDialog(QDialog):
             self.person_box.addItem("Все сотрудники", None)
             for u in db.users():
                 self.person_box.addItem(u.name or u.login, u.id)
-            index = self.person_box.findData(user.id)
-            self.person_box.setCurrentIndex(max(index, 0))
         else:
             self.person_box.addItem(user.name or user.login, user.id)
             self.person_box.setEnabled(False)
@@ -348,7 +360,10 @@ class CabinetDialog(QDialog):
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SingleSelection)
         self.table.verticalHeader().setVisible(False)
-        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(len(CABINET_HEADERS) - 1, QHeaderView.Stretch)
+        header.setMinimumSectionSize(40)
         self.table.itemSelectionChanged.connect(self._show_ops)
         layout.addWidget(self.table, 3)
 
@@ -401,7 +416,7 @@ class CabinetDialog(QDialog):
                 money(s.cash_sales) if closed else "", money(s.delivery_cash) if closed else "",
                 money(s.courier_cash) if closed else "", money(s.expenses), money(s.withdrawals),
                 money(s.expected_cash()) if closed else "",
-                money(s.closing_cash) if closed else "", diff_text(diff),
+                money(s.closing_cash) if closed else "", diff_text(diff), " ".join(s.note.split()),
             ]
             for col, text in enumerate(cells):
                 item = QTableWidgetItem(text)
@@ -413,8 +428,8 @@ class CabinetDialog(QDialog):
                     item.setForeground(QColor(RED))
                 if col == 14:
                     item.setForeground(QColor(diff_color(diff)))
-                if s.note and col == 14:
-                    item.setToolTip(f"Комментарий: {s.note}")
+                if col == 15 and s.note:
+                    item.setToolTip(s.note)
                 self.table.setItem(row, col, item)
 
         parts = [f"Смен: <b>{len(self.shifts)}</b>",
@@ -437,6 +452,7 @@ class CabinetDialog(QDialog):
         has = 0 <= row < len(self.shifts) and self.table.selectionModel().hasSelection()
         shift = self.shifts[row] if has else None
         self.ops_title.setText(
-            f"<b>Расходы и изъятия смены {shift.day:%d.%m}</b>" + (f" · комментарий: {shift.note}" if shift.note else "")
+            f"<b>Расходы и изъятия смены {shift.day:%d.%m}</b>"
+            + (f" · комментарий: {_html(shift.note)}" if shift.note else "")
             if shift else "<b>Расходы и изъятия</b> — выберите смену в таблице")
         _fill_ops(self.ops, self.db, shift.id if shift else None)

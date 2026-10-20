@@ -114,3 +114,13 @@ def test_delivery_cash_for_shift(db):
     db.add(Delivery(day=date(2026, 10, 21), time="10:00", price=900, courier_pay=500))  # уже смена 21-го
     db.add(Delivery(day=date(2026, 10, 20), time="07:00", price=100, courier_pay=50))  # ещё смена 19-го
     assert db.delivery_cash_for_shift(date(2026, 10, 20), CHANGE) == (1200, 700)
+
+
+def test_shift_note_is_kept_for_next_shift(db):
+    anna, oleg = db.add_user("anna", "Анна", "1"), db.add_user("oleg", "Олег", "1")
+    s = db.open_shift(anna.id, 1000, datetime(2026, 10, 20, 8, 5), CHANGE)
+    db.close_shift(s.id, datetime(2026, 10, 21, 7, 50), 1000, 0, 0, 0, "  закончился скотч\nклиентка заберёт в 10:00  ")
+    prev = db.shift_before(datetime(2026, 10, 21, 8, 10))
+    assert prev.note == "закончился скотч\nклиентка заберёт в 10:00"
+    nxt = db.open_shift(oleg.id, 1000, datetime(2026, 10, 21, 8, 10), CHANGE)
+    assert db.previous_shift(nxt).note.startswith("закончился скотч")
