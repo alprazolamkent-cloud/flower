@@ -50,6 +50,7 @@ COL_DONE, COL_TIME, COL_ITEMS, COL_RECIPIENT, COL_PHONE, COL_ADDRESS, \
 REMINDER_CHECK_MS = 30_000
 
 DELIVERED_BG = QColor("#e3f4e4")
+DELIVERED_FG = QColor("#1b1f1b")  # тёмный текст на светло-зелёной строке — читается при любой теме
 PENDING_DAY_BG = QColor("#ffe0b2")  # в этот день есть недоставленные
 DONE_DAY_BG = QColor("#c8e6c9")  # всё доставлено
 WATER_COLORS = {"planned": "#1e88e5", "done": "#1e88e5", "missed": "#c62828"}
@@ -759,12 +760,13 @@ class MainWindow(QMainWindow):
             }
             for col in (COL_PRICE, COL_COURIER, COL_REST):
                 cells[col].setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-            if d.remainder < 0:
-                cells[COL_REST].setForeground(QColor("#c62828"))
             for col, item in cells.items():
                 if d.delivered:
                     item.setBackground(DELIVERED_BG)
+                    item.setForeground(DELIVERED_FG)
                 self.table.setItem(row, col, item)
+            if d.remainder < 0:
+                cells[COL_REST].setForeground(QColor("#c62828"))
         self.table.resizeRowsToContents()
         self._loading = False
 

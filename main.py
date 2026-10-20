@@ -4,7 +4,7 @@ import os
 import sys
 import time
 
-from PySide6.QtCore import QLibraryInfo, QLocale, QStandardPaths, QTranslator
+from PySide6.QtCore import QLibraryInfo, QLocale, QStandardPaths, Qt, QTranslator
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import QApplication, QMessageBox
 
@@ -48,6 +48,11 @@ def main():
     app = QApplication(sys.argv)
     app.setApplicationName("Доставки цветов")
     app.setStyle("Fusion")
+    # Подсветки в программе (зелёные строки, жёлтые подсказки) рассчитаны на светлый фон:
+    # тёмная тема Windows дала бы светлый текст на светлом и он бы не читался.
+    if hasattr(app.styleHints(), "setColorScheme"):
+        app.styleHints().setColorScheme(Qt.ColorScheme.Light)
+    app.setPalette(app.style().standardPalette())
     app.setQuitOnLastWindowClosed(False)  # при закрытии окна остаёмся в трее ради напоминаний
 
     if getattr(sys, "frozen", False):
