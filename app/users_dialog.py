@@ -33,12 +33,12 @@ class LoginDialog(QDialog):
         self.db = db
         self.user: User | None = None
         self.settings = QSettings("FlowerDeliveries", "FlowerDeliveries")
-        self.setWindowTitle("Вход — Доставки цветов")
+        self.setWindowTitle("Вход — AloFlorist")
         self.setWindowIcon(flower_icon())
         self.setMinimumWidth(340)
 
         form = QFormLayout(self)
-        title = QLabel("<h3>Доставки цветов</h3>Войдите под своим логином")
+        title = QLabel("<h3>AloFlorist</h3>Войдите под своим логином")
         form.addRow(title)
         if note:
             note_label = QLabel(note)

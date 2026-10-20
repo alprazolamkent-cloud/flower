@@ -1,7 +1,7 @@
 @echo off
-rem Сборка "Доставки цветов.exe" на Windows (нужен установленный Python 3.10+)
+rem Сборка AloFlorist.exe на Windows (нужен установленный Python 3.10+)
 python -m pip install -r requirements.txt pyinstaller
-python -m PyInstaller --noconfirm --onefile --windowed --name "FlowerDeliveries" main.py
+python -m PyInstaller --noconfirm --onefile --windowed --name "AloFlorist" main.py
 echo.
-echo Готово: dist\FlowerDeliveries.exe
+echo Готово: dist\AloFlorist.exe
 pause

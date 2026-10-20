@@ -134,7 +134,7 @@ class MainWindow(QMainWindow):
         self.inbox.reply = self._bot_reply
         self.settings = QSettings("FlowerDeliveries", "FlowerDeliveries")
 
-        self.setWindowTitle("Доставки цветов")
+        self.setWindowTitle("AloFlorist")
         self.setWindowIcon(flower_icon())
         self.resize(1440, 720)
 
@@ -292,7 +292,7 @@ class MainWindow(QMainWindow):
 
     def _setup_tray(self):
         self.tray = QSystemTrayIcon(flower_icon(), self)
-        self.tray.setToolTip("Доставки цветов")
+        self.tray.setToolTip("AloFlorist")
         menu = QMenu(self)
         open_action = QAction("Открыть", self)
         open_action.triggered.connect(self.show_window)
@@ -621,7 +621,7 @@ class MainWindow(QMainWindow):
         if not self._tray_hint_shown:
             self._tray_hint_shown = True
             self.tray.showMessage(
-                "Доставки цветов",
+                "AloFlorist",
                 "Программа работает в фоне и напомнит о доставках. "
                 "Выход — правой кнопкой по значку у часов.",
                 QSystemTrayIcon.Information, 5000,

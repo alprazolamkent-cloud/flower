@@ -5,7 +5,7 @@ import sys
 from PySide6.QtCore import QSettings
 
 RUN_KEY = r"HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Run"
-NAME = "FlowerDeliveries"
+NAME = "FlowerDeliveries"  # прежнее имя записи: у установленных программ автозапуск уже записан под ним
 
 
 def _run() -> QSettings:

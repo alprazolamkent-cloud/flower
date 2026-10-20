@@ -7,7 +7,7 @@ from datetime import datetime
 
 PREFIX = "deliveries-"
 LOCAL_FOLDER = "Резервные копии"
-EXTRA_FOLDER = "Доставки цветов — резервные копии"
+EXTRA_FOLDER = "Доставки цветов — резервные копии"  # прежнее имя: на флешках уже лежат копии под ним
 DEFAULT_KEEP = 30
 
 

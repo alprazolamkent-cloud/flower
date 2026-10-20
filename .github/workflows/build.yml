@@ -26,16 +26,22 @@ jobs:
         shell: bash
         run: echo 'VERSION = "1.${{ github.run_number }}"' > app/version.py
       - name: Build exe
-        run: python -m PyInstaller --noconfirm --onefile --windowed --name FlowerDeliveries main.py
+        run: python -m PyInstaller --noconfirm --onefile --windowed --name AloFlorist main.py
+      - name: Copy under the old name
+        shell: bash
+        # Версии программы до переименования ищут в релизе файл FlowerDeliveries.exe — без копии они перестали бы обновляться.
+        run: cp dist/AloFlorist.exe dist/FlowerDeliveries.exe
       - uses: actions/upload-artifact@v4
         with:
-          name: FlowerDeliveries
-          path: dist/FlowerDeliveries.exe
+          name: AloFlorist
+          path: dist/AloFlorist.exe
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v1.${{ github.run_number }}
-          name: Доставки цветов v1.${{ github.run_number }}
+          name: AloFlorist v1.${{ github.run_number }}
           target_commitish: ${{ github.sha }}
           make_latest: true
-          files: dist/FlowerDeliveries.exe
+          files: |
+            dist/AloFlorist.exe
+            dist/FlowerDeliveries.exe

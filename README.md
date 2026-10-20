@@ -1,6 +1,6 @@
-# Доставки цветов
+# AloFlorist
 
-Программа для Windows, чтобы вести доставки цветочного магазина по дням.
+Программа для Windows для цветочного магазина: доставки по дням, смены и касса, зарплата, итоги и управление через Telegram.
 
 ![Скриншот](docs/screenshot.png)
 
@@ -64,9 +64,9 @@
 ## Как получить .exe
 
 **Вариант 1. Скачать готовый.** Прямая ссылка на последнюю версию:
-https://github.com/alprazolamkent-cloud/flower/releases/latest/download/FlowerDeliveries.exe
+https://github.com/alprazolamkent-cloud/flower/releases/latest/download/AloFlorist.exe
 
-**Вариант 2. Собрать самому.** Установите [Python](https://www.python.org/downloads/) (при установке отметьте «Add Python to PATH») и запустите `build.bat`. Готовая программа появится в `dist\FlowerDeliveries.exe`.
+**Вариант 2. Собрать самому.** Установите [Python](https://www.python.org/downloads/) (при установке отметьте «Add Python to PATH») и запустите `build.bat`. Готовая программа появится в `dist\AloFlorist.exe`.
 
 ## Для разработки
 

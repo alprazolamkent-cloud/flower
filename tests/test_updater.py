@@ -9,11 +9,12 @@ from app import updater
 from app.db import Database, Delivery
 from app.updater import Release, UpdateError, download, install, is_newer, parse_version, release_from_json
 
-URL = updater.DOWNLOAD_PREFIX + "v1.7/FlowerDeliveries.exe"
+URL = updater.DOWNLOAD_PREFIX + "v1.7/AloFlorist.exe"
+OLD_URL = updater.DOWNLOAD_PREFIX + "v1.7/FlowerDeliveries.exe"
 
 
 def sample(**asset):
-    a = {"name": "FlowerDeliveries.exe", "browser_download_url": URL, "size": 5,
+    a = {"name": "AloFlorist.exe", "browser_download_url": URL, "size": 5,
          "digest": "sha256:ABCDEF"}
     a.update(asset)
     return {"tag_name": "v1.7", "assets": [a]}
@@ -37,8 +38,24 @@ def test_release_from_json():
     assert release_from_json({"tag_name": "nightly", "assets": []}) is None
 
 
+def test_old_release_name_is_still_understood():
+    """Релиз с одним старым именем файла (до переименования) тоже подходит."""
+    old = sample(name="FlowerDeliveries.exe", browser_download_url=OLD_URL)
+    assert release_from_json(old).url == OLD_URL
+
+
+def test_new_name_is_preferred_when_both_present():
+    both = {"tag_name": "v1.20", "assets": [
+        {"name": "FlowerDeliveries.exe", "browser_download_url": OLD_URL, "size": 5, "digest": "sha256:AA"},
+        {"name": "AloFlorist.exe", "browser_download_url": URL, "size": 5, "digest": "sha256:BB"}]}
+    release = release_from_json(both)
+    assert release.url == URL and release.sha256 == "bb"
+    # старый клиент (ищет только FlowerDeliveries.exe) увидит в релизе свой файл
+    assert any(a["name"] == "FlowerDeliveries.exe" for a in both["assets"])
+
+
 def test_foreign_download_url_is_ignored():
-    assert release_from_json(sample(browser_download_url="https://evil.example/FlowerDeliveries.exe")) is None
+    assert release_from_json(sample(browser_download_url="https://evil.example/AloFlorist.exe")) is None
     assert release_from_json(sample(name="other.exe")) is None
 
 

@@ -14,7 +14,9 @@ REPO = "alprazolamkent-cloud/flower"
 API_URL = f"https://api.github.com/repos/{REPO}/releases/latest"
 DOWNLOAD_PREFIX = f"https://github.com/{REPO}/releases/download/"
 RELEASES_PAGE = f"https://github.com/{REPO}/releases/latest"
-ASSET_NAME = "FlowerDeliveries.exe"
+# Имена файла программы в релизе по предпочтению. Старое имя остаётся в релизах, пока у людей стоят версии,
+# которые ищут именно его: иначе они перестали бы видеть обновления.
+ASSET_NAMES = ("AloFlorist.exe", "FlowerDeliveries.exe")
 TIMEOUT = 20
 CHUNK = 256 * 1024
 
@@ -46,9 +48,11 @@ def release_from_json(data: dict) -> Release | None:
     tag = str(data.get("tag_name", ""))
     if parse_version(tag) is None:
         return None
-    for asset in data.get("assets", []):
-        url = str(asset.get("browser_download_url", ""))
-        if asset.get("name") == ASSET_NAME and url.startswith(DOWNLOAD_PREFIX):
+    assets = {a.get("name"): a for a in data.get("assets", [])}
+    for name in ASSET_NAMES:
+        asset = assets.get(name)
+        url = str(asset.get("browser_download_url", "")) if asset else ""
+        if url.startswith(DOWNLOAD_PREFIX):
             digest = str(asset.get("digest") or "")
             sha = digest.split(":", 1)[1].lower() if digest.startswith("sha256:") else None
             return Release(tag.lstrip("v"), url, int(asset.get("size") or 0), sha)

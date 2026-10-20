@@ -1,4 +1,4 @@
-"""Доставки цветов — запуск приложения."""
+"""AloFlorist — запуск приложения."""
 
 import os
 import sys
@@ -14,6 +14,7 @@ from app.main_window import MainWindow
 from app.settings_dialog import theme_mode
 from app.updater import cleanup_old
 
+# Внутренние имена остались прежними, чтобы не потерять данные и настройки при переименовании программы:
 APP_FOLDER = "Доставки цветов"
 INSTANCE_NAME = "FlowerDeliveries-single-instance"
 
@@ -48,7 +49,7 @@ def data_path() -> str:
 
 def main():
     app = QApplication(sys.argv)
-    app.setApplicationName("Доставки цветов")
+    app.setApplicationName("AloFlorist")
     app.setStyle("Fusion")
     # Тему выбирает админ в настройках; свои подсветки программы перекрашиваются вместе с ней.
     theme.apply(app, theme_mode())

@@ -463,7 +463,7 @@ class SettingsDialog(QDialog):
         failed = []
         for chat in chats:
             try:
-                telegram.send_message(token, chat, "🌸 Проверка: программа «Доставки цветов» подключена.")
+                telegram.send_message(token, chat, "🌸 Проверка: программа AloFlorist подключена.")
             except telegram.TelegramError as e:
                 failed.append(f"{chat}: {e}")
         if failed:
