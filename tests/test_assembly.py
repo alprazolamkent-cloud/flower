@@ -208,17 +208,17 @@ def test_reminder_window_until_assembled(window):
     db.add(d)
     w._check_assembly(now)
     assert w.assembly.isVisible() and w.assembly.ids == [d.id]
-    assert w.queued == []  # заказ только что увидели — хозяевам пока не пишем
+    assert w.queued == []  # заказ только что увидели — администраторам пока не пишем
     w.assembly.close()  # «напомнить через 10 минут»
     assert not w.assembly.isVisible()
     w._check_assembly(now + timedelta(minutes=5))
     assert not w.assembly.isVisible()  # отложено
     w._check_assembly(now + timedelta(minutes=11))
     assert w.assembly.isVisible()  # снова
-    assert any("Букет ещё не собран" in text for text, _ in w.queued)  # 10 минут проигнорировали — хозяевам
+    assert any("Букет ещё не собран" in text for text, _ in w.queued)  # 10 минут проигнорировали — администраторам
     w.assembly.assembled.emit(d.id)  # нажали «Собрано»
     assert db.get_delivery(d.id).assembled and not w.assembly.isVisible()
-    assert sum("Букет ещё не собран" in text for text, _ in w.queued) == 1  # хозяевам — один раз
+    assert sum("Букет ещё не собран" in text for text, _ in w.queued) == 1  # администраторам — один раз
 
 
 def test_reminder_rows_and_signals(app):

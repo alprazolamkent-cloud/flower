@@ -55,7 +55,7 @@ def test_shift_lifecycle_and_statuses(db):
     assert not s.can_close(datetime(2026, 10, 21, 8, 31), CHANGE, GRACE)
 
     db.add_cash_op(s.id, "expense", 300, "скотч", anna.id, datetime(2026, 10, 20, 12, 0))
-    db.add_cash_op(s.id, "withdrawal", 6000, "хозяйка", anna.id, datetime(2026, 10, 20, 20, 0))
+    db.add_cash_op(s.id, "withdrawal", 6000, "администратор", anna.id, datetime(2026, 10, 20, 20, 0))
     closed = db.close_shift(s.id, datetime(2026, 10, 21, 7, 55), 10000, 12000, 400, "",
                             revenue=30000, flowers=25000, terminal=15000, qr=3000, deliveries=1000)
     assert (closed.expenses, closed.withdrawals) == (300, 6000)
@@ -66,7 +66,7 @@ def test_shift_lifecycle_and_statuses(db):
         (30000, 25000, 15000, 3000, 1000)
     assert closed.status(datetime(2026, 10, 21, 9, 0), CHANGE, GRACE) == "closed"
     assert db.current_shift(anna.id) is None
-    assert [o.reason for o in db.cash_ops(s.id)] == ["скотч", "хозяйка"]
+    assert [o.reason for o in db.cash_ops(s.id)] == ["скотч", "администратор"]
 
     with pytest.raises(UserError):  # дважды сдать нельзя
         db.close_shift(s.id, datetime(2026, 10, 21, 7, 56), 1, 1, 1)

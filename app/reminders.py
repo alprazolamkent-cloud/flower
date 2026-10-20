@@ -105,7 +105,7 @@ def assembly_due(deliveries: list[Delivery], now: datetime, lead_minutes: int) -
 
 
 def assembly_escalations(deliveries: list[Delivery], now: datetime, minutes: int, already: set) -> list[Delivery]:
-    """Букет так и не собран за minutes минут до доставки — пора сообщить хозяевам (один раз).
+    """Букет так и не собран за minutes минут до доставки — пора сообщить администраторам (один раз).
     minutes = 0 — не сообщать."""
     if minutes <= 0:
         return []

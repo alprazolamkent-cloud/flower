@@ -1,4 +1,4 @@
-"""Сообщения хозяину в Telegram: итоги смен и проблемы. Отправка — через очередь в базе."""
+"""Сообщения администратору в Telegram: итоги смен и проблемы. Отправка — через очередь в базе."""
 
 import json
 import os
@@ -127,7 +127,7 @@ def chat_ids(raw) -> list[str]:
 
 
 def parse_announcements(updates: list[dict], chats) -> list[tuple[int, str, datetime]]:
-    """Объявления из сообщений хозяев: только из их чатов и только начинающиеся с «!»."""
+    """Объявления из сообщений администраторов: только из их чатов и только начинающиеся с «!»."""
     allowed = set(chat_ids(chats))
     found = []
     for update in updates:
@@ -232,7 +232,7 @@ def not_closed_text(shift: Shift) -> str:
 # ----- отправка в фоне -----
 
 class TelegramInbox(QObject):
-    """Слушает бота: объявления хозяина («!…») и команды («/касса»). Опрос не прерывается."""
+    """Слушает бота: объявления администратора («!…») и команды («/касса»). Опрос не прерывается."""
 
     fetched = Signal(list, str)  # (обновления, текст ошибки) — из фонового потока
     arrived = Signal(list)  # id новых объявлений — для главного окна
@@ -301,7 +301,7 @@ class TelegramInbox(QObject):
             self._answer_commands(updates, chats)
 
     def _answer_commands(self, updates: list, chats):
-        """Команды от каждого из хозяев; ответ уходит тому, кто спросил."""
+        """Команды от каждого из администраторов; ответ уходит тому, кто спросил."""
         allowed = set(chat_ids(chats))
         stale: set[str] = set()
         for update in updates:

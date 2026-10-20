@@ -39,12 +39,12 @@ def assembly_minutes() -> int:
 
 
 def assembly_alert_minutes() -> int:
-    """За сколько минут до доставки сообщить хозяевам, что букет всё ещё не собран (0 — не сообщать)."""
+    """За сколько минут до доставки сообщить администраторам, что букет всё ещё не собран (0 — не сообщать)."""
     return int(_settings().value("assembly_alert_minutes", 30))
 
 
 def backup_to_telegram() -> bool:
-    """Раз в сутки присылать копию базы хозяевам в Telegram."""
+    """Раз в сутки присылать копию базы администраторам в Telegram."""
     return str(_settings().value("backup_to_telegram", "true")) == "true"
 
 
@@ -290,7 +290,7 @@ class SettingsDialog(QDialog):
         self.late_box.setValue(late_minutes())
         form.addRow("Доставка не отмечена через:", self.late_box)
         form.addRow(_gray_label("Если после времени доставки (для «14:00–16:00» — после 16:00) прошло столько минут,\n"
-                                "а «Доставлено» не отмечено — сотрудник получит уведомление, а хозяева — сообщение в Telegram."))
+                                "а «Доставлено» не отмечено — сотрудник получит уведомление, а администраторы — сообщение в Telegram."))
         self.assembly_box = QSpinBox()
         self.assembly_box.setRange(0, 600)
         self.assembly_box.setSingleStep(15)
@@ -304,7 +304,7 @@ class SettingsDialog(QDialog):
         self.assembly_alert_box.setSuffix(" мин")
         self.assembly_alert_box.setSpecialValueText("не сообщать")
         self.assembly_alert_box.setValue(assembly_alert_minutes())
-        form.addRow("Сообщить хозяевам, если не собран за:", self.assembly_alert_box)
+        form.addRow("Сообщить администраторам, если не собран за:", self.assembly_alert_box)
         form.addRow(_gray_label("Окно «Не собрано!» всплывает поверх всех окон и повторяется каждые 10 минут,\n"
                                 "пока букет не отметят собранным. Заказы на дальние дни собирать заранее не нужно."))
         layout.addWidget(reminders)
@@ -607,7 +607,7 @@ class SettingsDialog(QDialog):
         form.addRow(_gray_label("Копия делается при каждой сдаче смены и раз в сутки.\n"
                                 "Всегда — на этом компьютере, и, если указано, — на флешку или в папку.\n"
                                 "Если флешка не вставлена, копия останется на компьютере, а программа предупредит."))
-        self.tg_backup_check = QCheckBox("Каждый день присылать копию хозяевам в Telegram")
+        self.tg_backup_check = QCheckBox("Каждый день присылать копию администраторам в Telegram")
         self.tg_backup_check.setChecked(backup_to_telegram())
         form.addRow(self.tg_backup_check)
         form.addRow(_gray_label("Файл приходит после утренней пересменки — даже если компьютер сломается,\n"

@@ -109,7 +109,7 @@ def test_admin_approves_delete_in_telegram(db):
     assert answer.startswith("🗑 Удалено: №1") and db.get_delivery(d.id) is None
     assert decided == [(1, True, "Мария")]
     assert audit[0][0] == "Удаление доставки подтверждено" and "просил(а) Анна" in audit[0][1] and "решил(а) Мария" in audit[0][1]
-    # второй хозяин нажал позже — уже решено, ничего не ломается
+    # второй администратор нажал позже — уже решено, ничего не ломается
     assert "уже нет" in BotHandler().handle(f"/del_{d.id}", make_ctx(db), "222", "Игорь")
 
 

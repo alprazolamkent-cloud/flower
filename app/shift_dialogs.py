@@ -399,7 +399,7 @@ class CashOpDialog(QDialog):
     """Расход или изъятие из кассы во время смены."""
 
     PLACEHOLDERS = {"expense": "на что потратили, например скотч или вода",
-                    "withdrawal": "кто забрал деньги, например хозяйка или инкассация"}
+                    "withdrawal": "кто забрал деньги, например администратор или инкассация"}
 
     def __init__(self, parent, db: Database, shift: Shift, user: User):
         super().__init__(parent)
@@ -463,7 +463,7 @@ class CabinetDialog(QDialog):
         super().__init__(parent)
         self.db, self.user, self.change, self.grace, self.water = db, user, change, grace, water
         self.on_dispute = on_dispute  # сообщить администраторам, что сотрудник оспорил санкцию
-        self.on_penalty = on_penalty  # админ поставил / снял санкцию в программе — сообщить второму хозяину
+        self.on_penalty = on_penalty  # админ поставил / снял санкцию в программе — сообщить второму администратору
         self.rules = rules  # правила зарплаты для сотрудника (у кого-то могут быть свои ступени)
         self.kinds = kinds  # список штрафных санкций (из настроек)
         self.month_shifts: list[Shift] = []
@@ -846,7 +846,7 @@ class PenaltyDialog(QDialog):
                  on_change: Callable[[Penalty, str], None] | None = None):
         super().__init__(parent)
         self.db, self.shift, self.kinds, self.admin = db, shift, kinds, admin
-        self.on_change = on_change  # (санкция, "set" / "removed" / "kept") — сообщить второму хозяину
+        self.on_change = on_change  # (санкция, "set" / "removed" / "kept") — сообщить второму администратору
         self.items = []
         self.setWindowTitle(f"Санкции: {shift.user_name or '—'}, смена {shift.day:%d.%m}")
         self.resize(720, 400)

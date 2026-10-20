@@ -755,7 +755,7 @@ class Database:
             (limit,)).fetchall()
 
     def remember_chat(self, chat_id: str, title: str, now: datetime):
-        """Кто писал боту (в том числе посторонние) — чтобы хозяин мог выбрать своих в настройках."""
+        """Кто писал боту (в том числе посторонние) — чтобы администратор мог выбрать своих в настройках."""
         self.conn.execute(
             "INSERT INTO telegram_chats (chat_id, title, last_seen) VALUES (?, ?, ?)"
             " ON CONFLICT (chat_id) DO UPDATE SET title = excluded.title, last_seen = excluded.last_seen",
@@ -917,7 +917,7 @@ class Database:
 
     def add_penalty(self, shift_id: int, kind_id: int, title: str, amount: int, by: str, now: datetime,
                     note: str = "") -> Penalty | None:
-        """Поставить санкцию за смену. Такая же за ту же смену уже есть — None (чтобы два хозяина
+        """Поставить санкцию за смену. Такая же за ту же смену уже есть — None (чтобы два администратора
         не наказали дважды за одно и то же)."""
         shift = self.get_shift(shift_id)
         if shift is None:

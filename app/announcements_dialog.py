@@ -19,7 +19,7 @@ def short(text: str, length: int = 60) -> str:
 
 
 class UnreadDialog(QDialog):
-    """Новые объявления от хозяина. Закрыть можно только кнопкой «Прочитал(а)»."""
+    """Новые объявления от администратора. Закрыть можно только кнопкой «Прочитал(а)»."""
 
     def __init__(self, parent, items: list[Announcement], name: str):
         super().__init__(parent)
@@ -63,7 +63,7 @@ class HistoryDialog(QDialog):
         self.setWindowTitle("Объявления")
         self.resize(820, 460)
         layout = QVBoxLayout(self)
-        hint = QLabel("Объявления пишет хозяин: сообщением Telegram-боту, начиная с «!», "
+        hint = QLabel("Объявления пишет администратор: сообщением Telegram-боту, начиная с «!», "
                       "например «! С понедельника розы по 150 ₽».")
         hint.setWordWrap(True)
         hint.setStyleSheet(f"color: {C.gray}")

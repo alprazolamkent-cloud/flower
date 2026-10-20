@@ -129,7 +129,7 @@ def test_outbox_dedup_and_sent(db):
 def test_shift_closed_text(db):
     anna = db.add_user("anna", "Анна", "1")
     s = db.open_shift(anna.id, 5000, datetime(2026, 10, 20, 8, 5), CH)
-    db.add_cash_op(s.id, "withdrawal", 10000, "хозяйка", anna.id, datetime(2026, 10, 20, 20, 0))
+    db.add_cash_op(s.id, "withdrawal", 10000, "администратор", anna.id, datetime(2026, 10, 20, 20, 0))
     s = db.close_shift(s.id, datetime(2026, 10, 21, 7, 50), 6700, 12000, 0, "всё ок",
                        revenue=30000, flowers=25000, terminal=15000, qr=3000)
     text = telegram.shift_closed_text(s, CH, False, "missed", ["протереть витрину"])

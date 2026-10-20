@@ -71,7 +71,7 @@ def test_penalty_lifecycle(db):
     s = closed_shift(db, anna, date(2026, 10, 20))
     p = db.add_penalty(s.id, 1, "Грязная вода", 500, "Мария (Telegram)", NOW)
     assert (p.user_id, p.amount, p.created_by, p.shift_day, p.user_name) == (anna.id, 500, "Мария (Telegram)", date(2026, 10, 20), "Анна")
-    assert db.add_penalty(s.id, 1, "Грязная вода", 500, "Игорь (Telegram)", NOW) is None  # второй хозяин — повтор
+    assert db.add_penalty(s.id, 1, "Грязная вода", 500, "Игорь (Telegram)", NOW) is None  # второй администратор — повтор
     assert db.add_penalty(s.id, 4, "Нет ценников", 1000, "Игорь", NOW) is not None  # другая санкция — можно
     assert [x.title for x in db.penalties_for_shift(s.id)] == ["Грязная вода", "Нет ценников"]
     assert db.delete_penalty(p.id).title == "Грязная вода" and db.delete_penalty(p.id) is None
@@ -249,7 +249,7 @@ def test_owner_taps_penalty_link(db):
     assert changed == [("Нет ценников", True, "Мария")] and audit[0][0] == "Штрафная санкция поставлена"
     [p] = db.penalties_for_shift(s.id)
     assert p.created_by == "Мария (Telegram)" and f"/unpen_{p.id}" in answer
-    # второй хозяин нажал ту же ссылку — не штрафуем дважды
+    # второй администратор нажал ту же ссылку — не штрафуем дважды
     assert "уже поставлена" in BotHandler().handle(f"/pen_{s.id}_4", ctx_for(db), "222", "Игорь")
     assert len(db.penalties_for_shift(s.id)) == 1
 

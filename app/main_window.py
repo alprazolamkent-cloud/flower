@@ -173,7 +173,7 @@ class MainWindow(QMainWindow):
         self.assembly.snoozed.connect(self._snooze_assembly)
         self._assembly_snooze_until: datetime | None = None
         self._assembly_seen: set[int] = set()  # о каких уже напоминали: новая — показываем сразу
-        self._assembly_first: dict[int, datetime] = {}  # когда впервые напомнили — хозяевам только после 10 минут
+        self._assembly_first: dict[int, datetime] = {}  # когда впервые напомнили — администраторам только после 10 минут
         self._backup_attempt: datetime | None = None
         self._backup_day_pending = ""
         self._really_quit = False
@@ -497,7 +497,7 @@ class MainWindow(QMainWindow):
                     shift, change, late, water, missed, penalty_catalog(), self._writeoff_note(shift),
                     self.db.writeoff_items_for_shift(shift.id), alert),
                     key=f"close:{shift.id}")
-            elif alert:  # итоги смен выключены, но о большом списании хозяева узнают всё равно
+            elif alert:  # итоги смен выключены, но о большом списании администраторы узнают всё равно
                 self.telegram.queue(f"{alert}\n{shift.user_name or 'Сотрудник'}, смена {shift.day:%d.%m}",
                                     key=f"writeoff_alert:{shift.id}")
         self.run_backup()
@@ -670,7 +670,7 @@ class MainWindow(QMainWindow):
 
         for s in self.db.open_shifts():
             deadline = s.deadline(change, grace)
-            if deadline <= now < deadline + timedelta(days=1):  # не сдана — сообщить хозяину один раз
+            if deadline <= now < deadline + timedelta(days=1):  # не сдана — сообщить администратору один раз
                 self.telegram.queue(telegram.not_closed_text(s), key=f"not_closed:{s.id}")
 
         day = business_day(now, change)
@@ -811,7 +811,7 @@ class MainWindow(QMainWindow):
 
     def _unread(self) -> list:
         if self.user is None or self.user.is_admin:
-            return []  # объявления пишет хозяин — показываем их сотрудникам
+            return []  # объявления пишет администратор — показываем их сотрудникам
         return self.db.unread_announcements(self.user.id, datetime.now() - ANNOUNCE_FOR)
 
     # ----- журнал уведомлений -----
@@ -917,7 +917,7 @@ class MainWindow(QMainWindow):
         QApplication.alert(self)
 
     def _check_overdue(self, now: datetime):
-        """Доставка не отмечена через N минут после времени — сказать сотруднику и хозяевам в Telegram."""
+        """Доставка не отмечена через N минут после времени — сказать сотруднику и администраторам в Telegram."""
         today = now.date()
         candidates = self.db.for_day(today - timedelta(days=1)) + self.db.for_day(today)
         for d in overdue_deliveries(candidates, now, late_minutes(), self._reminded):
@@ -1243,7 +1243,7 @@ class MainWindow(QMainWindow):
         self.refresh_all()
 
     def _penalty_changed(self, p, set_: bool, who: str):
-        """Админ поставил или снял санкцию в Telegram: обновить экран, сказать сотрудникам, сообщить второму хозяину."""
+        """Админ поставил или снял санкцию в Telegram: обновить экран, сказать сотрудникам, сообщить второму администратору."""
         self.refresh_all()
         what = f"{p.title} −{money(p.amount)} ({p.user_name or '—'}, смена {p.shift_day:%d.%m})"
         self.tray.showMessage("Штрафная санкция" if set_ else "Санкция снята", what, QSystemTrayIcon.Warning, 60_000)
@@ -1263,7 +1263,7 @@ class MainWindow(QMainWindow):
         self._assembly_first = {d.id: self._assembly_first.get(d.id, now) for d in due}
         for d in assembly_escalations(candidates, now, assembly_alert_minutes(), self._reminded):
             if now - self._assembly_first.get(d.id, now) < SNOOZE:
-                continue  # срочный заказ только что приняли — сначала напомнить флористу, хозяевам потом
+                continue  # срочный заказ только что приняли — сначала напомнить флористу, администраторам потом
             self._reminded.add(("assembly",) + reminder_key(d))
             self.telegram.queue(f"💐 Букет ещё не собран, а доставка скоро\n{describe_delivery(d)}",
                                 key=f"assembly:{d.id}:{d.day}:{d.time}")
@@ -1329,7 +1329,7 @@ class MainWindow(QMainWindow):
                 "Никому не пересылайте: в нём телефоны клиентов.")
 
     def _maybe_send_backup(self, now: datetime):
-        """Раз в сутки — после утренней пересменки и сдачи смены — свежая копия хозяевам в Telegram."""
+        """Раз в сутки — после утренней пересменки и сдачи смены — свежая копия администраторам в Telegram."""
         if not (backup_to_telegram() and telegram.configured()) or self.db.path == ":memory:":
             return
         change, day = shift_change(), business_day(now, shift_change())
@@ -1355,7 +1355,7 @@ class MainWindow(QMainWindow):
             self.db.log_action(None, "Копия в Telegram не отправлена", "; ".join(errors), who="программа")
 
     def _check_reports(self, now: datetime):
-        """Утренний, недельный и месячный отчёты хозяевам в Telegram — по одному разу за период."""
+        """Утренний, недельный и месячный отчёты администраторам в Telegram — по одному разу за период."""
         if not telegram.configured():
             return
         for report in due_reports(now, shift_change(), report_settings(), grace_minutes()):
@@ -1383,7 +1383,7 @@ class MainWindow(QMainWindow):
         return ""
 
     def _dispute_made(self, p) -> bool:
-        """Сотрудник оспорил санкцию: хозяевам — в Telegram, в журнал — для админа в программе.
+        """Сотрудник оспорил санкцию: администраторам — в Telegram, в журнал — для админа в программе.
         True — ушло в Telegram."""
         self.audit("Санкция оспорена", f"{p.user_name or '—'}, {p.title}, смена {p.shift_day:%d.%m}: {p.dispute_text}")
         self.telegram.queue(telegram.dispute_text(p), key=f"dispute:{p.id}")
@@ -1398,7 +1398,7 @@ class MainWindow(QMainWindow):
             self._penalty_changed(p, change == "set", who)
 
     def _dispute_kept(self, p, who: str):
-        """Хозяин в Telegram оставил оспоренную санкцию: сотруднику — на экран, второму хозяину — в Telegram."""
+        """Администратор в Telegram оставил оспоренную санкцию: сотруднику — на экран, второму администратору — в Telegram."""
         what = f"{p.title} ({p.user_name or '—'}, смена {p.shift_day:%d.%m})"
         self.tray.showMessage("Спор по санкции решён", f"Санкция остаётся: {what}", QSystemTrayIcon.Information, 60_000)
         self.telegram.queue(f"ℹ️ {who or 'Администратор'} оставил(а) санкцию после спора: {what}",
@@ -1416,7 +1416,7 @@ class MainWindow(QMainWindow):
         return note
 
     def _delete_decided(self, d: Delivery, approved: bool, who: str):
-        """Решение пришло из Telegram: обновить экран, сказать сотрудникам, сообщить второму хозяину."""
+        """Решение пришло из Telegram: обновить экран, сказать сотрудникам, сообщить второму администратору."""
         self.refresh_all()
         verdict = "подтверждено" if approved else "отклонено"
         self.tray.showMessage(f"Удаление доставки {verdict}", describe_delivery(d), QSystemTrayIcon.Information, 30_000)

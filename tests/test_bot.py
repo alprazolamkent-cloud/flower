@@ -246,7 +246,7 @@ def test_menu_matches_commands():
     assert all(name.isascii() and name.islower() for name, _ in bc.MENU)  # Telegram принимает в меню только латиницу
 
 
-# ----- несколько хозяев -----
+# ----- несколько администраторов -----
 
 def test_chat_ids_parsing():
     assert telegram.chat_ids("111, -100222;333  111") == ["111", "-100222", "333"]
