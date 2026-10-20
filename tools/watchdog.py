@@ -12,8 +12,10 @@ import re
 import sys
 import urllib.parse
 import urllib.request
-from datetime import datetime, timezone
-from zoneinfo import ZoneInfo
+from datetime import datetime, timedelta, timezone, tzinfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+MOSCOW = timezone(timedelta(hours=3), "МСК")
 
 OFFLINE_AFTER_MIN = 10
 PAUSED_MARK = "⏸"
@@ -25,7 +27,15 @@ def call(token: str, method: str, params: dict) -> dict:
         return json.load(r)
 
 
-def alert_text(pinned: dict | None, now: datetime, tz: ZoneInfo) -> str | None:
+def zone(name: str) -> tzinfo:
+    """Часовой пояс по имени; нет базы поясов (бывает на Windows) или опечатка — Москва."""
+    try:
+        return ZoneInfo(name) if name else MOSCOW
+    except (ZoneInfoNotFoundError, ValueError):
+        return MOSCOW
+
+
+def alert_text(pinned: dict | None, now: datetime, tz: tzinfo) -> str | None:
     """Текст тревоги или None (всё в порядке, слежение выключено или ещё не настроено)."""
     if not pinned or PAUSED_MARK in (pinned.get("text") or ""):
         return None
@@ -45,7 +55,7 @@ def main() -> int:
     if not token or not chats:
         print("Секреты TG_TOKEN и TG_CHATS не заданы — сторож выключен.")
         return 0
-    tz = ZoneInfo(os.environ.get("TG_TZ") or "Europe/Moscow")
+    tz = zone(os.environ.get("TG_TZ", "").strip())
     pinned = call(token, "getChat", {"chat_id": chats[0]}).get("result", {}).get("pinned_message")
     text = alert_text(pinned, datetime.now(timezone.utc), tz)
     if text is None:

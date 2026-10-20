@@ -4,7 +4,6 @@ import importlib.util
 import os
 import sys
 from datetime import datetime, timedelta, timezone
-from zoneinfo import ZoneInfo
 
 import pytest
 from PySide6.QtCore import QSettings
@@ -28,7 +27,7 @@ def test_back_online_text():
 
 
 def test_watchdog_alert_text():
-    tz = ZoneInfo("Europe/Moscow")
+    tz = watchdog.MOSCOW  # без базы поясов: на Windows её может не быть
     now = datetime(2026, 10, 20, 19, 0, tzinfo=timezone.utc)  # 22:00 по Москве
     fresh = {"text": "🟢 на связи", "date": 0, "edit_date": int((now - timedelta(minutes=3)).timestamp())}
     old = {"text": "🟢 на связи", "date": int((now - timedelta(minutes=25)).timestamp())}
@@ -38,6 +37,10 @@ def test_watchdog_alert_text():
     assert "не на связи уже 25 мин" in text and "20.10 21:35" in text and "через 10 минут" in text
     assert watchdog.alert_text(paused, now, tz) is None  # выключили нарочно
     assert watchdog.alert_text(None, now, tz) is None  # ещё не настроено
+
+
+def test_watchdog_zone_fallback():
+    assert watchdog.zone("") is watchdog.MOSCOW and watchdog.zone("Нет/Такого") is watchdog.MOSCOW
 
 
 def test_watchdog_without_secrets(monkeypatch, capsys):
@@ -55,19 +58,17 @@ def store(monkeypatch):
 
 
 def test_heartbeat_pins_then_edits(store, monkeypatch):
-    app = QApplication.instance() or QApplication(sys.argv)
+    QApplication.instance() or QApplication(sys.argv)
     calls = []
     monkeypatch.setattr(telegram, "send_message", lambda t, c, text: calls.append(("send", c)) or 77)
     monkeypatch.setattr(telegram, "pin_message", lambda t, c, m: calls.append(("pin", c, m)))
     monkeypatch.setattr(telegram, "edit_message", lambda t, c, m, text: calls.append(("edit", c, m, text[:1])))
     hb = heartbeat.Heartbeat()
     hb._send("x", "111", 0, heartbeat.status_text(NOW))  # первый раз — прислать и закрепить
-    app.processEvents()
     assert calls == [("send", "111"), ("pin", "111", 77)]
     assert (store["tg_status_chat"], store["tg_status_msg"]) == ("111", 77)
     calls.clear()
     hb._send("x", "111", 77, heartbeat.status_text(NOW))  # дальше — только править
-    app.processEvents()
     assert calls == [("edit", "111", 77, "🟢")]
 
     def gone(*a):
@@ -75,14 +76,13 @@ def test_heartbeat_pins_then_edits(store, monkeypatch):
     monkeypatch.setattr(telegram, "edit_message", gone)
     calls.clear()
     hb._send("x", "111", 77, heartbeat.status_text(NOW))  # открепили / удалили — новое
-    app.processEvents()
     assert calls == [("send", "111"), ("pin", "111", 77)]
     hb.timer.stop()
     hb.deleteLater()
 
 
 def test_back_online_after_gap(store):
-    app = QApplication.instance() or QApplication(sys.argv)
+    QApplication.instance() or QApplication(sys.argv)
     hb = heartbeat.Heartbeat()
     got = []
     hb.back_online.connect(got.append)
@@ -95,4 +95,3 @@ def test_back_online_after_gap(store):
     assert len(got) == 1
     hb.timer.stop()
     hb.deleteLater()
-    app.processEvents()
