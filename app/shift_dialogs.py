@@ -15,13 +15,12 @@ from PySide6.QtWidgets import (
 
 from .db import Database, User, UserError
 from .delivery_dialog import MAX_MONEY, money, money_box
-from .salary import (
-    KIND_TITLES, PenaltyKind, SalaryRules, calculate, forecast, monthly_ranking, pct, shifts_word, shop_writeoff,
-)
+from .salary import PenaltyKind, SalaryRules, calculate, forecast, monthly_ranking, shop_writeoff
 from .shifts import (
     KIND_TEXT, PROBLEM_STATUSES, STATUS_TEXT, WRITEOFF_REASONS, ChecklistItem, Penalty, Shift, WaterSchedule,
     expected_cash, revenue_mismatch, window,
 )
+from .salary_view import SalaryPanel
 from .theme import C
 
 MONTHS = ["январь", "февраль", "март", "апрель", "май", "июнь",
@@ -460,11 +459,11 @@ class CabinetDialog(QDialog):
         self.year, self.month = year, month
         self.shifts: list[Shift] = []
         self.setWindowTitle("Личный кабинет")
-        self.resize(1500, 660)
+        self.resize(1500, 800)
         screen = self.screen() or QApplication.primaryScreen()
-        if screen is not None:  # на ноутбуке 1366×768 — не шире экрана
+        if screen is not None:  # на ноутбуке 1366×768 — не больше экрана
             area = screen.availableGeometry()
-            self.resize(min(1500, area.width() - 20), min(660, area.height() - 60))
+            self.resize(min(1500, area.width() - 20), min(800, area.height() - 60))
         layout = QVBoxLayout(self)
 
         top = QHBoxLayout()
@@ -495,24 +494,20 @@ class CabinetDialog(QDialog):
         self.summary.setStyleSheet("font-size: 14px; padding: 6px 0")
         layout.addWidget(self.summary)
 
-        self.salary_box = QGroupBox("Зарплата за месяц")
-        salary_row = QHBoxLayout(self.salary_box)
-        self.salary_label = QLabel()
-        self.salary_label.setWordWrap(True)
-        salary_row.addWidget(self.salary_label, 1)
+        self.salary_panel = SalaryPanel()
         self.adjust_btn = QPushButton("± Аванс / премия / штраф…")
         self.adjust_btn.clicked.connect(self._adjust)
-        salary_row.addWidget(self.adjust_btn)
         self.penalty_btn = QPushButton("⚠ Санкции смены…")
         self.penalty_btn.setToolTip("Поставить штрафную санкцию за выбранную смену или убрать")
         self.penalty_btn.clicked.connect(self._penalties)
-        salary_row.addWidget(self.penalty_btn)
         self.dispute_btn = QPushButton("✋ Оспорить санкцию…")
         self.dispute_btn.setToolTip("Не согласны с санкцией — напишите почему, решит администратор")
         self.dispute_btn.clicked.connect(self._dispute)
-        salary_row.addWidget(self.dispute_btn)
-        self.salary_box.setVisible(rules is not None)
-        layout.addWidget(self.salary_box)
+        for b in (self.adjust_btn, self.penalty_btn, self.dispute_btn):
+            self.salary_panel.buttons.addWidget(b)
+        self.salary_panel.buttons.addStretch(1)
+        self.salary_panel.setVisible(rules is not None)
+        layout.addWidget(self.salary_panel)
 
         self.table = QTableWidget(0, len(CABINET_HEADERS))
         self.table.setHorizontalHeaderLabels(CABINET_HEADERS)
@@ -677,39 +672,18 @@ class CabinetDialog(QDialog):
         self.adjust_btn.setVisible(self.user.is_admin and person is not None)
         self.penalty_btn.setVisible(self.user.is_admin and self.kinds is not None)
         self.dispute_btn.setVisible(not self.user.is_admin)
-        if person is None:  # все сотрудники — по строчке на каждого
-            lines = []
-            for u in self.db.users():
-                shifts = [s for s in self.shifts if s.user_id == u.id]
-                if shifts:
-                    sal = self._salary(u.id, shifts)
-                    flag = f" <span style='color:{C.red}'>⚠ без премии</span>" if sal.blocked else ""
-                    if any(p.disputed_at and not p.dispute_result for p in sal.penalties):
-                        flag += f" <span style='color:{C.orange}'>✋ оспорена санкция</span>"
-                    lines.append(f"{u.name or u.login}: <b>{money(sal.total)}</b>{flag}")
-            self.salary_label.setText(" &nbsp;·&nbsp; ".join(lines) or "Смен за месяц нет.")
+        name = MONTHS[self.month - 1]
+        reasons = self.db.writeoff_by_reason(*self._month_range())
+        if person is None:  # все сотрудники — таблица по людям
+            rows = [(u.name or u.login, self._salary(u.id, own)) for u in self.db.users()
+                    if (own := [s for s in self.shifts if s.user_id == u.id])]
+            self.salary_panel.show_all(rows, name, monthly_ranking(self.month_shifts, self.rules(None)), reasons)
             return
         rules = self.rules(person)
         sal = self._salary(person, self.shifts)
-        parts = [self._base_text(sal)]
-        bonus_line = self._bonus_text(sal, rules)
-        if sal.shortage:
-            parts.append(f"<span style='color:{C.red}'>Недостача: −{money(sal.shortage)}</span>")
-        for p in sal.penalties:
-            parts.append(f"<span style='color:{C.red}'>Санкция «{_html(p.title)}» ({p.shift_day:%d.%m}): "
-                         f"−{money(p.amount)}</span>")
-        for a in sal.adjustments:
-            sign = "+" if a.amount > 0 else "−"
-            parts.append(f"{_html(a.reason)}: {sign}{money(abs(a.amount))}")
-        text = " &nbsp;·&nbsp; ".join(parts)
-        if bonus_line:
-            text += "<br>" + bonus_line
-        text += self._conditions_text(sal, rules)
-        text += self._extras_text(sal, rules)
-        text += f"<br><b style='font-size:15px'>Итого: {money(sal.total)}</b>"
-        if sal.not_closed:
-            text += f" &nbsp;<span style='color:{C.gray}'>(несданные смены не учтены: {sal.not_closed})</span>"
-        self.salary_label.setText(text)
+        today = date.today()
+        plan = forecast(sal, rules, today) if (self.year, self.month) == (today.year, today.month) else None
+        self.salary_panel.show_person(sal, rules, name, plan, monthly_ranking(self.month_shifts, rules), reasons)
 
     def _salary(self, user_id: int, shifts: list[Shift]):
         """Зарплата сотрудника за месяц: санкции — его, списания — по всему магазину."""
@@ -721,44 +695,6 @@ class CabinetDialog(QDialog):
     def _month_range(self) -> tuple[date, date]:
         last = calendar.monthrange(self.year, self.month)[1]
         return date(self.year, self.month, 1), date(self.year, self.month, last)
-
-    @staticmethod
-    def _base_text(sal) -> str:
-        if not sal.base_parts:
-            return f"Смены: 0 = {money(0)}"
-        pieces = [(f"{KIND_TITLES[kind]} " if len(sal.base_parts) > 1 else "") + f"{count} × {money(rate)}"
-                  for kind, count, rate in sal.base_parts]
-        return f"Смены: {' + '.join(pieces)} = {money(sal.base)}"
-
-    def _extras_text(self, sal, rules: SalaryRules) -> str:
-        """Праздничные смены, прогноз премии, рейтинг месяца, списания по причинам."""
-        lines = []
-        if sal.holiday_shifts:
-            lines.append(f"🎉 Праздничных смен: {sal.holiday_shifts}, выручка {money(sal.holiday_revenue)} "
-                         "в премию не идёт (в праздники премия за выручку не начисляется)")
-        today = date.today()
-        if (self.year, self.month) == (today.year, today.month):
-            plan = forecast(sal, rules, today)
-            if plan is not None:
-                lines.append(f"🎯 Прогноз: до конца месяца примерно {shifts_word(plan.remaining_shifts)}. Чтобы выйти на ступень "
-                             f"«от {money(plan.target.per_shift)}» ({pct(plan.target.percent, None)}), нужно в среднем "
-                             f"<b>{money(plan.needed_average)}</b> за смену")
-        rank = monthly_ranking(self.month_shifts, rules)
-        if rank.best_shift is not None and rank.best_shift.revenue:
-            b = rank.best_shift
-            text = f"🏆 Лучшая смена месяца: {_html(b.user_name or '—')}, {b.day:%d.%m} — {money(b.revenue)}"
-            if rank.best_average_name:
-                text += f". Лучший средний приход: {_html(rank.best_average_name)} — {money(rank.best_average)}"
-            lines.append(text)
-        reasons = self.db.writeoff_by_reason(*self._month_range())
-        if reasons:
-            lines.append("Списания магазина по причинам: "
-                         + ", ".join(f"{_html(r)} {money(a)}" for r, a in sorted(reasons.items(), key=lambda x: -x[1])))
-        open_disputes = [p for p in sal.penalties if p.disputed_at and not p.dispute_result]
-        if open_disputes:
-            lines.append(f"<span style='color:{C.orange}'>✋ Оспорено, ждёт решения: "
-                         + ", ".join(_html(p.title) for p in open_disputes) + "</span>")
-        return "<br>" + "<br>".join(lines) if lines else ""
 
     def _dispute(self):
         row = self.table.currentRow()
@@ -776,45 +712,6 @@ class CabinetDialog(QDialog):
                 "Администратор получил ваше объяснение в Telegram и решит." if in_telegram
                 else "Администратор увидит ваше объяснение в программе и решит.")
             self.refresh()
-
-    @staticmethod
-    def _conditions_text(sal, rules: SalaryRules) -> str:
-        """Условия премии: санкции и списания — чтобы было понятно, почему премия есть или нет."""
-        lines = []
-        if rules.max_penalties > 0:
-            ok = len(sal.penalties) < rules.max_penalties
-            lines.append(f"<span style='color:{C.green if ok else C.red}'>Санкций за месяц: {len(sal.penalties)} "
-                         f"(для премии меньше {rules.max_penalties})</span>")
-        if sal.writeoff_percent is not None:
-            ok = sal.writeoff_percent < rules.max_writeoff_percent
-            base = "от всех цветов" if rules.writeoff_base == "total" else "от проданных"
-            lines.append(f"<span style='color:{C.green if ok else C.red}'>Списания по магазину: "
-                         f"{pct(sal.writeoff_percent)} {base} (для премии меньше {pct(rules.max_writeoff_percent, None)})</span>")
-        if sal.blocked:
-            lines.append(f"<b style='color:{C.red}'>Премия не начислена: " + "; ".join(sal.blocked)
-                         + f". Без этого было бы {money(sal.bonus_earned)}.</b>")
-        return "<br>" + "<br>".join(lines) if lines else ""
-
-    @staticmethod
-    def _bonus_text(sal, rules: SalaryRules) -> str:
-        """Строка про премию: средний приход, достигнутая ступень и сколько до следующей."""
-        if not rules.active_tiers():
-            return ""
-        avg = money(round(sal.average))
-        text = f"Приход: {money(sal.revenue)}, в среднем {avg} за смену"
-        if sal.tier is None:
-            text += (f" — <span style='color:{C.red}'>план не выполнен (нужно от {money(sal.plan)}), "
-                     "премии нет</span>")
-        else:
-            source = "со сверх плана " if rules.above_plan_only else ""
-            paid = "" if not sal.blocked else f" <span style='color:{C.red}'>(не выплачивается)</span>"
-            text += (f" → ступень «от {money(sal.tier.per_shift)}»: <b style='color:{C.green}'>"
-                     f"{pct(sal.tier.percent, None)} {source}с {money(sal.bonus_base)} = {money(sal.bonus_earned)}</b>{paid}")
-        if sal.next_tier is not None and sal.shifts:
-            short = money(round(sal.next_tier.per_shift - sal.average))
-            text += (f"<br><span style='color:{C.gray}'>До ступени «от {money(sal.next_tier.per_shift)}» "
-                     f"({pct(sal.next_tier.percent, None)}) не хватает {short} в среднем за смену</span>")
-        return text
 
     def _adjust(self):
         person = self.person_box.currentData()

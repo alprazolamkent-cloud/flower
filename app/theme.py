@@ -19,6 +19,7 @@ LIGHT = {
     "pending_day": "#ffe0b2", "done_day": "#c8e6c9", "shift_name": "#546e7a",
     "note_bg": "#fff8e1", "note_border": "#ffe082", "info_bg": "#e3f2fd", "info_border": "#90caf9",
     "note_fg": "#212121",
+    "card_bg": "#ffffff", "card_border": "#dadada", "bar": "#a5d6a7",
 }
 DARK = {
     "red": "#ff6b6b", "green": "#66bb6a", "orange": "#ffa726", "blue": "#64b5f6", "gray": "#9aa0a6",
@@ -27,6 +28,7 @@ DARK = {
     "pending_day": "#4a3218", "done_day": "#1e3a24", "shift_name": "#b0bec5",
     "note_bg": "#3a3320", "note_border": "#6d5a1e", "info_bg": "#1c2b3a", "info_border": "#2f5d8a",
     "note_fg": "#f1f1f1",
+    "card_bg": "#26272b", "card_border": "#3a3c41", "bar": "#2f6a36",
 }
 
 C = SimpleNamespace(**LIGHT)
