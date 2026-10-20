@@ -27,7 +27,7 @@ def _buttons(dialog: QDialog, ok_text: str) -> QDialogButtonBox:
 
 
 class LoginDialog(QDialog):
-    def __init__(self, parent, db: Database):
+    def __init__(self, parent, db: Database, note: str = ""):
         super().__init__(parent)
         self.db = db
         self.user: User | None = None
@@ -39,6 +39,11 @@ class LoginDialog(QDialog):
         form = QFormLayout(self)
         title = QLabel("<h3>Доставки цветов</h3>Войдите под своим логином")
         form.addRow(title)
+        if note:
+            note_label = QLabel(note)
+            note_label.setWordWrap(True)
+            note_label.setStyleSheet("background: #e3f2fd; border: 1px solid #90caf9; padding: 6px")
+            form.addRow(note_label)
         self.login_edit = QLineEdit(self.settings.value("last_login", ""))
         form.addRow("Логин:", self.login_edit)
         self.password_edit = _password_edit()

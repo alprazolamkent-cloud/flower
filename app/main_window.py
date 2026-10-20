@@ -210,7 +210,7 @@ class MainWindow(QMainWindow):
         password_btn = QPushButton("🔑 Сменить пароль")
         password_btn.clicked.connect(self.change_password)
         logout_btn = QPushButton("🚪 Выйти")
-        logout_btn.setToolTip("Выйти из профиля, чтобы вошёл другой сотрудник")
+        logout_btn.setToolTip("Выйти из профиля, чтобы вошёл другой сотрудник. Смена при этом не закрывается.")
         logout_btn.clicked.connect(self.logout)
         for b in (self.settings_btn, password_btn, logout_btn):
             top.addWidget(b)
@@ -308,7 +308,7 @@ class MainWindow(QMainWindow):
         if not self.db.has_users():
             dlg = UserFormDialog(self, self.db, first_admin=True)
         else:
-            dlg = LoginDialog(self, self.db)
+            dlg = LoginDialog(self, self.db, self._on_shift_note())
         if dlg.exec() != QDialog.Accepted:
             return False
         self.set_user(dlg.user)
@@ -366,7 +366,15 @@ class MainWindow(QMainWindow):
             self.shift_label.setText("")
             return
         if self.shift is None:
-            self.shift_label.setText("Вы не на смене.")
+            others = [s for s in self.active_shifts() if s.user_id != self.user.id]
+            if others:
+                change = shift_change()
+                lines = [f"На смене: <b>{s.user_name or '—'}</b>, с {fmt_dt(s.opened_at)} до "
+                         f"{fmt_dt(s.end(change))}" for s in others]
+                self.shift_label.setText("<br>".join(lines) + "<br><span style='color:gray'>Вы не на смене. "
+                                         "Смена продолжается — сотруднику достаточно снова войти.</span>")
+            else:
+                self.shift_label.setText("Вы не на смене.")
             self.shift_btn.setText("🟢 Начать смену")
             self.shift_btn.setVisible(self.user.is_admin)  # сотрудник начинает смену при входе
             self.cash_btn.setEnabled(False)
@@ -418,6 +426,12 @@ class MainWindow(QMainWindow):
             self.close_shift()
 
     def start_shift(self):
+        others = [s.user_name or "—" for s in self.active_shifts() if s.user_id != self.user.id]
+        if others and QMessageBox.question(
+                self, "Начать смену",
+                f"Сейчас на смене: {', '.join(others)}. Ваша смена будет отдельной, их смена не закроется.\n\n"
+                "Начать свою смену?", QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+            return
         dlg = StartShiftDialog(self, self.db, self.user, shift_change())
         if dlg.exec() == QDialog.Accepted:
             self.shift = dlg.shift
@@ -450,32 +464,47 @@ class MainWindow(QMainWindow):
         CabinetDialog(self, self.db, self.user, shift_change(), grace_minutes(),
                       self.calendar.yearShown(), self.calendar.monthShown(), water_schedule()).exec()
 
-    def check_shift(self):
-        """Напомнить о скорой пересменке, а в пересменку вывести сотрудника из программы."""
-        if self.user is None or self.shift is None:
-            return
+    def active_shifts(self) -> list[Shift]:
+        """Кто сейчас на смене (или ещё может её сдать)."""
         now, change, grace = datetime.now(), shift_change(), grace_minutes()
-        end = self.shift.end(change)
-        if end - timedelta(minutes=REMIND_BEFORE_MINUTES) <= now < end \
-                and self.shift.id not in self._shift_reminded:
-            self._shift_reminded.add(self.shift.id)
-            self.tray.showMessage("Скоро пересменка",
-                                  f"Смена заканчивается в {end:%H:%M}. Сдайте смену: кнопка «Сдать смену».",
-                                  QSystemTrayIcon.Warning, 60_000)
-        start = window(self.shift.day, change)[0]
-        if now >= start + WATER_REMIND_AFTER and self.shift.day not in self._water_reminded \
-                and water_schedule().is_water_day(self.shift.day) and not self.db.water_change(self.shift.day):
-            self._water_reminded.add(self.shift.day)
+        return [s for s in self.db.open_shifts() if s.status(now, change, grace) in ("open", "closing")]
+
+    def _on_shift_note(self) -> str:
+        """Подсказка в окне входа: кто сейчас на смене."""
+        change = shift_change()
+        return "<br>".join(f"Сейчас на смене: <b>{s.user_name or '—'}</b> (до {s.end(change):%H:%M}). "
+                           "Чтобы продолжить смену, просто войдите снова." for s in self.active_shifts())
+
+    def check_shift(self):
+        """Напомнить о пересменке и смене воды; в пересменку вывести из программы того, чья смена."""
+        now, change, grace = datetime.now(), shift_change(), grace_minutes()
+        active = self.active_shifts()
+        for s in active:
+            mine = self.shift is not None and s.id == self.shift.id
+            end, name = s.end(change), s.user_name or "сотрудник"
+            if end - timedelta(minutes=REMIND_BEFORE_MINUTES) <= now < end and s.id not in self._shift_reminded:
+                self._shift_reminded.add(s.id)
+                text = (f"Смена заканчивается в {end:%H:%M}. Сдайте смену: кнопка «Сдать смену»." if mine
+                        else f"Смена ({name}) заканчивается в {end:%H:%M} — нужно войти и сдать смену.")
+                self.tray.showMessage("Скоро пересменка", text, QSystemTrayIcon.Warning, 60_000)
+            if now >= end and s.id not in self._shift_ended:
+                if mine and QApplication.activeModalWidget() is not None:
+                    continue  # человек что-то заполняет — выведем, когда закроет окно
+                self._shift_ended.add(s.id)
+                deadline = s.deadline(change, grace)
+                text = (f"Сдайте смену до {deadline:%H:%M}: войдите в программу и заполните итоги." if mine
+                        else f"Смена ({name}) закончилась — нужно войти и сдать её до {deadline:%H:%M}.")
+                self.tray.showMessage("Смена закончилась", text, QSystemTrayIcon.Warning, 60_000)
+                if mine:
+                    self.logout()
+                    return
+
+        day = business_day(now, change)
+        if active and now >= window(day, change)[0] + WATER_REMIND_AFTER and day not in self._water_reminded \
+                and water_schedule().is_water_day(day) and not self.db.water_change(day):
+            self._water_reminded.add(day)
             self.tray.showMessage("Смена воды", "Сегодня день смены воды. Поменяйте воду и отметьте "
                                   "кнопкой «💧 Вода поменяна».", QSystemTrayIcon.Information, 60_000)
-        if now >= end and self.shift.id not in self._shift_ended \
-                and QApplication.activeModalWidget() is None:
-            self._shift_ended.add(self.shift.id)
-            self.tray.showMessage("Смена закончилась",
-                                  f"Сдайте смену до {self.shift.deadline(change, grace):%H:%M}: "
-                                  "войдите в программу и заполните итоги.",
-                                  QSystemTrayIcon.Warning, 60_000)
-            self.logout()
 
     def set_user(self, user: User | None):
         self.user = user

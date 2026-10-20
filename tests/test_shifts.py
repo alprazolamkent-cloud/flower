@@ -185,3 +185,13 @@ def test_shifts_from_previous_version_are_migrated(tmp_path):
     [s] = db.shifts_between(date(2026, 10, 20), date(2026, 10, 20))
     assert s.revenue == 0 and s.expected_cash() == 1700  # у старой смены доставка считалась в кассе
     db.close()
+
+
+def test_open_shifts_survive_logout(db):
+    """Выход из программы не закрывает смену: открытые смены видны всем, сданные — нет."""
+    anna, oleg = db.add_user("anna", "Анна", "1"), db.add_user("oleg", "Олег", "1")
+    a = db.open_shift(anna.id, 0, datetime(2026, 10, 20, 8, 5), CHANGE)
+    o = db.open_shift(oleg.id, 0, datetime(2026, 10, 19, 8, 5), CHANGE)
+    db.close_shift(o.id, datetime(2026, 10, 20, 7, 50), 0, 0, 0)
+    assert [s.id for s in db.open_shifts()] == [a.id]
+    assert db.current_shift(anna.id).id == a.id  # Анна вернётся в ту же смену

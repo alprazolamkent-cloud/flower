@@ -389,6 +389,11 @@ class Database:
         ).fetchone()
         return _row_to_shift(row) if row else None
 
+    def open_shifts(self) -> list[Shift]:
+        """Все несданные смены (кто сейчас на смене или не сдал)."""
+        rows = self.conn.execute(SHIFT_SELECT + " WHERE s.closed_at IS NULL ORDER BY s.opened_at, s.id").fetchall()
+        return [_row_to_shift(r) for r in rows]
+
     def close_shift(self, shift_id: int, now: datetime, closing_cash: int, cash_sales: int,
                     courier_cash: int, note: str = "", revenue: int = 0, flowers: int = 0,
                     terminal: int = 0, qr: int = 0, deliveries: int = 0) -> Shift:
