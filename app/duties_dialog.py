@@ -10,6 +10,7 @@ from PySide6.QtWidgets import (
 
 from .db import Database
 from .shifts import Shift
+from .theme import C
 
 
 class DutiesEditor(QDialog):
@@ -40,7 +41,7 @@ class DutiesEditor(QDialog):
         hint = QLabel("Например: протереть витрину, проверить холодильник, вынести мусор. "
                       "Смена воды отмечается отдельно.")
         hint.setWordWrap(True)
-        hint.setStyleSheet("color: gray")
+        hint.setStyleSheet(f"color: {C.gray}")
         layout.addWidget(hint)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)

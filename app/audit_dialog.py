@@ -9,6 +9,7 @@ from PySide6.QtWidgets import (
 )
 
 from .db import Database
+from .theme import C
 
 PERIODS = (("За сутки", 1), ("За неделю", 7), ("За месяц", 30), ("За всё время (до 180 дней)", 180))
 
@@ -50,7 +51,7 @@ class AuditDialog(QDialog):
         header.setSectionResizeMode(3, QHeaderView.Stretch)
         layout.addWidget(self.table, 1)
         self.count = QLabel()
-        self.count.setStyleSheet("color: gray")
+        self.count.setStyleSheet(f"color: {C.gray}")
         layout.addWidget(self.count)
 
         close = QDialogButtonBox(QDialogButtonBox.Close)

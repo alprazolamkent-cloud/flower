@@ -66,7 +66,7 @@ class HistoryDialog(QDialog):
         hint = QLabel("Объявления пишет хозяин: сообщением Telegram-боту, начиная с «!», "
                       "например «! С понедельника розы по 150 ₽».")
         hint.setWordWrap(True)
-        hint.setStyleSheet("color: gray")
+        hint.setStyleSheet(f"color: {C.gray}")
         layout.addWidget(hint)
 
         self.table = QTableWidget(0, 3)

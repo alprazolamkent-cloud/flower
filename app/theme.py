@@ -12,16 +12,19 @@ from PySide6.QtGui import QColor, QPainter, QPalette, QPen, QPixmap
 THEMES = {"light": "Светлая", "dark": "Тёмная", "system": "Как в Windows"}
 
 LIGHT = {
-    "red": "#c62828", "green": "#2e7d32", "orange": "#ef6c00", "blue": "#1e88e5", "gray": "#757575",
+    # текстовые цвета подобраны так, чтобы читались и на белом, и на сером фоне окна
+    "red": "#c62828", "green": "#2e7d32", "orange": "#bf5000", "blue": "#1565c0", "gray": "#6b6b6b",
+    "weekend": "#c62828",
     "delivered_bg": "#e3f4e4", "delivered_fg": "#1b1f1b",
     "pending_day": "#ffe0b2", "done_day": "#c8e6c9", "shift_name": "#546e7a",
     "note_bg": "#fff8e1", "note_border": "#ffe082", "info_bg": "#e3f2fd", "info_border": "#90caf9",
     "note_fg": "#212121",
 }
 DARK = {
-    "red": "#ef5350", "green": "#66bb6a", "orange": "#ffa726", "blue": "#64b5f6", "gray": "#9aa0a6",
+    "red": "#ff6b6b", "green": "#66bb6a", "orange": "#ffa726", "blue": "#64b5f6", "gray": "#9aa0a6",
+    "weekend": "#ff8a80",
     "delivered_bg": "#1f3a24", "delivered_fg": "#e8f5e9",
-    "pending_day": "#5d4022", "done_day": "#24452b", "shift_name": "#b0bec5",
+    "pending_day": "#4a3218", "done_day": "#1e3a24", "shift_name": "#b0bec5",
     "note_bg": "#3a3320", "note_border": "#6d5a1e", "info_bg": "#1c2b3a", "info_border": "#2f5d8a",
     "note_fg": "#f1f1f1",
 }

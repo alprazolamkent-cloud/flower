@@ -8,7 +8,7 @@ from datetime import date, datetime, time
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
-    QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QGridLayout, QGroupBox,
+    QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QGridLayout, QGroupBox,
     QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMessageBox, QPlainTextEdit, QPushButton,
     QSpinBox, QTableWidget, QTableWidgetItem, QVBoxLayout,
 )
@@ -16,7 +16,7 @@ from PySide6.QtWidgets import (
 from .db import Database, User, UserError
 from .delivery_dialog import MAX_MONEY, money, money_box
 from .salary import (
-    KIND_TITLES, PenaltyKind, SalaryRules, calculate, forecast, monthly_ranking, shifts_word, shop_writeoff,
+    KIND_TITLES, PenaltyKind, SalaryRules, calculate, forecast, monthly_ranking, pct, shifts_word, shop_writeoff,
 )
 from .shifts import (
     KIND_TEXT, PROBLEM_STATUSES, STATUS_TEXT, WRITEOFF_REASONS, ChecklistItem, Penalty, Shift, WaterSchedule,
@@ -188,10 +188,8 @@ class CloseShiftDialog(QDialog):
         self.sales_box = count_box("— введите —")
         self.sales_box.setToolTip("Продажи наличными за смену из отчёта Hoog")
         sales_form.addRow("Продажи наличными:", self.sales_box)
-        self.check_label = QLabel()
-        self.check_label.setWordWrap(True)
-        # место под две строки сразу: иначе форма не успевает вырасти и вторая строка обрезается
-        self.check_label.setMinimumHeight(self.check_label.fontMetrics().lineSpacing() * 2 + 10)
+        self.check_label = QLabel()  # две строки разбиты сами; запас по высоте — значок ⚠ выше обычных букв
+        self.check_label.setMinimumHeight(self.check_label.fontMetrics().lineSpacing() * 2 + 8)
         sales_form.addRow(self.check_label)
         self.delivery_box = money_box()
         self.delivery_box.setValue(delivery_sum)
@@ -463,6 +461,10 @@ class CabinetDialog(QDialog):
         self.shifts: list[Shift] = []
         self.setWindowTitle("Личный кабинет")
         self.resize(1500, 660)
+        screen = self.screen() or QApplication.primaryScreen()
+        if screen is not None:  # на ноутбуке 1366×768 — не шире экрана
+            area = screen.availableGeometry()
+            self.resize(min(1500, area.width() - 20), min(660, area.height() - 60))
         layout = QVBoxLayout(self)
 
         top = QHBoxLayout()
@@ -473,9 +475,9 @@ class CabinetDialog(QDialog):
                 self.person_box.addItem(u.name or u.login, u.id)
         else:
             self.person_box.addItem(user.name or user.login, user.id)
-            self.person_box.setEnabled(False)
+            self.person_box.setVisible(False)  # свой кабинет: имя надписью, а не серым выключенным списком
         self.person_box.currentIndexChanged.connect(self.refresh)
-        top.addWidget(QLabel("Сотрудник:"))
+        top.addWidget(QLabel("Сотрудник:" if user.is_admin else f"Сотрудник: <b>{_html(user.name or user.login)}</b>"))
         top.addWidget(self.person_box)
         top.addStretch(1)
         prev_btn, next_btn = QPushButton("◀"), QPushButton("▶")
@@ -739,7 +741,7 @@ class CabinetDialog(QDialog):
             plan = forecast(sal, rules, today)
             if plan is not None:
                 lines.append(f"🎯 Прогноз: до конца месяца примерно {shifts_word(plan.remaining_shifts)}. Чтобы выйти на ступень "
-                             f"«от {money(plan.target.per_shift)}» ({plan.target.percent:g}%), нужно в среднем "
+                             f"«от {money(plan.target.per_shift)}» ({pct(plan.target.percent, None)}), нужно в среднем "
                              f"<b>{money(plan.needed_average)}</b> за смену")
         rank = monthly_ranking(self.month_shifts, rules)
         if rank.best_shift is not None and rank.best_shift.revenue:
@@ -787,7 +789,7 @@ class CabinetDialog(QDialog):
             ok = sal.writeoff_percent < rules.max_writeoff_percent
             base = "от всех цветов" if rules.writeoff_base == "total" else "от проданных"
             lines.append(f"<span style='color:{C.green if ok else C.red}'>Списания по магазину: "
-                         f"{sal.writeoff_percent:.1f}% {base} (для премии меньше {rules.max_writeoff_percent:g}%)</span>")
+                         f"{pct(sal.writeoff_percent)} {base} (для премии меньше {pct(rules.max_writeoff_percent, None)})</span>")
         if sal.blocked:
             lines.append(f"<b style='color:{C.red}'>Премия не начислена: " + "; ".join(sal.blocked)
                          + f". Без этого было бы {money(sal.bonus_earned)}.</b>")
@@ -807,11 +809,11 @@ class CabinetDialog(QDialog):
             source = "со сверх плана " if rules.above_plan_only else ""
             paid = "" if not sal.blocked else f" <span style='color:{C.red}'>(не выплачивается)</span>"
             text += (f" → ступень «от {money(sal.tier.per_shift)}»: <b style='color:{C.green}'>"
-                     f"{sal.tier.percent:g}% {source}с {money(sal.bonus_base)} = {money(sal.bonus_earned)}</b>{paid}")
+                     f"{pct(sal.tier.percent, None)} {source}с {money(sal.bonus_base)} = {money(sal.bonus_earned)}</b>{paid}")
         if sal.next_tier is not None and sal.shifts:
             short = money(round(sal.next_tier.per_shift - sal.average))
             text += (f"<br><span style='color:{C.gray}'>До ступени «от {money(sal.next_tier.per_shift)}» "
-                     f"({sal.next_tier.percent:g}%) не хватает {short} в среднем за смену</span>")
+                     f"({pct(sal.next_tier.percent, None)}) не хватает {short} в среднем за смену</span>")
         return text
 
     def _adjust(self):
@@ -949,6 +951,7 @@ class PenaltyDialog(QDialog):
         header.setSectionResizeMode(QHeaderView.ResizeToContents)
         header.setSectionResizeMode(0, QHeaderView.Stretch)
         header.setSectionResizeMode(4, QHeaderView.Stretch)
+        self.table.setWordWrap(True)  # объяснение сотрудника — целиком, а не «…»
         layout.addWidget(self.table, 1)
         row_buttons = QHBoxLayout()
         remove = QPushButton("🗑 Убрать выбранную")
@@ -991,6 +994,7 @@ class PenaltyDialog(QDialog):
                     item.setForeground(QColor(C.orange))
                     item.setToolTip(p.dispute_text)
                 self.table.setItem(row, col, item)
+        self.table.resizeRowsToContents()
 
     def _add(self):
         kind = self.kind_box.currentData()

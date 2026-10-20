@@ -38,7 +38,7 @@ from .templates_dialog import load_templates
 from .theme import C
 from .update_ui import UpdateController
 from .reminders import due_reminders, overdue_deliveries, reminder_key
-from .salary import shop_writeoff
+from .salary import pct, shop_writeoff
 from .users_dialog import LoginDialog, PasswordDialog, UserFormDialog, UsersDialog
 
 MONTHS_GENITIVE = [
@@ -51,11 +51,12 @@ MONTHS = [
 ]
 WEEKDAYS = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
 
-HEADERS = ["✓", "Время", "Что доставить", "Кому", "Телефон", "Адрес",
-           "Взяли", "Курьеру", "Осталось", "Заказчик", "Писали", "Добавил", "Отметил"]
-COL_DONE, COL_TIME, COL_ITEMS, COL_RECIPIENT, COL_PHONE, COL_ADDRESS, \
-    COL_PRICE, COL_COURIER, COL_REST, COL_CUSTOMER, COL_MESSAGES, \
-    COL_CREATED_BY, COL_DELIVERED_BY = range(len(HEADERS))
+HEADERS = ["✓", "Время", "Что доставить", "Кому", "Адрес",
+           "Взяли", "Курьеру", "Осталось", "Заказчик", "Писали", "Кто"]
+COL_DONE, COL_TIME, COL_ITEMS, COL_RECIPIENT, COL_ADDRESS, \
+    COL_PRICE, COL_COURIER, COL_REST, COL_CUSTOMER, COL_MESSAGES, COL_WHO = range(len(HEADERS))
+WRAP_UP_TO = {COL_RECIPIENT: 170, COL_CUSTOMER: 160}  # длинное — переносится, а не растягивает столбец
+MIN_WIDTH = {COL_ITEMS: 220, COL_ADDRESS: 160}  # главные столбцы: всё свободное место, но не уже этого
 
 REMINDER_CHECK_MS = 30_000
 
@@ -190,6 +191,10 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("AloFlorist")
         self.setWindowIcon(flower_icon())
         self.resize(1440, 720)
+        screen = QApplication.primaryScreen()
+        if screen is not None:  # на ноутбуке 1366×768 окно не должно вылезать за экран
+            area = screen.availableGeometry()
+            self.resize(min(1440, area.width()), min(720, area.height() - 40))
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -265,11 +270,17 @@ class MainWindow(QMainWindow):
         title_font.setPointSize(15)
         title_font.setBold(True)
         self.day_title.setFont(title_font)
+        self.day_title.setWordWrap(True)  # на узком экране — в две строки, а не шире экрана
 
         top = QHBoxLayout()
         top.addWidget(self.day_title, 1)
-        self.user_label = QLabel()
-        top.addWidget(self.user_label)
+        self.user_btn = QPushButton()
+        self.user_btn.setToolTip("Кто сейчас вошёл. Здесь же — смена пароля")
+        user_menu = QMenu(self.user_btn)
+        password_action = user_menu.addAction("🔑 Сменить пароль")
+        password_action.triggered.connect(self.change_password)
+        self.user_btn.setMenu(user_menu)
+        top.addWidget(self.user_btn)
         self.ann_btn = QPushButton("📢 Объявления")
         self.ann_btn.clicked.connect(self.open_announcements)
         top.addWidget(self.ann_btn)
@@ -279,12 +290,10 @@ class MainWindow(QMainWindow):
         top.addWidget(self.notif_btn)
         self.settings_btn = QPushButton("⚙ Настройки")
         self.settings_btn.clicked.connect(self.open_settings)
-        password_btn = QPushButton("🔑 Сменить пароль")
-        password_btn.clicked.connect(self.change_password)
         logout_btn = QPushButton("🚪 Выйти")
         logout_btn.setToolTip("Выйти из профиля, чтобы вошёл другой сотрудник. Смена при этом не закрывается.")
         logout_btn.clicked.connect(self.logout)
-        for b in (self.settings_btn, password_btn, logout_btn):
+        for b in (self.settings_btn, logout_btn):
             top.addWidget(b)
         right.addLayout(top)
 
@@ -320,10 +329,10 @@ class MainWindow(QMainWindow):
         self.table.verticalHeader().setVisible(False)
         header = self.table.horizontalHeader()
         for col in range(len(HEADERS)):
-            header.setSectionResizeMode(col, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(COL_ITEMS, QHeaderView.Stretch)
-        header.setSectionResizeMode(COL_ADDRESS, QHeaderView.Stretch)
+            header.setSectionResizeMode(col, QHeaderView.Interactive if col in (*WRAP_UP_TO, *MIN_WIDTH)
+                                        else QHeaderView.ResizeToContents)
         self.table.horizontalHeaderItem(COL_DONE).setToolTip("Доставлено")
+        self.table.horizontalHeaderItem(COL_WHO).setToolTip("Кто добавил доставку и кто отметил «Доставлено» (✓)")
         self.table.itemChanged.connect(self._on_item_changed)
         self.table.itemDoubleClicked.connect(self._on_double_click)
         self.table.itemSelectionChanged.connect(self._update_buttons)
@@ -332,9 +341,9 @@ class MainWindow(QMainWindow):
         self.day_totals = QLabel()
         right.addWidget(self.day_totals)
 
-        hint = QLabel("Галочка в первом столбце — «Доставлено». Двойной щелчок — изменить.")
-        hint.setStyleSheet("color: gray")
-        right.addWidget(hint)
+        self.hint = QLabel("Галочка в первом столбце — «Доставлено». Двойной щелчок — изменить.")
+        self.hint.setStyleSheet(f"color: {C.gray}")
+        right.addWidget(self.hint)
 
         QShortcut(QKeySequence.New, self, activated=self.add_delivery)
         QShortcut(QKeySequence.Delete, self.table, activated=self.delete_delivery)
@@ -634,11 +643,11 @@ class MainWindow(QMainWindow):
         self.user = user
         if user is None:
             self.shift = None
-            self.user_label.setText("")
+            self.user_btn.setText("")
             self.update_shift_box()
             return
         role = "админ" if user.is_admin else "сотрудник"
-        self.user_label.setText(f"Вы вошли: <b>{user.name or user.login}</b> ({role})")
+        self.user_btn.setText(f"👤 {user.name or user.login} ({role})")
         self.settings_btn.setVisible(user.is_admin)
         self.update_shift_box()
         self._update_ann_button()
@@ -822,6 +831,7 @@ class MainWindow(QMainWindow):
     def apply_theme(self):
         """Переключить тему сразу, без перезапуска: палитра + перерисовать свои подсветки."""
         theme.apply(QApplication.instance(), theme_mode())
+        self.hint.setStyleSheet(f"color: {C.gray}")
         self.refresh_all()
         self.update_shift_box()
         self._update_ann_button()
@@ -887,6 +897,10 @@ class MainWindow(QMainWindow):
             f"<span style='color:{C.blue}'>●</span> воду поменяли &nbsp; "
             f"<span style='color:{C.red}'>●</span> не поменяли")
 
+        weekend = QTextCharFormat()  # свой красный: стандартный не читается на тёмной теме
+        weekend.setForeground(QColor(C.weekend))
+        for weekday in (Qt.Saturday, Qt.Sunday):
+            self.calendar.setWeekdayTextFormat(weekday, weekend)
         for qd in self._marked_days:
             self.calendar.setDateTextFormat(qd, QTextCharFormat())
         self._marked_days = []
@@ -951,8 +965,7 @@ class MainWindow(QMainWindow):
                 COL_DONE: done,
                 COL_TIME: QTableWidgetItem(d.time),
                 COL_ITEMS: QTableWidgetItem(("🗑 ждёт удаления · " if d.delete_requested_at else "") + d.items),
-                COL_RECIPIENT: QTableWidgetItem(d.recipient),
-                COL_PHONE: QTableWidgetItem(d.phone),
+                COL_RECIPIENT: QTableWidgetItem("\n".join(x for x in (d.recipient, d.phone) if x)),
                 COL_ADDRESS: QTableWidgetItem(d.address),
                 COL_PRICE: QTableWidgetItem(money(d.price)),
                 COL_COURIER: QTableWidgetItem(money(d.courier_pay)),
@@ -962,8 +975,9 @@ class MainWindow(QMainWindow):
                     else (d.customer_contact or d.source)),
                 COL_MESSAGES: QTableWidgetItem(
                     " · ".join(SHORT[k] for k in KINDS if d.sent(k))),
-                COL_CREATED_BY: QTableWidgetItem(d.created_by_name),
-                COL_DELIVERED_BY: QTableWidgetItem(d.delivered_by_name if d.delivered else ""),
+                COL_WHO: QTableWidgetItem("\n".join(
+                    x for x in (d.created_by_name, f"✓ {d.delivered_by_name}" if d.delivered and d.delivered_by_name
+                                else "") if x)),
             }
             for col in (COL_PRICE, COL_COURIER, COL_REST):
                 cells[col].setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
@@ -979,11 +993,30 @@ class MainWindow(QMainWindow):
                 cells[COL_ITEMS].setToolTip(
                     f"{d.delete_requested_by_name or 'Сотрудник'} попросил(а) удалить эту доставку "
                     f"({d.delete_requested_at:%d.%m %H:%M}). Ждёт решения администратора.")
-        self.table.resizeRowsToContents()
+        self._fit_columns()
         self._loading = False
 
         self.day_totals.setText(totals_text(self.db.totals_for_day(day)))
         self._update_buttons()
+
+    def _fit_columns(self):
+        """«Что доставить» и «Адрес» делят свободное место; на узком экране — не уже минимума (тогда прокрутка вбок)."""
+        header = self.table.horizontalHeader()
+        for col, limit in WRAP_UP_TO.items():
+            wanted = max(self.table.sizeHintForColumn(col), header.sectionSizeHint(col))
+            header.resizeSection(col, max(80, min(wanted, limit)))
+        others = sum(header.sectionSize(c) for c in range(len(HEADERS)) if c not in MIN_WIDTH)
+        free = self.table.viewport().width() - others
+        items = max(MIN_WIDTH[COL_ITEMS], free * 3 // 5)
+        header.resizeSection(COL_ITEMS, items)
+        header.resizeSection(COL_ADDRESS, max(MIN_WIDTH[COL_ADDRESS], free - items))
+        self.table.resizeRowsToContents()
+        for row in range(self.table.rowCount()):  # немного воздуха: двухстрочные ячейки не слипаются
+            self.table.setRowHeight(row, self.table.rowHeight(row) + 10)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        QTimer.singleShot(0, self._fit_columns)  # после того как таблица получит новый размер
 
     def refresh_all(self):
         self.refresh_month()
@@ -1199,9 +1232,9 @@ class MainWindow(QMainWindow):
         last = shift.day.replace(day=calendar.monthrange(shift.day.year, shift.day.month)[1])
         rules = salary_rules()
         percent = shop_writeoff(self.db.shifts_between(first, last)).percent(rules.writeoff_base)
-        note = f"за месяц по магазину {percent:.1f}%"
+        note = f"за месяц по магазину {pct(percent)}"
         if rules.max_writeoff_percent > 0 and percent >= rules.max_writeoff_percent:
-            note += f" ❗ для премии нужно меньше {rules.max_writeoff_percent:g}%"
+            note += f" ❗ для премии нужно меньше {pct(rules.max_writeoff_percent, None)}"
         return note
 
     def _delete_decided(self, d: Delivery, approved: bool, who: str):

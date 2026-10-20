@@ -9,6 +9,7 @@ from PySide6.QtWidgets import (
 )
 
 from .db import Database
+from .theme import C
 
 WINDOW = timedelta(hours=24)
 
@@ -20,7 +21,7 @@ class NotificationsDialog(QDialog):
         self.resize(760, 420)
         layout = QVBoxLayout(self)
         hint = QLabel("Всё, что программа показывала в углу экрана за последние 24 часа. Только просмотр.")
-        hint.setStyleSheet("color: gray")
+        hint.setStyleSheet(f"color: {C.gray}")
         layout.addWidget(hint)
 
         items = db.notifications_since(datetime.now() - WINDOW)

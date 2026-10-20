@@ -41,6 +41,12 @@ DEFAULT_PENALTY_KINDS = [
 ]
 
 
+def pct(value: float, digits: int | None = 1) -> str:
+    """Процент по-русски: 2,9% (digits=None — без лишних нулей: 15%, 12,5%)."""
+    text = f"{value:g}" if digits is None else f"{value:.{digits}f}"
+    return text.replace(".", ",") + "%"
+
+
 def writeoff_percent(writeoff: int, flowers: int, base: str = "total") -> float:
     """Доля списаний, %. total — от всех цветов (проданные + списанные), sales — от проданных."""
     denominator = flowers + writeoff if base == "total" else flowers
@@ -169,7 +175,7 @@ def calculate(shifts: list[Shift], adjustments: list[Adjustment], rules: SalaryR
     if rules.max_writeoff_percent > 0 and shop is not None:
         percent = shop.percent(rules.writeoff_base)
         if percent >= rules.max_writeoff_percent:
-            blocked.append(f"списания по магазину {percent:.1f}% (для премии нужно меньше {rules.max_writeoff_percent:g}%)")
+            blocked.append(f"списания по магазину {pct(percent)} (для премии нужно меньше {pct(rules.max_writeoff_percent, None)})")
 
     return Salary(
         shifts=len(closed),

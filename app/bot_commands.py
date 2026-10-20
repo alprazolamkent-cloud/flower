@@ -13,7 +13,7 @@ from datetime import date, datetime, time, timedelta
 from .db import Database, Delivery, User, UserError
 from .delivery_dialog import money
 from .salary import (
-    KIND_TITLES, PenaltyKind, SalaryRules, calculate, forecast, monthly_ranking, shifts_word, shop_writeoff,
+    KIND_TITLES, PenaltyKind, SalaryRules, calculate, forecast, monthly_ranking, pct, shifts_word, shop_writeoff,
 )
 from .shifts import STATUS_TEXT, Penalty, Shift, WaterSchedule, business_day, window
 
@@ -335,8 +335,8 @@ def _conditions_lines(sal, rules: SalaryRules) -> list[str]:
         lines.append(f"Санкций за месяц: {len(sal.penalties)} (для премии меньше {rules.max_penalties})")
     if sal.writeoff_percent is not None:
         base = "от всех цветов" if rules.writeoff_base == "total" else "от проданных"
-        lines.append(f"Списания по магазину: {sal.writeoff_percent:.1f}% {base} "
-                     f"(для премии меньше {rules.max_writeoff_percent:g}%)")
+        lines.append(f"Списания по магазину: {pct(sal.writeoff_percent)} {base} "
+                     f"(для премии меньше {pct(rules.max_writeoff_percent, None)})")
     if sal.blocked:
         lines.append("❗ Премия не начислена: " + "; ".join(sal.blocked) + f". Без этого было бы {money(sal.bonus_earned)}.")
     return lines
@@ -356,10 +356,10 @@ def _salary_detail(ctx: BotContext, user: User, first: date, last: date, month: 
         if sal.tier is None:
             lines.append(f"План не выполнен (нужно от {money(sal.plan)} за смену) — премии нет")
         else:
-            lines.append(f"Ступень «от {money(sal.tier.per_shift)}»: {sal.tier.percent:g}% с "
+            lines.append(f"Ступень «от {money(sal.tier.per_shift)}»: {pct(sal.tier.percent, None)} с "
                          f"{money(sal.bonus_base)} = {money(sal.bonus_earned)}" + (" (не выплачивается)" if sal.blocked else ""))
         if sal.next_tier is not None and sal.shifts:
-            lines.append(f"До «от {money(sal.next_tier.per_shift)}» ({sal.next_tier.percent:g}%) не хватает "
+            lines.append(f"До «от {money(sal.next_tier.per_shift)}» ({pct(sal.next_tier.percent, None)}) не хватает "
                          f"{money(round(sal.next_tier.per_shift - sal.average))} в среднем за смену")
     today = ctx.now.date()
     plan = forecast(sal, rules, today) if first <= today <= last else None
@@ -414,7 +414,7 @@ def writeoff_text(ctx: BotContext, first: date, last: date, title: str) -> str:
     lines = [f"🥀 Списания {title}"]
     if not shop.writeoff:
         return lines[0] + "\nСписаний не было."
-    lines.append(f"Всего: {money(shop.writeoff)} = {shop.percent(rules.writeoff_base):.1f}% "
+    lines.append(f"Всего: {money(shop.writeoff)} = {pct(shop.percent(rules.writeoff_base))} "
                  f"{'от всех цветов' if rules.writeoff_base == 'total' else 'от проданных'}")
     reasons = ctx.db.writeoff_by_reason(first, last)
     lines += [f"• {r}: {money(a)}" for r, a in sorted(reasons.items(), key=lambda x: -x[1])]
@@ -422,7 +422,7 @@ def writeoff_text(ctx: BotContext, first: date, last: date, title: str) -> str:
     if known < shop.writeoff:
         lines.append(f"• без причины (старые смены): {money(shop.writeoff - known)}")
     if rules.max_writeoff_percent > 0:
-        lines.append(f"Для премий нужно меньше {rules.max_writeoff_percent:g}%")
+        lines.append(f"Для премий нужно меньше {pct(rules.max_writeoff_percent, None)}")
     return "\n".join(lines)
 
 
@@ -743,8 +743,8 @@ def penalties_text(ctx: BotContext, first: date, last: date, user: User | None =
         shop = shop_writeoff(ctx.db.shifts_between(first, last))
         percent = shop.percent(rules.writeoff_base)
         mark = "✅" if percent < rules.max_writeoff_percent else "❌ премий не будет"
-        lines.append(f"\nСписания по магазину: {money(shop.writeoff)} = {percent:.1f}% "
-                     f"(для премий меньше {rules.max_writeoff_percent:g}%) {mark}")
+        lines.append(f"\nСписания по магазину: {money(shop.writeoff)} = {pct(percent)} "
+                     f"(для премий меньше {pct(rules.max_writeoff_percent, None)}) {mark}")
     return "\n".join(lines)
 
 

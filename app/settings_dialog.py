@@ -176,7 +176,7 @@ def set_last_backup(moment: datetime):
 def _gray_label(text: str) -> QLabel:
     """Подсказка с переносами строк, расставленными вручную (автоперенос в форме обрезается)."""
     label = QLabel(text)
-    label.setStyleSheet("color: gray")
+    label.setStyleSheet(f"color: {C.gray}")
     return label
 
 
@@ -373,7 +373,8 @@ class SettingsDialog(QDialog):
         bonus = QGroupBox("Премия от прихода — только при выполнении плана")
         bonus_layout = QVBoxLayout(bonus)
         bonus_layout.addWidget(_gray_label(
-            "Берётся средний приход сотрудника за смену за месяц (приход ÷ сданные смены).\n"
+            "Берётся средний приход сотрудника за смену за месяц (приход ÷ сданные смены),\n"
+            "праздничные смены не считаются.\n"
             "Срабатывает самая высокая ступень, до которой он дотянул.\n"
             "Первая ступень — это план: не дотянул до неё — премии нет. Пустые (—) не считаются."))
         self.tiers_editor = TiersEditor(bonus_tiers())
@@ -421,7 +422,8 @@ class SettingsDialog(QDialog):
         self.rep_monthly.setChecked(reports["monthly"])
         form.addRow(self.rep_monthly)
         form.addRow(_gray_label("Приходят всем подключённым чатам. Программа должна быть запущена: если компьютер\n"
-                                "включили позже, отчёт придёт при запуске (утренний — в течение 4 часов после времени)."))
+                                "включили позже, отчёт придёт при запуске. Утренний ждёт, пока сдадут ночную смену,\n"
+                                "и не приходит, если программу включили больше чем через 6 часов."))
         layout.addWidget(box)
 
         alerts = QGroupBox("Тревога о большом списании")
@@ -442,7 +444,8 @@ class SettingsDialog(QDialog):
         self.alert_min.setSuffix(" ₽")
         self.alert_min.setValue(minimum)
         alert_form.addRow("и не меньше, чем:", self.alert_min)
-        alert_form.addRow(_gray_label("«Обычное» — среднее списание за смену по последним 14 сданным сменам магазина.\n"
+        alert_form.addRow(_gray_label("«Обычное» — среднее списание за смену по последним 14 сданным сменам магазина\n"
+                                      "(сравнивается, когда сданных смен уже хотя бы три).\n"
                                       "Списания вводит сам сотрудник, так что это единственная цифра, которую\n"
                                       "программа не может проверить, — поэтому о скачках она сообщает вам."))
         layout.addWidget(alerts)
