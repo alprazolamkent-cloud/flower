@@ -86,7 +86,14 @@ def main():
 
     def on_connection():
         sock = server.nextPendingConnection()
-        sock.readyRead.connect(lambda: window.show_window() if bytes(sock.readAll()) == b"show" else None)
+
+        def read():
+            if bytes(sock.readAll()) == b"show":
+                window.show_window()
+
+        sock.readyRead.connect(read)
+        if sock.bytesAvailable():  # «show» мог прийти раньше, чем подключили сигнал
+            read()
 
     server.newConnection.connect(on_connection)
     server.listen(INSTANCE_NAME)

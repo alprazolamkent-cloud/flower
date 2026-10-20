@@ -153,3 +153,44 @@ def test_duties_checklist_lifecycle(db):
     db.save_duties([(duties[1].id, "Полить все растения"), (None, "Вынести мусор")])
     assert [i.text for i in db.checklist(closed)] == ["Протереть витрину", "Полить растения"]
     assert [d.text for d in db.duties()] == ["Полить все растения", "Вынести мусор"]
+
+
+# ----- найденные при проверке ошибки -----
+
+def test_clearing_duty_text_removes_it(db):
+    db.save_duties([(None, "Протереть витрину"), (None, "Вынести мусор")])
+    first, second = db.duties()
+    db.save_duties([(first.id, "Протереть витрину"), (second.id, "   ")])
+    assert [d.text for d in db.duties()] == ["Протереть витрину"]
+
+
+def test_done_never_exceeds_total_after_duty_removed(db):
+    anna = db.add_user("anna", "", "1")
+    db.save_duties([(None, "А"), (None, "Б")])
+    a, b = db.duties()
+    s = db.open_shift(anna.id, 0, datetime.now(), CH)
+    for duty in (a, b):
+        db.set_duty_done(s.id, duty.id, duty.text, True, datetime.now())
+    db.save_duties([(a.id, "А")])
+    s = db.get_shift(s.id)
+    assert (s.duties_done, s.duties_total) == (1, 1)
+
+
+def test_cannot_delete_user_during_shift(db):
+    anna = db.add_user("anna", "", "1")
+    s = db.open_shift(anna.id, 0, datetime.now(), CH)
+    with pytest.raises(UserError):
+        db.delete_user(anna.id)
+    db.close_shift(s.id, datetime.now(), 0, 0, 0)
+    db.delete_user(anna.id)  # после сдачи — можно
+    assert [u.login for u in db.users()] == []
+
+
+def test_long_telegram_text_is_shortened(db, monkeypatch):
+    monkeypatch.setattr(telegram, "configured", lambda: True)
+    sender = telegram.TelegramSender.__new__(telegram.TelegramSender)  # без таймера Qt
+    sender.db = db
+    monkeypatch.setattr(telegram.QTimer, "singleShot", lambda *a: None)
+    sender.queue("x" * 10_000)
+    [(_, text)] = db.unsent_messages()
+    assert len(text) <= telegram.MAX_TEXT

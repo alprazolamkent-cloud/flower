@@ -156,7 +156,10 @@ SELECT s.id, s.user_id, COALESCE(NULLIF(u.name, ''), u.login, ''), s.day, s.open
        COALESCE((SELECT SUM(amount) FROM cash_ops c WHERE c.shift_id = s.id AND c.kind = 'expense'), 0),
        COALESCE((SELECT SUM(amount) FROM cash_ops c WHERE c.shift_id = s.id AND c.kind = 'withdrawal'), 0),
        s.revenue, s.flowers, s.terminal, s.qr, s.deliveries,
-       (SELECT COUNT(*) FROM shift_duties sd WHERE sd.shift_id = s.id AND sd.done_at IS NOT NULL),
+       CASE WHEN s.closed_at IS NULL THEN
+                (SELECT COUNT(*) FROM shift_duties sd JOIN duties d ON d.id = sd.duty_id
+                 WHERE sd.shift_id = s.id AND sd.done_at IS NOT NULL AND d.active = 1)
+            ELSE (SELECT COUNT(*) FROM shift_duties sd WHERE sd.shift_id = s.id AND sd.done_at IS NOT NULL) END,
        CASE WHEN s.closed_at IS NULL THEN (SELECT COUNT(*) FROM duties WHERE active = 1)
             ELSE (SELECT COUNT(*) FROM shift_duties sd WHERE sd.shift_id = s.id) END
 FROM shifts s LEFT JOIN users u ON u.id = s.user_id
@@ -259,6 +262,7 @@ class Database:
             src.backup(self.conn)
         finally:
             src.close()
+        self.conn.close()
         Database.__init__(self, self.path)  # копия могла быть от старой версии — дополнить таблицы
 
     def add(self, d: Delivery) -> int:
@@ -395,6 +399,10 @@ class Database:
 
     def delete_user(self, user_id: int):
         self._ensure_other_admin(user_id)
+        recent = _ts(datetime.now() - timedelta(days=2))
+        if self.conn.execute("SELECT 1 FROM shifts WHERE user_id = ? AND closed_at IS NULL AND opened_at >= ?",
+                             (user_id, recent)).fetchone():
+            raise UserError("У сотрудника идёт или не сдана смена. Пусть сначала сдаст её, потом удалите.")
         # Доставки остаются, просто без автора.
         self.conn.execute("UPDATE deliveries SET created_by=NULL WHERE created_by=?", (user_id,))
         self.conn.execute("UPDATE deliveries SET delivered_by=NULL WHERE delivered_by=?", (user_id,))
@@ -601,7 +609,7 @@ class Database:
 
     def save_duties(self, items: list[tuple[int | None, str]]):
         """Новый список обязанностей: (id существующей или None для новой, текст). Убранные — в архив."""
-        keep = {duty_id for duty_id, _ in items if duty_id is not None}
+        keep = {duty_id for duty_id, text in items if duty_id is not None and text.strip()}
         for duty in self.duties():
             if duty.id not in keep:
                 self.conn.execute("UPDATE duties SET active = 0 WHERE id = ?", (duty.id,))

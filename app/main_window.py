@@ -317,19 +317,20 @@ class MainWindow(QMainWindow):
     # ----- вход и сотрудники -----
 
     def login(self) -> bool:
-        """Спросить логин и пароль (или создать первого админа). True — вошли."""
-        if not self.db.has_users():
-            dlg = UserFormDialog(self, self.db, first_admin=True)
-        else:
-            dlg = LoginDialog(self, self.db, self._on_shift_note())
-        if dlg.exec() != QDialog.Accepted:
-            return False
-        self.set_user(dlg.user)
-        if not self._shift_flow():
+        """Спросить логин и пароль (или создать первого админа). True — вошли, False — нажали «Отмена»."""
+        while True:
+            if not self.db.has_users():
+                dlg = UserFormDialog(self, self.db, first_admin=True)
+            else:
+                dlg = LoginDialog(self, self.db, self._on_shift_note())
+            if dlg.exec() != QDialog.Accepted:
+                return False
+            self.set_user(dlg.user)
+            if self._shift_flow():
+                self.update_shift_box()
+                return True
+            # Сдал смену и не начал новую (или передумал) — окно входа для следующего сотрудника.
             self.set_user(None)
-            return False
-        self.update_shift_box()
-        return True
 
     # ----- смены -----
 
@@ -353,6 +354,7 @@ class MainWindow(QMainWindow):
                 if closing.exec() != QDialog.Accepted:
                     if self.user.is_admin:
                         self.shift = pending
+                        self._shift_ended.add(pending.id)  # уже знает, что смена кончилась
                         return True
                     return False
                 self._after_shift_closed(closing.shift)

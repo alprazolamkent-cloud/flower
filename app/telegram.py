@@ -15,6 +15,7 @@ from .shifts import Shift
 API = "https://api.telegram.org/bot{token}/{method}"
 TIMEOUT = 15
 FLUSH_EVERY_MS = 60_000
+MAX_TEXT = 4000  # предел Telegram — 4096 знаков
 
 
 class TelegramError(Exception):
@@ -140,6 +141,8 @@ class TelegramSender(QObject):
         self.timer.start(FLUSH_EVERY_MS)
 
     def queue(self, text: str, key: str | None = None):
+        if len(text) > MAX_TEXT:  # иначе Telegram откажет и сообщение застопорит очередь
+            text = text[:MAX_TEXT - 1] + "…"
         if configured() and self.db.queue_message(text, datetime.now(), key):
             QTimer.singleShot(0, self.flush)
 
