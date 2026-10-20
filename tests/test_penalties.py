@@ -142,7 +142,7 @@ def test_three_penalties_cancel_bonus(db):
 def test_writeoff_over_limit_cancels_bonus_for_everyone():
     anna_shifts = []  # смены не нужны для проверки правила
     from types import SimpleNamespace
-    shift = SimpleNamespace(closed_at=NOW, revenue=40000, flowers=36000, writeoff=0,
+    shift = SimpleNamespace(closed_at=NOW, revenue=40000, flowers=36000, writeoff=0, day=NOW.date(),
                             difference=lambda: 0, user_id=1)
     rules = SalaryRules(shift_rate=0, tiers=[Tier(30000, 5)])
     for amount, expected_bonus in ((14999, 2000), (15000, 0), (30000, 0)):  # 15% — граница: «меньше» строго
@@ -153,7 +153,8 @@ def test_writeoff_over_limit_cancels_bonus_for_everyone():
 
 def test_both_writeoff_bases_decide_differently():
     from types import SimpleNamespace
-    shift = SimpleNamespace(closed_at=NOW, revenue=40000, flowers=36000, writeoff=0, difference=lambda: 0, user_id=1)
+    shift = SimpleNamespace(closed_at=NOW, revenue=40000, flowers=36000, writeoff=0, day=NOW.date(),
+                            difference=lambda: 0, user_id=1)
     shop = ShopWriteoff(writeoff=15000, flowers=85000)  # 15,0% от всех цветов, но 17,6% от проданных
     total = calculate([shift], [], SalaryRules(tiers=[Tier(30000, 5)], writeoff_base="total", max_writeoff_percent=15.5), [], shop)
     sales = calculate([shift], [], SalaryRules(tiers=[Tier(30000, 5)], writeoff_base="sales", max_writeoff_percent=15.5), [], shop)

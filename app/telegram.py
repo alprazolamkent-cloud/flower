@@ -147,7 +147,8 @@ def shift_started_text(shift: Shift, handover: int | None, prev_name: str) -> st
 
 
 def shift_closed_text(shift: Shift, change: time, late: bool, water: str | None,
-                      missed_duties: list[str], kinds=(), writeoff_note: str = "") -> str:
+                      missed_duties: list[str], kinds=(), writeoff_note: str = "",
+                      reasons: dict[str, int] | None = None, alert: str = "") -> str:
     lines = [f"🌸 Смена сдана — {shift.user_name or 'сотрудник'}",
              f"{shift.opened_at:%d.%m %H:%M} → {shift.closed_at:%d.%m %H:%M}"]
     if late:
@@ -155,6 +156,12 @@ def shift_closed_text(shift: Shift, change: time, late: bool, water: str | None,
     lines += [
         f"Приход: {money(shift.revenue)} · Цветы: {money(shift.flowers)} · "
         f"Списано: {money(shift.writeoff)}" + (f" ({writeoff_note})" if writeoff_note else ""),
+    ]
+    if reasons:
+        lines.append("   " + ", ".join(f"{r} {money(a)}" for r, a in reasons.items()))
+    if alert:
+        lines.append(alert)
+    lines += [
         f"Терминал: {money(shift.terminal)} · QR: {money(shift.qr)} · Наличные: {money(shift.cash_sales)}",
         f"Касса: должно {money(shift.expected_cash())}, сдали {money(shift.closing_cash or 0)} — "
         f"{diff_words(shift.difference())}",
@@ -176,6 +183,14 @@ def shift_closed_text(shift: Shift, change: time, late: bool, water: str | None,
         lines += ["", "⚠ Штрафные санкции (нажмите, если нужно):"]
         lines += [f"/pen_{shift.id}_{k.id} {k.title} — {money(k.amount)}" for k in kinds]
     return "\n".join(lines)
+
+
+def dispute_text(p) -> str:
+    """Сотрудник оспорил санкцию: админу — текст и две ссылки (оставить / снять)."""
+    return (f"✋ {p.user_name or 'Сотрудник'} не согласен(на) с санкцией\n"
+            f"{p.title} −{money(p.amount)}, смена {p.shift_day:%d.%m}\n"
+            f"Объяснение: {p.dispute_text}\n\n"
+            f"/pok_{p.id} оставить санкцию\n/unpen_{p.id} снять санкцию")
 
 
 def not_closed_text(shift: Shift) -> str:

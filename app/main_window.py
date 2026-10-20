@@ -26,9 +26,11 @@ from .notifications_dialog import NotificationsDialog
 from .bot_commands import BotContext, BotHandler, chunk
 from .version import VERSION
 from .duties_dialog import ChecklistDialog
+from .reports import due_reports, report_text
 from .settings_dialog import (
     SettingsDialog, backup_dir, backup_keep, grace_minutes, last_backup, late_minutes, lead_minutes,
-    penalty_catalog, salary_rules, set_last_backup, shift_change, theme_mode, water_schedule,
+    penalty_catalog, report_settings, salary_rules, set_last_backup, shift_change, theme_mode, water_schedule,
+    writeoff_alert,
 )
 from .shift_dialogs import CabinetDialog, CashOpDialog, CloseShiftDialog, StartShiftDialog, fmt_dt
 from .shifts import PROBLEM_STATUSES, REMIND_BEFORE_MINUTES, Shift, business_day, short_name, window
@@ -158,6 +160,7 @@ class MainWindow(QMainWindow):
         self._loading = False
         self.user: User | None = None
         self._reminded: set = set()
+        self._reports_done: set = set()
         self._really_quit = False
         self._tray_hint_shown = False
         self._last_reminded_day: date | None = None
@@ -452,9 +455,10 @@ class MainWindow(QMainWindow):
                                             datetime.now(), change)
             missed = [i.text for i in self.db.checklist(shift) if not i.done]
             late = shift.status(datetime.now(), change, grace_minutes()) == "late"
-            self.telegram.queue(telegram.shift_closed_text(shift, change, late, water, missed, penalty_catalog(),
-                                                           self._writeoff_note(shift)),
-                                key=f"close:{shift.id}")
+            self.telegram.queue(telegram.shift_closed_text(
+                shift, change, late, water, missed, penalty_catalog(), self._writeoff_note(shift),
+                self.db.writeoff_items_for_shift(shift.id), self._writeoff_alert(shift)),
+                key=f"close:{shift.id}")
         self.run_backup()
 
     def update_shift_box(self):
@@ -572,7 +576,7 @@ class MainWindow(QMainWindow):
     def open_cabinet(self):
         CabinetDialog(self, self.db, self.user, shift_change(), grace_minutes(),
                       self.calendar.yearShown(), self.calendar.monthShown(), water_schedule(),
-                      salary_rules, penalty_catalog).exec()
+                      salary_rules, penalty_catalog, self._dispute_made).exec()
 
     def active_shifts(self) -> list[Shift]:
         """Кто сейчас на смене (или ещё может её сдать)."""
@@ -829,6 +833,7 @@ class MainWindow(QMainWindow):
         now = datetime.now()
         today = now.date()
         self._check_overdue(now)
+        self._check_reports(now)
         deliveries = self.db.for_day(today) + self.db.for_day(today + timedelta(days=1))
         due = due_reminders(deliveries, now, lead_minutes(), self._reminded)
         for d in due:
@@ -1140,6 +1145,36 @@ class MainWindow(QMainWindow):
         self.telegram.queue(f"ℹ️ {who or 'Администратор'} {verb}: {what}",
                             key=f"pen:{p.id}:{int(set_)}:{datetime.now():%Y%m%d%H%M%S}",
                             except_chat=self._current_bot_chat)
+
+    def _check_reports(self, now: datetime):
+        """Утренний, недельный и месячный отчёты хозяевам в Telegram — по одному разу за период."""
+        if not telegram.configured():
+            return
+        for report in due_reports(now, shift_change(), report_settings()):
+            if report.key in self._reports_done:
+                continue
+            self._reports_done.add(report.key)
+            ctx = self._bot_context()
+            text = report_text(report, ctx)
+            self.telegram.queue(text, key=report.key)
+
+    def _writeoff_alert(self, shift) -> str:
+        """Тревога, если за смену списали заметно больше обычного (среднего по последним сменам магазина)."""
+        factor, minimum = writeoff_alert()
+        if factor <= 0 or shift.writeoff < max(minimum, 1):
+            return ""
+        usual = self.db.recent_writeoff_average(shift)
+        if usual is None:
+            return ""
+        if shift.writeoff >= usual * factor:
+            return (f"❗ Списание необычно большое: {money(shift.writeoff)} при обычных "
+                    f"~{money(round(usual))} за смену")
+        return ""
+
+    def _dispute_made(self, p):
+        """Сотрудник оспорил санкцию: хозяевам — в Telegram, на экране — уведомление."""
+        self.audit("Санкция оспорена", f"{p.user_name or '—'}, {p.title}, смена {p.shift_day:%d.%m}: {p.dispute_text}")
+        self.telegram.queue(telegram.dispute_text(p), key=f"dispute:{p.id}")
 
     def _writeoff_note(self, shift) -> str:
         """Списания по магазину за месяц смены — для итогов в Telegram."""

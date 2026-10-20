@@ -3,11 +3,12 @@
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFormLayout,
-    QGridLayout, QHBoxLayout, QHeaderView, QLabel, QPushButton, QSpinBox, QTableWidget,
-    QTableWidgetItem, QVBoxLayout, QWidget,
+    QGridLayout, QHBoxLayout, QHeaderView, QLabel, QMessageBox, QPlainTextEdit, QPushButton, QSpinBox,
+    QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
 from .db import Database
+from .holidays import parse_holidays
 from .salary import MAX_TIERS, PenaltyKind, Tier
 
 
@@ -166,3 +167,39 @@ class PenaltyCatalogEditor(QWidget):
         return result
 
     max_used_id = 0  # наибольший номер, который уже использовался (даже убранный)
+
+
+class HolidaysDialog(QDialog):
+    """Список праздничных дней: по строке на дату. В такие смены премия за выручку не начисляется."""
+
+    def __init__(self, parent, text: str):
+        super().__init__(parent)
+        self.setWindowTitle("Праздничные дни")
+        self.resize(460, 420)
+        layout = QVBoxLayout(self)
+        hint = QLabel("По одной дате в строке. <b>08.03</b> — каждый год, <b>23.11.2026</b> — только в этот год "
+                      "(для праздников, которые каждый год в другой день, например День матери). "
+                      "После даты можно написать пояснение.<br><br>"
+                      "Дата — это день, <b>с которого начинается смена</b> (смена с 8:00 до 8:00 следующего дня). "
+                      "В праздничную смену выручка не идёт в премию, а ставка за смену — праздничная.")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+        self.edit = QPlainTextEdit(text)
+        layout.addWidget(self.edit, 1)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Ok).setText("Готово")
+        buttons.button(QDialogButtonBox.Cancel).setText("Отмена")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def accept(self):
+        _, bad = parse_holidays(self.edit.toPlainText())
+        if bad:
+            QMessageBox.warning(self, "Праздничные дни", "Не получилось понять строки:\n• " + "\n• ".join(bad)
+                                + "\n\nНужен вид «08.03» или «23.11.2026».")
+            return
+        super().accept()
+
+    def text(self) -> str:
+        return "\n".join(line.rstrip() for line in self.edit.toPlainText().splitlines() if line.strip())

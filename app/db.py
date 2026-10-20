@@ -178,6 +178,12 @@ CREATE TABLE IF NOT EXISTS penalties (
     UNIQUE (shift_id, title)
 );
 CREATE INDEX IF NOT EXISTS idx_penalties_user ON penalties(user_id);
+CREATE TABLE IF NOT EXISTS writeoff_items (
+    shift_id INTEGER NOT NULL,
+    reason   TEXT    NOT NULL,
+    amount   INTEGER NOT NULL,
+    PRIMARY KEY (shift_id, reason)
+);
 CREATE TABLE IF NOT EXISTS announcements (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     update_id  INTEGER UNIQUE,
@@ -203,6 +209,12 @@ CREATE TABLE IF NOT EXISTS shift_duties (
 SHIFT_MIGRATIONS = {
     column: f"ALTER TABLE shifts ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0"
     for column in ("revenue", "flowers", "terminal", "qr", "deliveries", "writeoff")
+}
+
+PENALTY_MIGRATIONS = {
+    "dispute_text": "ALTER TABLE penalties ADD COLUMN dispute_text TEXT NOT NULL DEFAULT ''",
+    "dispute_at": "ALTER TABLE penalties ADD COLUMN dispute_at TEXT",
+    "dispute_result": "ALTER TABLE penalties ADD COLUMN dispute_result TEXT NOT NULL DEFAULT ''",
 }
 
 SHIFT_SELECT = """
@@ -297,6 +309,10 @@ class Database:
                 self.conn.execute(sql)
         existing = {r[1] for r in self.conn.execute("PRAGMA table_info(shifts)")}
         for column, sql in SHIFT_MIGRATIONS.items():
+            if column not in existing:
+                self.conn.execute(sql)
+        existing = {r[1] for r in self.conn.execute("PRAGMA table_info(penalties)")}
+        for column, sql in PENALTY_MIGRATIONS.items():
             if column not in existing:
                 self.conn.execute(sql)
         existing = {r[1] for r in self.conn.execute("PRAGMA table_info(telegram_outbox)")}
@@ -537,7 +553,13 @@ class Database:
 
     def close_shift(self, shift_id: int, now: datetime, closing_cash: int, cash_sales: int,
                     courier_cash: int, note: str = "", revenue: int = 0, flowers: int = 0,
-                    terminal: int = 0, qr: int = 0, deliveries: int = 0, writeoff: int = 0) -> Shift:
+                    terminal: int = 0, qr: int = 0, deliveries: int = 0, writeoff: int = 0,
+                    writeoff_items: dict[str, int] | None = None) -> Shift:
+        """writeoff_items — списания по причинам {«Завяло»: 2000}; если заданы, writeoff считается их суммой."""
+        if writeoff_items is not None:
+            if min(writeoff_items.values(), default=0) < 0:
+                raise UserError("Суммы не могут быть отрицательными.")
+            writeoff = sum(writeoff_items.values())
         if min(closing_cash, cash_sales, courier_cash, revenue, flowers, terminal, qr, deliveries, writeoff) < 0:
             raise UserError("Суммы не могут быть отрицательными.")
         if flowers > revenue:
@@ -552,6 +574,10 @@ class Database:
         self.conn.commit()
         if cur.rowcount == 0:
             raise UserError("Эта смена уже сдана.")
+        for reason, amount in (writeoff_items or {}).items():
+            if amount > 0:
+                self.conn.execute("INSERT OR REPLACE INTO writeoff_items (shift_id, reason, amount) VALUES (?, ?, ?)",
+                                  (shift_id, reason, amount))
         # Список обязанностей на момент сдачи: потом его могут поменять, а история останется.
         self.conn.execute(
             "INSERT OR IGNORE INTO shift_duties (shift_id, duty_id, text, done_at)"
@@ -834,14 +860,16 @@ class Database:
 
     PENALTY_SELECT = (
         "SELECT p.id, p.shift_id, p.user_id, p.kind_id, p.title, p.amount, p.created_at, p.created_by, p.note,"
-        " s.day, COALESCE(NULLIF(u.name, ''), u.login, '') FROM penalties p"
+        " s.day, COALESCE(NULLIF(u.name, ''), u.login, ''), p.dispute_text, p.dispute_at, p.dispute_result"
+        " FROM penalties p"
         " JOIN shifts s ON s.id = p.shift_id LEFT JOIN users u ON u.id = p.user_id")
 
     @staticmethod
     def _row_to_penalty(r) -> Penalty:
         return Penalty(id=r[0], shift_id=r[1], user_id=r[2], kind_id=r[3], title=r[4], amount=r[5],
                        created_at=datetime.fromisoformat(r[6]), created_by=r[7], note=r[8],
-                       shift_day=date.fromisoformat(r[9]), user_name=r[10])
+                       shift_day=date.fromisoformat(r[9]), user_name=r[10], dispute_text=r[11],
+                       disputed_at=datetime.fromisoformat(r[12]) if r[12] else None, dispute_result=r[13])
 
     def add_penalty(self, shift_id: int, kind_id: int, title: str, amount: int, by: str, now: datetime,
                     note: str = "") -> Penalty | None:
@@ -889,3 +917,46 @@ class Database:
         row = self.conn.execute(SHIFT_SELECT + " WHERE s.user_id = ? ORDER BY s.opened_at DESC, s.id DESC LIMIT 1",
                                 (user_id,)).fetchone()
         return _row_to_shift(row) if row else None
+
+    def dispute_penalty(self, penalty_id: int, text: str, now: datetime) -> Penalty:
+        """Сотрудник не согласен с санкцией. Один раз: повторный спор не нужен, решение за администратором."""
+        penalty = self.get_penalty(penalty_id)
+        if penalty is None:
+            raise UserError("Такой санкции уже нет.")
+        if not text.strip():
+            raise UserError("Напишите, почему вы не согласны.")
+        if penalty.disputed_at is not None:
+            raise UserError("Вы уже оспорили эту санкцию, администратор решит.")
+        self.conn.execute("UPDATE penalties SET dispute_text=?, dispute_at=?, dispute_result='' WHERE id=?",
+                          (text.strip(), _ts(now), penalty_id))
+        self.conn.commit()
+        return self.get_penalty(penalty_id)
+
+    def resolve_dispute(self, penalty_id: int) -> Penalty | None:
+        """Администратор оставил санкцию в силе: спор закрыт. (Если снял — санкция просто удаляется.)"""
+        self.conn.execute("UPDATE penalties SET dispute_result='kept' WHERE id=? AND dispute_at IS NOT NULL",
+                          (penalty_id,))
+        self.conn.commit()
+        return self.get_penalty(penalty_id)
+
+    # ----- списания: причины и «обычный» уровень -----
+
+    def writeoff_items_for_shift(self, shift_id: int) -> dict[str, int]:
+        return dict(self.conn.execute("SELECT reason, amount FROM writeoff_items WHERE shift_id = ? ORDER BY amount DESC",
+                                      (shift_id,)).fetchall())
+
+    def writeoff_by_reason(self, first: date, last: date) -> dict[str, int]:
+        """Списания магазина за период по причинам (сданные смены), по убыванию суммы."""
+        rows = self.conn.execute(
+            "SELECT w.reason, SUM(w.amount) FROM writeoff_items w JOIN shifts s ON s.id = w.shift_id"
+            " WHERE s.closed_at IS NOT NULL AND s.day BETWEEN ? AND ? GROUP BY w.reason ORDER BY SUM(w.amount) DESC",
+            (first.isoformat(), last.isoformat())).fetchall()
+        return dict(rows)
+
+    def recent_writeoff_average(self, shift: Shift, count: int = 14) -> float | None:
+        """Сколько в среднем списывали за смену раньше (последние count сданных смен до этой), None — смен не было."""
+        row = self.conn.execute(
+            "SELECT AVG(writeoff), COUNT(*) FROM (SELECT writeoff FROM shifts WHERE closed_at IS NOT NULL"
+            " AND id <> ? AND opened_at < ? ORDER BY opened_at DESC LIMIT ?)",
+            (shift.id, _ts(shift.opened_at), count)).fetchone()
+        return row[0] if row and row[1] else None

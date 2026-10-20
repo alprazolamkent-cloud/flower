@@ -104,6 +104,9 @@ class Adjustment:
     created_by_name: str = ""
 
 
+WRITEOFF_REASONS = ("Завяло", "Разбито", "Брак поставки", "Истёк срок", "Другое")
+
+
 @dataclass
 class Penalty:
     """Штрафная санкция за смену. Название и сумма сохраняются как были при постановке."""
@@ -118,6 +121,9 @@ class Penalty:
     note: str = ""
     shift_day: date | None = None
     user_name: str = ""
+    dispute_text: str = ""  # сотрудник не согласен: что написал
+    disputed_at: datetime | None = None
+    dispute_result: str = ""  # "" — ждёт решения, "kept" — администратор оставил санкцию
 
 
 @dataclass

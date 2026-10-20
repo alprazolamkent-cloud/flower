@@ -12,7 +12,7 @@ from datetime import date, datetime, time, timedelta
 
 from .db import Database, Delivery, User, UserError
 from .delivery_dialog import money
-from .salary import PenaltyKind, SalaryRules, calculate, shop_writeoff
+from .salary import KIND_TITLES, PenaltyKind, SalaryRules, calculate, forecast, monthly_ranking, shop_writeoff
 from .shifts import STATUS_TEXT, Penalty, Shift, WaterSchedule, business_day, window
 
 CONFIRM_FOR = timedelta(minutes=5)
@@ -37,6 +37,8 @@ MENU = [
     ("ann", "Объявления и кто прочитал"),
     ("status", "Состояние программы"),
     ("penalties", "Штрафные санкции за месяц"),
+    ("writeoffs", "Списания: сколько и по каким причинам"),
+    ("rating", "Рейтинг месяца: лучшая смена и средний приход"),
     ("backup", "Сделать резервную копию"),
 ]
 ALIASES = {
@@ -58,6 +60,7 @@ ALIASES = {
     "копия": "backup", "бэкап": "backup", "бекап": "backup",
     "аванс": "advance", "премия": "bonus", "штраф": "fine",
     "удалить": "del", "оставить": "keep",
+    "списания": "writeoffs", "списание": "writeoffs", "рейтинг": "rating",
     "санкция": "sanction", "санкции": "penalties", "штрафы": "penalties", "fines": "penalties",
     "да": "yes", "yes": "yes", "ок": "yes", "нет": "no", "no": "no", "отмена": "no", "cancel": "no",
 }
@@ -97,6 +100,9 @@ def parse_command(text: str) -> tuple[str, str] | None:
     m = re.fullmatch(r"pen_(\d+)_(\d+)", word)  # ссылка из итогов смены: смена, санкция
     if m and text.startswith("/"):
         return "pen", f"{m.group(1)} {m.group(2)}"
+    m = re.fullmatch(r"pok_(\d+)", word)  # оставить санкцию в силе после спора сотрудника
+    if m and text.startswith("/"):
+        return "pok", m.group(1)
     m = re.fullmatch(r"unpen_(\d+)", word)  # «Отменить» под сообщением о санкции
     if m and text.startswith("/"):
         return "unpen", m.group(1)
@@ -190,6 +196,8 @@ def cmd_help(ctx: BotContext, args: str) -> str:
     lines = ["🌸 Что я умею (можно писать по-русски: /касса, /зарплата Анна):", ""]
     lines += [f"/{name} — {text}" for name, text in MENU]
     lines += ["", "Штрафные санкции: после сдачи смены придут ссылки — нажмите нужную. Позже: /санкция Анна 2. Список: /штрафы.",
+              "Сотрудник может оспорить санкцию — придёт его объяснение со ссылками: оставить /pok_N, снять /unpen_N.",
+              "Списания по причинам: /списания (или /списания неделя). Рейтинг месяца: /рейтинг.",
               "Когда сотрудник просит удалить доставку, придёт сообщение со ссылками: удалить /del_N, оставить /keep_N.",
               "Записать: /аванс Анна 5000 на ремонт, /премия Анна 3000 за праздники, "
                   "/штраф Анна 500 разбила вазу — сначала спрошу «да / нет».",
@@ -239,7 +247,10 @@ def cmd_cash(ctx: BotContext, args: str) -> str:
 
 
 def cmd_revenue(ctx: BotContext, args: str) -> str:
-    first, last, title = _period(args, ctx.now, ctx.change)
+    return revenue_text(ctx, *_period(args, ctx.now, ctx.change))
+
+
+def revenue_text(ctx: BotContext, first: date, last: date, title: str) -> str:
     shifts = ctx.db.shifts_between(first, last)
     closed = [s for s in shifts if s.closed_at is not None]
     if not shifts:
@@ -290,10 +301,13 @@ def cmd_shifts(ctx: BotContext, args: str) -> str:
 
 
 def cmd_staff(ctx: BotContext, args: str) -> str:
-    first, last, title = _period("месяц", ctx.now, ctx.change)
+    return staff_text(ctx, *_period("месяц", ctx.now, ctx.change))
+
+
+def staff_text(ctx: BotContext, first: date, last: date, title: str) -> str:
     shifts = ctx.db.shifts_between(first, last)
     if not shifts:
-        return "В этом месяце смен ещё не было."
+        return f"Смен {title} не было."
     lines = [f"👥 Сотрудники {title}:"]
     for u in ctx.db.users():
         own = [s for s in shifts if s.user_id == u.id]
@@ -328,8 +342,12 @@ def _conditions_lines(sal, rules: SalaryRules) -> list[str]:
 def _salary_detail(ctx: BotContext, user: User, first: date, last: date, month: str) -> str:
     rules = ctx.rules(user.id)
     sal = _calc(ctx, user.id, first, last, month)
+    pieces = [(f"{KIND_TITLES[kind]} " if len(sal.base_parts) > 1 else "") + f"{count} × {money(rate)}"
+              for kind, count, rate in sal.base_parts]
     lines = [f"💰 {user.name or user.login}, {month[5:]}.{month[:4]}",
-             f"Смены: {sal.shifts} × {money(rules.shift_rate)} = {money(sal.base)}"]
+             f"Смены: {' + '.join(pieces) or '0'} = {money(sal.base)}"]
+    if sal.holiday_shifts:
+        lines.append(f"🎉 Праздничных смен {sal.holiday_shifts} (выручка {money(sal.holiday_revenue)} в премию не идёт)")
     if rules.active_tiers():
         lines.append(f"Приход {money(sal.revenue)}, в среднем {money(round(sal.average))} за смену")
         if sal.tier is None:
@@ -340,10 +358,16 @@ def _salary_detail(ctx: BotContext, user: User, first: date, last: date, month: 
         if sal.next_tier is not None and sal.shifts:
             lines.append(f"До «от {money(sal.next_tier.per_shift)}» ({sal.next_tier.percent:g}%) не хватает "
                          f"{money(round(sal.next_tier.per_shift - sal.average))} в среднем за смену")
+    today = ctx.now.date()
+    plan = forecast(sal, rules, today) if first <= today <= last else None
+    if plan is not None:
+        lines.append(f"🎯 Прогноз: ещё ~{plan.remaining_shifts} смен; для «от {money(plan.target.per_shift)}» нужно "
+                     f"в среднем {money(plan.needed_average)} за смену")
     if sal.shortage:
         lines.append(f"Недостача: −{money(sal.shortage)}")
     for p in sal.penalties:
-        lines.append(f"Санкция «{p.title}» ({p.shift_day:%d.%m}): −{money(p.amount)}")
+        lines.append(f"Санкция «{p.title}» ({p.shift_day:%d.%m}): −{money(p.amount)}"
+                     + (" ✋ оспорена" if p.disputed_at and not p.dispute_result else ""))
     lines += _conditions_lines(sal, rules)
     for a in sal.adjustments:
         lines.append(f"{a.reason}: {'+' if a.amount > 0 else '−'}{money(abs(a.amount))}")
@@ -355,11 +379,15 @@ def _salary_detail(ctx: BotContext, user: User, first: date, last: date, month: 
 
 def cmd_salary(ctx: BotContext, args: str) -> str:
     first, last, _ = _period("месяц", ctx.now, ctx.change)
-    month = f"{first:%Y-%m}"
     if args.strip():
         user, error = find_user(ctx.db, args)
-        return error if user is None else _salary_detail(ctx, user, first, last, month)
-    lines = [f"💰 Зарплата, {month[5:]}.{month[:4]} (на сейчас):"]
+        return error if user is None else _salary_detail(ctx, user, first, last, f"{first:%Y-%m}")
+    return salary_overview(ctx, first, last)
+
+
+def salary_overview(ctx: BotContext, first: date, last: date) -> str:
+    month = f"{first:%Y-%m}"
+    lines = [f"💰 Зарплата, {month[5:]}.{month[:4]}" + (" (на сейчас):" if last >= ctx.now.date() else ":")]
     for u in ctx.db.users():
         shifts = ctx.db.shifts_between(first, last, u.id)
         if shifts:
@@ -368,6 +396,44 @@ def cmd_salary(ctx: BotContext, args: str) -> str:
     if len(lines) == 1:
         return "В этом месяце смен ещё не было."
     return "\n".join(lines) + "\nПодробнее: /зарплата Имя"
+
+
+def writeoff_text(ctx: BotContext, first: date, last: date, title: str) -> str:
+    shop = shop_writeoff(ctx.db.shifts_between(first, last))
+    rules = ctx.rules(None)
+    lines = [f"🥀 Списания {title}"]
+    if not shop.writeoff:
+        return lines[0] + "\nСписаний не было."
+    lines.append(f"Всего: {money(shop.writeoff)} = {shop.percent(rules.writeoff_base):.1f}% "
+                 f"{'от всех цветов' if rules.writeoff_base == 'total' else 'от проданных'}")
+    reasons = ctx.db.writeoff_by_reason(first, last)
+    lines += [f"• {r}: {money(a)}" for r, a in sorted(reasons.items(), key=lambda x: -x[1])]
+    known = sum(reasons.values())
+    if known < shop.writeoff:
+        lines.append(f"• без причины (старые смены): {money(shop.writeoff - known)}")
+    if rules.max_writeoff_percent > 0:
+        lines.append(f"Для премий нужно меньше {rules.max_writeoff_percent:g}%")
+    return "\n".join(lines)
+
+
+def cmd_writeoffs(ctx: BotContext, args: str) -> str:
+    arg = args.strip() or "месяц"
+    return writeoff_text(ctx, *_period(arg, ctx.now, ctx.change))
+
+
+def ranking_text(ctx: BotContext, first: date, last: date, title: str) -> str:
+    rank = monthly_ranking(ctx.db.shifts_between(first, last), ctx.rules(None))
+    if rank.best_shift is None or not rank.best_shift.revenue:
+        return f"🏆 Рейтинг {title}: сданных смен ещё нет."
+    b = rank.best_shift
+    lines = [f"🏆 Рейтинг {title}", f"Лучшая смена: {_name(b.user_name)}, {b.day:%d.%m} — {money(b.revenue)}"]
+    if rank.best_average_name:
+        lines.append(f"Лучший средний приход за смену: {rank.best_average_name} — {money(rank.best_average)}")
+    return "\n".join(lines)
+
+
+def cmd_rating(ctx: BotContext, args: str) -> str:
+    return ranking_text(ctx, *_period(args.strip() or "месяц", ctx.now, ctx.change))
 
 
 def cmd_problems(ctx: BotContext, args: str) -> str:
@@ -602,6 +668,20 @@ def cmd_unpen(ctx: BotContext, args: str) -> str:
     return f"↩ Санкция снята: {_name(penalty.user_name)}, смена {penalty.shift_day:%d.%m} — {penalty.title}"
 
 
+def cmd_pok(ctx: BotContext, args: str) -> str:
+    try:
+        penalty = ctx.db.resolve_dispute(int(args.strip()))
+    except ValueError:
+        return "Укажите номер санкции."
+    if penalty is None:
+        return "Такой санкции уже нет (возможно, вы её уже сняли)."
+    if ctx.audit:
+        ctx.audit("Спор по санкции: оставлена", f"{_name(penalty.user_name)}, смена {penalty.shift_day:%d.%m}: "
+                  f"{penalty.title}; решил(а) {ctx.author or 'Telegram'}")
+    return (f"✔ Санкция остаётся: {_name(penalty.user_name)}, смена {penalty.shift_day:%d.%m} — {penalty.title}. "
+            "Спор закрыт.")
+
+
 def _catalog_lines(ctx: BotContext) -> str:
     if not ctx.penalty_kinds:
         return "Список санкций пуст — добавьте их в настройках (вкладка «Санкции и списания»)."
@@ -629,7 +709,10 @@ def cmd_penalties(ctx: BotContext, args: str) -> str:
         if rules.max_penalties > 0:
             status = "  ❌ без премии" if len(group) >= rules.max_penalties else "  ✅ премия возможна"
         lines.append(f"• {_name(name)}: {len(group)} шт. на {money(sum(p.amount for p in group))}{status}")
-        lines += [f"    {p.shift_day:%d.%m} {p.title} −{money(p.amount)} (отменить /unpen_{p.id})" for p in group]
+        for p in group:
+            lines.append(f"    {p.shift_day:%d.%m} {p.title} −{money(p.amount)} (отменить /unpen_{p.id})")
+            if p.disputed_at and not p.dispute_result:
+                lines.append(f"      ✋ оспорено: «{p.dispute_text}» — оставить /pok_{p.id}")
     rules = ctx.rules(None)
     if rules.max_writeoff_percent > 0:
         shop = shop_writeoff(ctx.db.shifts_between(first, last))
@@ -643,7 +726,7 @@ def cmd_penalties(ctx: BotContext, args: str) -> str:
 
 COMMANDS: dict[str, Callable[[BotContext, str], str]] = {
     "del": cmd_del, "keep": cmd_keep, "pen": cmd_pen, "unpen": cmd_unpen, "sanction": cmd_sanction,
-    "penalties": cmd_penalties,
+    "penalties": cmd_penalties, "pok": cmd_pok, "writeoffs": cmd_writeoffs, "rating": cmd_rating,
     "help": cmd_help, "shift": cmd_shift, "cash": cmd_cash, "revenue": cmd_revenue, "today": cmd_today,
     "shifts": cmd_shifts, "staff": cmd_staff, "salary": cmd_salary, "problems": cmd_problems,
     "deliveries": cmd_deliveries, "water": cmd_water, "duties": cmd_duties, "ann": cmd_ann,

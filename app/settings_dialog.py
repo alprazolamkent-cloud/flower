@@ -18,7 +18,9 @@ from .audit_dialog import AuditDialog
 from .db import UserError
 from .duties_dialog import DutiesEditor
 from .salary import DEFAULT_PENALTY_KINDS, WRITEOFF_BASES, PenaltyKind, SalaryRules, Tier
-from .salary_dialog import EmployeeTiersDialog, PenaltyCatalogEditor, TiersEditor
+from .holidays import DEFAULT_TEXT as DEFAULT_HOLIDAYS
+from .holidays import Holidays, parse_holidays
+from .salary_dialog import EmployeeTiersDialog, HolidaysDialog, PenaltyCatalogEditor, TiersEditor
 from .shifts import DEFAULT_CHANGE, DEFAULT_GRACE_MINUTES, WaterSchedule
 from .templates_dialog import TemplatesDialog
 from .theme import C
@@ -94,6 +96,28 @@ def _dump_tiers(tiers: list[Tier]) -> list:
     return [[t.per_shift, t.percent] for t in tiers]
 
 
+def holidays_text() -> str:
+    return str(_settings().value("holidays_text", DEFAULT_HOLIDAYS))
+
+
+def holidays_calendar() -> Holidays:
+    return parse_holidays(holidays_text())[0]
+
+
+def report_settings() -> dict:
+    """Автоматические отчёты в Telegram: утренний, недельный, месячный."""
+    s = _settings()
+    on = lambda key, default="true": str(s.value(key, default)) == "true"
+    return {"morning": on("report_morning"), "time": str(s.value("report_time", "08:30")),
+            "weekly": on("report_weekly"), "monthly": on("report_monthly")}
+
+
+def writeoff_alert() -> tuple[float, int]:
+    """(во сколько раз выше обычного, не меньше ₽): тревога о большом списании. Кратность 0 — выключено."""
+    s = _settings()
+    return float(s.value("writeoff_alert_factor", 3)), int(s.value("writeoff_alert_min", 3000))
+
+
 def penalty_catalog() -> list[PenaltyKind]:
     """Список штрафных санкций; пока админ его не менял — четыре стандартные."""
     raw = str(_settings().value("penalty_catalog", ""))
@@ -120,6 +144,9 @@ def salary_rules(user_id: int | None = None) -> SalaryRules:
         tiers=tiers if tiers is not None else bonus_tiers(),
         above_plan_only=str(s.value("bonus_above_plan", "false")) == "true",
         deduct_shortage=str(s.value("salary_deduct", "true")) == "true",
+        weekend_rate=int(s.value("salary_weekend_rate", 0)),
+        holiday_rate=int(s.value("salary_holiday_rate", 0)),
+        holidays=holidays_calendar(),
         max_penalties=int(s.value("bonus_max_penalties", 3)),
         max_writeoff_percent=float(s.value("bonus_max_writeoff", 15)),
         writeoff_base=str(s.value("writeoff_base", "total")) if str(s.value("writeoff_base", "total")) in WRITEOFF_BASES
@@ -198,16 +225,17 @@ class SettingsDialog(QDialog):
         self.main = window
         self.db = window.db
         self.setWindowTitle("Настройки")
-        self.setMinimumWidth(740)  # чтобы все вкладки помещались без стрелок прокрутки
+        self.setMinimumWidth(780)  # чтобы все вкладки помещались без стрелок прокрутки
         layout = QVBoxLayout(self)
 
         self.tabs = QTabWidget()
         self.tabs.addTab(self._main_tab(), "Основное")
         self.tabs.addTab(self._shop_tab(), "Магазин")
         self.tabs.addTab(self._salary_tab(), "Зарплата")
-        self.tabs.addTab(self._penalty_tab(), "Санкции и списания")
+        self.tabs.addTab(self._penalty_tab(), "Санкции")
         self.tabs.addTab(self._telegram_tab(), "Telegram")
-        self.tabs.addTab(self._backup_tab(), "Резервные копии")
+        self.tabs.addTab(self._reports_tab(), "Отчёты")
+        self.tabs.addTab(self._backup_tab(), "Копии")
         self.tabs.addTab(self._program_tab(), "Программа")
         layout.addWidget(self.tabs)
 
@@ -321,6 +349,30 @@ class SettingsDialog(QDialog):
         self.rate_box.setSuffix(" ₽")
         self.rate_box.setValue(rules.shift_rate)
         base_form.addRow("За каждую сданную смену:", self.rate_box)
+        self.weekend_box = QSpinBox()
+        self.weekend_box.setRange(0, 100_000)
+        self.weekend_box.setSingleStep(100)
+        self.weekend_box.setGroupSeparatorShown(True)
+        self.weekend_box.setSuffix(" ₽")
+        self.weekend_box.setSpecialValueText("как обычная")
+        self.weekend_box.setValue(rules.weekend_rate)
+        base_form.addRow("Смена в субботу и воскресенье:", self.weekend_box)
+        self.holiday_box = QSpinBox()
+        self.holiday_box.setRange(0, 100_000)
+        self.holiday_box.setSingleStep(100)
+        self.holiday_box.setGroupSeparatorShown(True)
+        self.holiday_box.setSuffix(" ₽")
+        self.holiday_box.setSpecialValueText("как обычная")
+        self.holiday_box.setValue(rules.holiday_rate)
+        holiday_row = QHBoxLayout()
+        holiday_row.addWidget(self.holiday_box, 1)
+        holidays_btn = QPushButton("Праздничные дни…")
+        holidays_btn.clicked.connect(self._edit_holidays)
+        holiday_row.addWidget(holidays_btn)
+        base_form.addRow("Праздничная смена:", holiday_row)
+        base_form.addRow(_gray_label("В праздничные дни премия за выручку не начисляется: выручка таких смен\n"
+                                     "не идёт в расчёт премии, зато ставка за смену — праздничная."))
+        self.holidays_text = holidays_text()
         self.deduct_check = QCheckBox("Вычитать недостачу кассы из зарплаты")
         self.deduct_check.setChecked(rules.deduct_shortage)
         base_form.addRow(self.deduct_check)
@@ -348,6 +400,60 @@ class SettingsDialog(QDialog):
         layout.addWidget(bonus)
         layout.addWidget(_gray_label("Зарплата = смены × ставка + премия − недостачи ± аванс, премия, штраф.\n"
                                      "Аванс, премию или штраф добавляйте в личном кабинете, выбрав сотрудника."))
+        layout.addStretch(1)
+        return page
+
+    def _edit_holidays(self):
+        dlg = HolidaysDialog(self, self.holidays_text)
+        if dlg.exec() == QDialog.Accepted:
+            self.holidays_text = dlg.text()
+
+    def _reports_tab(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        reports = report_settings()
+        box = QGroupBox("Отчёты сами приходят в Telegram")
+        form = QFormLayout(box)
+        self.rep_morning = QCheckBox("Каждое утро — итоги прошлой смены и доставки на сегодня")
+        self.rep_morning.setChecked(reports["morning"])
+        form.addRow(self.rep_morning)
+        self.rep_time = QTimeEdit()
+        self.rep_time.setDisplayFormat("HH:mm")
+        hour, minute = (int(x) for x in reports["time"].split(":"))
+        self.rep_time.setTime(QTime(hour, minute))
+        form.addRow("Во сколько присылать:", self.rep_time)
+        self.rep_weekly = QCheckBox("По понедельникам — итоги недели")
+        self.rep_weekly.setChecked(reports["weekly"])
+        form.addRow(self.rep_weekly)
+        self.rep_monthly = QCheckBox("1-го числа — итоги прошлого месяца: выручка, зарплаты, санкции, списания")
+        self.rep_monthly.setChecked(reports["monthly"])
+        form.addRow(self.rep_monthly)
+        form.addRow(_gray_label("Приходят всем подключённым чатам. Программа должна быть запущена: если компьютер\n"
+                                "включили позже, отчёт придёт при запуске (утренний — в течение 4 часов после времени)."))
+        layout.addWidget(box)
+
+        alerts = QGroupBox("Тревога о большом списании")
+        alert_form = QFormLayout(alerts)
+        factor, minimum = writeoff_alert()
+        self.alert_factor = QDoubleSpinBox()
+        self.alert_factor.setRange(0, 50)
+        self.alert_factor.setDecimals(1)
+        self.alert_factor.setPrefix("в ")
+        self.alert_factor.setSuffix(" раза выше обычного")
+        self.alert_factor.setSpecialValueText("выключено")
+        self.alert_factor.setValue(factor)
+        alert_form.addRow("Сообщать, если списали:", self.alert_factor)
+        self.alert_min = QSpinBox()
+        self.alert_min.setRange(0, 1_000_000)
+        self.alert_min.setSingleStep(500)
+        self.alert_min.setGroupSeparatorShown(True)
+        self.alert_min.setSuffix(" ₽")
+        self.alert_min.setValue(minimum)
+        alert_form.addRow("и не меньше, чем:", self.alert_min)
+        alert_form.addRow(_gray_label("«Обычное» — среднее списание за смену по последним 14 сданным сменам магазина.\n"
+                                      "Списания вводит сам сотрудник, так что это единственная цифра, которую\n"
+                                      "программа не может проверить, — поэтому о скачках она сообщает вам."))
+        layout.addWidget(alerts)
         layout.addStretch(1)
         return page
 
@@ -610,6 +716,15 @@ class SettingsDialog(QDialog):
             ("вода раз в (дн.)", schedule.every, self.water_every.value(), False),
             ("день замены воды", schedule.anchor.isoformat(), self.water_anchor.date().toString("yyyy-MM-dd"), False),
             ("ставка за смену", rules.shift_rate, self.rate_box.value(), False),
+            ("ставка в выходные", rules.weekend_rate, self.weekend_box.value(), False),
+            ("ставка в праздники", rules.holiday_rate, self.holiday_box.value(), False),
+            ("праздничные дни", " ".join(holidays_text().split()), " ".join(self.holidays_text.split()), True),
+            ("утренний отчёт", report_settings()["morning"], self.rep_morning.isChecked(), False),
+            ("время отчёта", report_settings()["time"], self.rep_time.time().toString("HH:mm"), False),
+            ("недельный отчёт", report_settings()["weekly"], self.rep_weekly.isChecked(), False),
+            ("месячный отчёт", report_settings()["monthly"], self.rep_monthly.isChecked(), False),
+            ("тревога о списании (раз)", writeoff_alert()[0], self.alert_factor.value(), False),
+            ("тревога о списании от (₽)", writeoff_alert()[1], self.alert_min.value(), False),
             ("вычитать недостачу", rules.deduct_shortage, self.deduct_check.isChecked(), False),
             ("процент сверх плана", rules.above_plan_only, bool(self.above_box.currentData()), False),
             ("премия, если санкций меньше", rules.max_penalties, self.max_pen_box.value(), False),
@@ -644,6 +759,15 @@ class SettingsDialog(QDialog):
         settings.setValue("water_every", self.water_every.value())
         settings.setValue("water_anchor", self.water_anchor.date().toString("yyyy-MM-dd"))
         settings.setValue("salary_rate", self.rate_box.value())
+        settings.setValue("salary_weekend_rate", self.weekend_box.value())
+        settings.setValue("salary_holiday_rate", self.holiday_box.value())
+        settings.setValue("holidays_text", self.holidays_text)
+        settings.setValue("report_morning", _bool(self.rep_morning.isChecked()))
+        settings.setValue("report_time", self.rep_time.time().toString("HH:mm"))
+        settings.setValue("report_weekly", _bool(self.rep_weekly.isChecked()))
+        settings.setValue("report_monthly", _bool(self.rep_monthly.isChecked()))
+        settings.setValue("writeoff_alert_factor", self.alert_factor.value())
+        settings.setValue("writeoff_alert_min", self.alert_min.value())
         settings.setValue("salary_deduct", _bool(self.deduct_check.isChecked()))
         settings.setValue("bonus_tiers", json.dumps(_dump_tiers(self.tiers_editor.tiers())))
         settings.setValue("bonus_above_plan", _bool(self.above_box.currentData()))
