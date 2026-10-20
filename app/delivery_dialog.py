@@ -10,6 +10,7 @@ from PySide6.QtWidgets import (
 
 from .db import Delivery
 from .messaging import CHANNELS
+from .theme import C
 
 MAX_MONEY = 10_000_000
 
@@ -114,7 +115,7 @@ class DeliveryDialog(QDialog):
 
     def _update_remainder(self):
         rest = self.price_box.value() - self.courier_box.value()
-        color = "#c62828" if rest < 0 else "#2e7d32"
+        color = C.red if rest < 0 else C.green
         self.remainder_label.setText(f"<b style='color:{color}'>{money(rest)}</b>")
 
     def accept(self):

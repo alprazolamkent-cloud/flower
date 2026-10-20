@@ -19,8 +19,8 @@ from .shifts import (
     KIND_TEXT, PROBLEM_STATUSES, STATUS_TEXT, ChecklistItem, Shift, WaterSchedule, expected_cash,
     revenue_mismatch, window,
 )
+from .theme import C
 
-RED, GREEN, ORANGE, GRAY = "#c62828", "#2e7d32", "#ef6c00", "#757575"
 MONTHS = ["январь", "февраль", "март", "апрель", "май", "июнь",
           "июль", "август", "сентябрь", "октябрь", "ноябрь", "декабрь"]
 
@@ -38,7 +38,7 @@ def diff_text(diff: int | None) -> str:
 
 
 def diff_color(diff: int | None) -> str:
-    return GRAY if diff is None else (GREEN if diff == 0 else RED)
+    return C.gray if diff is None else (C.green if diff == 0 else C.red)
 
 
 def _html(text: str) -> str:
@@ -67,7 +67,7 @@ def _buttons(dialog: QDialog, ok_text: str) -> QDialogButtonBox:
 def _gray(text: str) -> QLabel:
     label = QLabel(text)
     label.setWordWrap(True)
-    label.setStyleSheet(f"color: {GRAY}")
+    label.setStyleSheet(f"color: {C.gray}")
     return label
 
 
@@ -99,7 +99,8 @@ class StartShiftDialog(QDialog):
         if self.prev is not None and self.prev.note:
             note = QLabel(f"<b>Комментарий предыдущей смены:</b><br>{_html(self.prev.note)}")
             note.setWordWrap(True)
-            note.setStyleSheet("background: #fff8e1; border: 1px solid #ffe082; padding: 6px")
+            note.setStyleSheet(f"background: {C.note_bg}; border: 1px solid {C.note_border}; "
+                               f"color: {C.note_fg}; padding: 6px")
             form.addRow(note)
 
         self.cash_box = count_box()
@@ -120,9 +121,9 @@ class StartShiftDialog(QDialog):
         if diff is None:
             self.diff_label.setText("")
         elif diff == 0:
-            self.diff_label.setText(f"<b style='color:{GREEN}'>Сходится с предыдущей сменой</b>")
+            self.diff_label.setText(f"<b style='color:{C.green}'>Сходится с предыдущей сменой</b>")
         else:
-            self.diff_label.setText(f"<b style='color:{RED}'>Не сходится: {diff_text(diff)}</b>")
+            self.diff_label.setText(f"<b style='color:{C.red}'>Не сходится: {diff_text(diff)}</b>")
 
     def accept(self):
         cash = self.cash_box.value()
@@ -161,7 +162,7 @@ class CloseShiftDialog(QDialog):
         layout.addWidget(QLabel(f"<h3>Сдача смены</h3>{s.user_name or '—'} · с {fmt_dt(s.opened_at)} "
                                 f"до {fmt_dt(s.end(change))}"))
         if datetime.now() >= s.end(change):
-            late = QLabel(f"<b style='color:{ORANGE}'>Пересменка уже прошла — смена будет отмечена "
+            late = QLabel(f"<b style='color:{C.orange}'>Пересменка уже прошла — смена будет отмечена "
                           "«сдана с опозданием».</b>")
             late.setWordWrap(True)
             layout.addWidget(late)
@@ -278,9 +279,9 @@ class CloseShiftDialog(QDialog):
         if check is None:
             self.check_label.setText("")
         elif check == 0:
-            self.check_label.setText(f"<span style='color:{GREEN}'>✓ нал. + терминал + QR = приход</span>")
+            self.check_label.setText(f"<span style='color:{C.green}'>✓ нал. + терминал + QR = приход</span>")
         else:
-            self.check_label.setText(f"<span style='color:{ORANGE}'>⚠ нал. + терминал + QR = {parts},<br>"
+            self.check_label.setText(f"<span style='color:{C.orange}'>⚠ нал. + терминал + QR = {parts},<br>"
                                      f"с приходом разница {money(abs(check))}</span>")
 
     def _ask(self, title: str, text: str) -> bool:
@@ -420,7 +421,7 @@ CABINET_HEADERS = ["Смена", "Сотрудник", "Открыта", "Сда
                    "Должно быть", "Сдали", "Касса", "Вода", "Обязанности", "Комментарий"]
 (C_STATUS, C_HANDOVER, C_CASH, C_WATER, C_DUTIES, C_NOTE) = (4, 12, 18, 19, 20, 21)
 MONEY_COLS = {5, 6, 7, 8, 9, 10, 11, 13, 14, 15, 16, 17}
-WATER_TEXT = {"done": ("поменяли", GREEN), "missed": ("не поменяли", RED), "planned": ("надо поменять", ORANGE)}
+WATER_TEXT = {"done": ("поменяли", "green"), "missed": ("не поменяли", "red"), "planned": ("надо поменять", "orange")}
 
 
 class CabinetDialog(QDialog):
@@ -560,20 +561,20 @@ class CabinetDialog(QDialog):
                 if col in MONEY_COLS:
                     item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
                 if col == C_STATUS and status in PROBLEM_STATUSES:
-                    item.setForeground(QColor(ORANGE if status == "closing" else RED))
+                    item.setForeground(QColor(C.orange if status == "closing" else C.red))
                 if col == C_HANDOVER and handover:
-                    item.setForeground(QColor(RED))
+                    item.setForeground(QColor(C.red))
                 if col == C_CASH:
                     item.setForeground(QColor(diff_color(diff)))
                 if col == C_WATER and water:
-                    item.setForeground(QColor(WATER_TEXT[water][1]))
+                    item.setForeground(QColor(getattr(C, WATER_TEXT[water][1])))
                     if s.day in waters:
                         who, when = waters[s.day]
                         item.setToolTip(f"Отметил(а) {who or '—'} {when:%d.%m %H:%M}")
                 if col == C_DUTIES and s.duties_total:
                     missed = [i.text for i in self.db.checklist(s) if not i.done]
                     if closed:
-                        item.setForeground(QColor(RED if missed else GREEN))
+                        item.setForeground(QColor(C.red if missed else C.green))
                     if missed:
                         item.setToolTip("Не сделано: " + ", ".join(missed))
                 if col == C_NOTE and s.note:
@@ -588,17 +589,17 @@ class CabinetDialog(QDialog):
                  f"Наличные: <b>{money(totals['cash'])}</b>"]
         problems = []
         if stats["short"]:
-            problems.append(f"<span style='color:{RED}'>Недостача: <b>{money(stats['short'])}</b></span>")
+            problems.append(f"<span style='color:{C.red}'>Недостача: <b>{money(stats['short'])}</b></span>")
         if stats["extra"]:
             problems.append(f"Излишек: <b>{money(stats['extra'])}</b>")
         if stats["handover"]:
-            problems.append(f"<span style='color:{RED}'>Не сошлось при приёме: <b>{stats['handover']}</b></span>")
+            problems.append(f"<span style='color:{C.red}'>Не сошлось при приёме: <b>{stats['handover']}</b></span>")
         if stats["late"]:
-            problems.append(f"<span style='color:{RED}'>Сдано с опозданием: <b>{stats['late']}</b></span>")
+            problems.append(f"<span style='color:{C.red}'>Сдано с опозданием: <b>{stats['late']}</b></span>")
         if stats["not_closed"]:
-            problems.append(f"<span style='color:{RED}'>Не сдано: <b>{stats['not_closed']}</b></span>")
+            problems.append(f"<span style='color:{C.red}'>Не сдано: <b>{stats['not_closed']}</b></span>")
         if stats["water_days"]:
-            color = GREEN if stats["water_done"] == stats["water_days"] else RED
+            color = C.green if stats["water_done"] == stats["water_days"] else C.red
             problems.append(f"<span style='color:{color}'>💧 Вода: поменяли <b>{stats['water_done']}</b> "
                             f"из {stats['water_days']}</span>")
         text = " &nbsp;·&nbsp; ".join(parts)
@@ -630,13 +631,13 @@ class CabinetDialog(QDialog):
         if self.rules.flowers_percent:
             parts.append(f"Цветы: {money(sal.flowers)} × {self.rules.flowers_percent:g}% = {money(sal.percent_part)}")
         if sal.shortage:
-            parts.append(f"<span style='color:{RED}'>Недостача: −{money(sal.shortage)}</span>")
+            parts.append(f"<span style='color:{C.red}'>Недостача: −{money(sal.shortage)}</span>")
         for a in sal.adjustments:
             sign = "+" if a.amount > 0 else "−"
             parts.append(f"{_html(a.reason)}: {sign}{money(abs(a.amount))}")
         text = " &nbsp;·&nbsp; ".join(parts) + f"<br><b style='font-size:15px'>Итого: {money(sal.total)}</b>"
         if sal.not_closed:
-            text += f" &nbsp;<span style='color:{GRAY}'>(несданные смены не учтены: {sal.not_closed})</span>"
+            text += f" &nbsp;<span style='color:{C.gray}'>(несданные смены не учтены: {sal.not_closed})</span>"
         self.salary_label.setText(text)
 
     def _adjust(self):
@@ -717,7 +718,7 @@ class AdjustmentDialog(QDialog):
                 item = QTableWidgetItem(text)
                 if col == 2:
                     item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-                    item.setForeground(QColor(GREEN if a.amount > 0 else RED))
+                    item.setForeground(QColor(C.green if a.amount > 0 else C.red))
                 self.table.setItem(row, col, item)
 
     def _add(self):

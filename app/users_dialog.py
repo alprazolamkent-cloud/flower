@@ -9,6 +9,7 @@ from PySide6.QtWidgets import (
 
 from .db import Database, User, UserError
 from .icon import flower_icon
+from .theme import C
 
 
 def _password_edit() -> QLineEdit:
@@ -42,7 +43,8 @@ class LoginDialog(QDialog):
         if note:
             note_label = QLabel(note)
             note_label.setWordWrap(True)
-            note_label.setStyleSheet("background: #e3f2fd; border: 1px solid #90caf9; padding: 6px")
+            note_label.setStyleSheet(f"background: {C.info_bg}; border: 1px solid {C.info_border}; "
+                                     f"color: {C.note_fg}; padding: 6px")
             form.addRow(note_label)
         self.login_edit = QLineEdit(self.settings.value("last_login", ""))
         form.addRow("Логин:", self.login_edit)

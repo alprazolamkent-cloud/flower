@@ -7,17 +7,18 @@ from datetime import date, datetime, time
 from PySide6.QtCore import QDate, QSettings, QTime, QTimer, QUrl
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
-    QCheckBox, QDateEdit, QDialog, QDialogButtonBox, QDoubleSpinBox, QFileDialog, QFormLayout,
+    QCheckBox, QComboBox, QDateEdit, QDialog, QDialogButtonBox, QDoubleSpinBox, QFileDialog, QFormLayout,
     QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPushButton, QSpinBox, QTabWidget,
     QTimeEdit, QVBoxLayout, QWidget,
 )
 
-from . import autostart, backup, telegram
+from . import autostart, backup, telegram, theme
 from .db import UserError
 from .duties_dialog import DutiesEditor
 from .salary import SalaryRules
 from .shifts import DEFAULT_CHANGE, DEFAULT_GRACE_MINUTES, WaterSchedule
 from .templates_dialog import TemplatesDialog
+from .theme import C
 
 DEFAULT_LEAD_MINUTES = 20
 
@@ -54,6 +55,11 @@ def water_schedule() -> WaterSchedule:
         anchor = date.today()
         settings.setValue("water_anchor", anchor.isoformat())
     return WaterSchedule(anchor, int(settings.value("water_every", 2)))
+
+
+def theme_mode() -> str:
+    mode = str(_settings().value("theme", "light"))
+    return mode if mode in theme.THEMES else "light"
 
 
 def salary_rules() -> SalaryRules:
@@ -122,6 +128,15 @@ class SettingsDialog(QDialog):
     def _main_tab(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
+
+        look = QGroupBox("Оформление")
+        look_form = QFormLayout(look)
+        self.theme_box = QComboBox()
+        for key, title in theme.THEMES.items():
+            self.theme_box.addItem(title, key)
+        self.theme_box.setCurrentIndex(max(self.theme_box.findData(theme_mode()), 0))
+        look_form.addRow("Тема:", self.theme_box)
+        layout.addWidget(look)
 
         reminders = QGroupBox("Напоминания о доставках")
         form = QFormLayout(reminders)
@@ -260,7 +275,7 @@ class SettingsDialog(QDialog):
         test.clicked.connect(self._test_telegram)
         layout.addWidget(test)
         if self.main.telegram.last_error:
-            error = QLabel(f"<span style='color:#c62828'>Последняя ошибка отправки: "
+            error = QLabel(f"<span style='color:{C.red}'>Последняя ошибка отправки: "
                            f"{self.main.telegram.last_error}</span>")
             error.setWordWrap(True)
             layout.addWidget(error)
@@ -420,5 +435,10 @@ class SettingsDialog(QDialog):
         settings.setValue("backup_keep", self.keep_box.value())
         if sys.platform == "win32":
             autostart.set_enabled(self.autostart_check.isChecked())
+        new_theme = self.theme_box.currentData()
+        changed_theme = new_theme != theme_mode()
+        settings.setValue("theme", new_theme)
         super().accept()
+        if changed_theme:
+            self.main.apply_theme()
         self.main.check_reminders()

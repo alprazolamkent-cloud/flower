@@ -10,6 +10,7 @@ from PySide6.QtWidgets import (
 )
 
 from .db import Announcement, Database, User
+from .theme import C
 
 
 def short(text: str, length: int = 60) -> str:
@@ -34,7 +35,8 @@ class UnreadDialog(QDialog):
                            f"<span style='font-size:16px'>{html.escape(item.text).replace(chr(10), '<br>')}</span>")
             label.setWordWrap(True)
             label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-            label.setStyleSheet("background: #fff8e1; border: 1px solid #ffe082; padding: 10px")
+            label.setStyleSheet(f"background: {C.note_bg}; border: 1px solid {C.note_border}; "
+                                f"color: {C.note_fg}; padding: 10px")
             inner.addWidget(label)
         inner.addStretch(1)
         scroll = QScrollArea()

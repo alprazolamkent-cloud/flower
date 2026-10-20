@@ -18,16 +18,17 @@ from .db import Database, Delivery, Totals, User
 from .delivery_dialog import DeliveryDialog, money
 from .icon import flower_icon
 from .messaging import KINDS, SHORT, build_action, render
-from . import backup, telegram
+from . import backup, telegram, theme
 from .announcements_dialog import HistoryDialog, UnreadDialog, short
 from .duties_dialog import ChecklistDialog
 from .settings_dialog import (
     SettingsDialog, backup_dir, backup_keep, grace_minutes, last_backup, lead_minutes, salary_rules,
-    set_last_backup, shift_change, water_schedule,
+    set_last_backup, shift_change, theme_mode, water_schedule,
 )
 from .shift_dialogs import CabinetDialog, CashOpDialog, CloseShiftDialog, StartShiftDialog, fmt_dt
 from .shifts import PROBLEM_STATUSES, REMIND_BEFORE_MINUTES, Shift, business_day, short_name, window
 from .templates_dialog import load_templates
+from .theme import C
 from .update_ui import UpdateController
 from .reminders import due_reminders, reminder_key
 from .users_dialog import LoginDialog, PasswordDialog, UserFormDialog, UsersDialog
@@ -50,11 +51,6 @@ COL_DONE, COL_TIME, COL_ITEMS, COL_RECIPIENT, COL_PHONE, COL_ADDRESS, \
 
 REMINDER_CHECK_MS = 30_000
 
-DELIVERED_BG = QColor("#e3f4e4")
-DELIVERED_FG = QColor("#1b1f1b")  # тёмный текст на светло-зелёной строке — читается при любой теме
-PENDING_DAY_BG = QColor("#ffe0b2")  # в этот день есть недоставленные
-DONE_DAY_BG = QColor("#c8e6c9")  # всё доставлено
-WATER_COLORS = {"planned": "#1e88e5", "done": "#1e88e5", "missed": "#c62828"}
 WATER_REMIND_AFTER = timedelta(hours=4)  # через сколько после начала смены напомнить про воду
 BACKUP_EVERY = timedelta(hours=24)
 ANNOUNCE_FOR = timedelta(days=7)  # сколько дней новое объявление всплывает тем, кто его не прочитал
@@ -78,7 +74,7 @@ class ShiftCalendar(QCalendarWidget):
         if water:
             painter.save()
             painter.setRenderHint(QPainter.Antialiasing)
-            color = QColor("white" if qdate == self.selectedDate() else WATER_COLORS[water])
+            color = QColor("white" if qdate == self.selectedDate() else (C.red if water == "missed" else C.blue))
             painter.setPen(QPen(color, 1.5))
             painter.setBrush(color if water != "planned" else Qt.NoBrush)
             size = max(6, min(rect.width(), rect.height()) // 6)
@@ -95,7 +91,7 @@ class ShiftCalendar(QCalendarWidget):
         if qdate == self.selectedDate():
             painter.setPen(QColor("white"))  # на синей подсветке выбранного дня
         else:
-            painter.setPen(QColor("#c62828" if problem else "#546e7a"))
+            painter.setPen(QColor(C.red if problem else C.shift_name))
         area = rect.adjusted(2, 0, -2, -1)
         text = painter.fontMetrics().elidedText(names, Qt.ElideRight, area.width())
         painter.drawText(area, Qt.AlignHCenter | Qt.AlignBottom, text)
@@ -155,14 +151,8 @@ class MainWindow(QMainWindow):
         self.calendar.currentPageChanged.connect(lambda *_: self.refresh_month())
         left.addWidget(self.calendar)
 
-        legend = QLabel(
-            "<span style='background:#ffe0b2'>&nbsp;&nbsp;&nbsp;&nbsp;</span> есть недоставленные"
-            " &nbsp; <span style='background:#c8e6c9'>&nbsp;&nbsp;&nbsp;&nbsp;</span> всё доставлено"
-            "<br><span style='color:#1e88e5'>○</span> поменять воду &nbsp; "
-            "<span style='color:#1e88e5'>●</span> воду поменяли &nbsp; "
-            "<span style='color:#c62828'>●</span> не поменяли"
-        )
-        left.addWidget(legend)
+        self.legend = QLabel()
+        left.addWidget(self.legend)
 
         today_btn = QPushButton("Сегодня")
         today_btn.clicked.connect(self.go_today)
@@ -460,11 +450,11 @@ class MainWindow(QMainWindow):
         done = self.db.water_change(day)
         if done:
             who, when = done
-            self.water_label.setText(f"<span style='color:#1e88e5'>💧 Вода поменяна</span> — "
+            self.water_label.setText(f"<span style='color:{C.blue}'>💧 Вода поменяна</span> — "
                                      f"{who or '—'}, {when:%H:%M}")
             self.water_btn.setVisible(False)
         else:
-            self.water_label.setText("<b style='color:#1e88e5'>💧 Сегодня день смены воды</b>")
+            self.water_label.setText(f"<b style='color:{C.blue}'>💧 Сегодня день смены воды</b>")
             self.water_btn.setVisible(self.shift is not None or self.user.is_admin)
 
     def mark_water(self):
@@ -660,7 +650,7 @@ class MainWindow(QMainWindow):
     def _update_ann_button(self):
         count = len(self._unread())
         self.ann_btn.setText(f"📢 Объявления ({count})" if count else "📢 Объявления")
-        self.ann_btn.setStyleSheet("font-weight: bold; color: #c62828" if count else "")
+        self.ann_btn.setStyleSheet(f"font-weight: bold; color: {C.red}" if count else "")
 
     def _on_announcements(self, ids: list):
         for item in self.db.announcements(limit=len(ids) + 5):
@@ -686,6 +676,13 @@ class MainWindow(QMainWindow):
 
     def open_announcements(self):
         HistoryDialog(self, self.db, self.user).exec()
+        self._update_ann_button()
+
+    def apply_theme(self):
+        """Переключить тему сразу, без перезапуска: палитра + перерисовать свои подсветки."""
+        theme.apply(QApplication.instance(), theme_mode())
+        self.refresh_all()
+        self.update_shift_box()
         self._update_ann_button()
 
     def after_restore(self):
@@ -728,6 +725,12 @@ class MainWindow(QMainWindow):
 
     def refresh_month(self):
         year, month = self.calendar.yearShown(), self.calendar.monthShown()
+        self.legend.setText(
+            f"<span style='background:{C.pending_day}'>&nbsp;&nbsp;&nbsp;&nbsp;</span> есть недоставленные"
+            f" &nbsp; <span style='background:{C.done_day}'>&nbsp;&nbsp;&nbsp;&nbsp;</span> всё доставлено"
+            f"<br><span style='color:{C.blue}'>○</span> поменять воду &nbsp; "
+            f"<span style='color:{C.blue}'>●</span> воду поменяли &nbsp; "
+            f"<span style='color:{C.red}'>●</span> не поменяли")
 
         for qd in self._marked_days:
             self.calendar.setDateTextFormat(qd, QTextCharFormat())
@@ -736,7 +739,7 @@ class MainWindow(QMainWindow):
         for day, (count, delivered) in self.db.counts_for_month(year, month).items():
             fmt = QTextCharFormat()
             fmt.setFontWeight(QFont.Bold)
-            fmt.setBackground(QBrush(DONE_DAY_BG if delivered == count else PENDING_DAY_BG))
+            fmt.setBackground(QBrush(QColor(C.done_day if delivered == count else C.pending_day)))
             fmt.setToolTip(f"Доставок: {count}, доставлено: {delivered}")
             qd = QDate(day.year, day.month, day.day)
             self.calendar.setDateTextFormat(qd, fmt)
@@ -811,11 +814,11 @@ class MainWindow(QMainWindow):
                 cells[col].setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
             for col, item in cells.items():
                 if d.delivered:
-                    item.setBackground(DELIVERED_BG)
-                    item.setForeground(DELIVERED_FG)
+                    item.setBackground(QColor(C.delivered_bg))
+                    item.setForeground(QColor(C.delivered_fg))
                 self.table.setItem(row, col, item)
             if d.remainder < 0:
-                cells[COL_REST].setForeground(QColor("#c62828"))
+                cells[COL_REST].setForeground(QColor(C.red))
         self.table.resizeRowsToContents()
         self._loading = False
 
