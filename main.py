@@ -2,6 +2,7 @@
 
 import os
 import sys
+import time
 
 from PySide6.QtCore import QLibraryInfo, QLocale, QStandardPaths, QTranslator
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
@@ -9,21 +10,30 @@ from PySide6.QtWidgets import QApplication, QMessageBox
 
 from app.db import Database
 from app.main_window import MainWindow
+from app.updater import cleanup_old
 
 APP_FOLDER = "Доставки цветов"
 INSTANCE_NAME = "FlowerDeliveries-single-instance"
 
 
-def notify_running_instance() -> bool:
-    """Если программа уже запущена — попросить её показать окно и вернуть True."""
+def notify_running_instance(message: bytes = b"show") -> bool:
+    """Если программа уже запущена — отправить ей сообщение и вернуть True."""
     socket = QLocalSocket()
     socket.connectToServer(INSTANCE_NAME)
     if not socket.waitForConnected(500):
         return False
-    socket.write(b"show")
-    socket.waitForBytesWritten(500)
+    if message:
+        socket.write(message)
+        socket.waitForBytesWritten(500)
     socket.disconnectFromServer()
     return True
+
+
+def wait_for_previous_instance(seconds: float = 10):
+    """После обновления старая копия ещё закрывается — дождаться, пока она уйдёт."""
+    deadline = time.monotonic() + seconds
+    while notify_running_instance(b"") and time.monotonic() < deadline:
+        time.sleep(0.25)
 
 
 def data_path() -> str:
@@ -40,6 +50,10 @@ def main():
     app.setStyle("Fusion")
     app.setQuitOnLastWindowClosed(False)  # при закрытии окна остаёмся в трее ради напоминаний
 
+    if getattr(sys, "frozen", False):
+        cleanup_old(sys.executable)  # остатки прежней версии после обновления
+    if "--updated" in sys.argv:
+        wait_for_previous_instance()
     if notify_running_instance():
         return 0
 
@@ -64,7 +78,12 @@ def main():
 
     QLocalServer.removeServer(INSTANCE_NAME)  # остаток после аварийного завершения
     server = QLocalServer()
-    server.newConnection.connect(lambda: (server.nextPendingConnection(), window.show_window()))
+
+    def on_connection():
+        sock = server.nextPendingConnection()
+        sock.readyRead.connect(lambda: window.show_window() if bytes(sock.readAll()) == b"show" else None)
+
+    server.newConnection.connect(on_connection)
     server.listen(INSTANCE_NAME)
     code = app.exec()
     db.close()

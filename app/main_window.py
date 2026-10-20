@@ -17,6 +17,7 @@ from .delivery_dialog import DeliveryDialog, money
 from .icon import flower_icon
 from .messaging import KINDS, SHORT, build_action, render
 from .templates_dialog import TemplatesDialog, load_templates
+from .update_ui import UpdateController
 from .reminders import due_reminders, reminder_key
 from .users_dialog import LoginDialog, PasswordDialog, UserFormDialog, UsersDialog
 
@@ -90,7 +91,7 @@ class MainWindow(QMainWindow):
         self.calendar.setFirstDayOfWeek(Qt.Monday)
         self.calendar.setGridVisible(True)
         self.calendar.setVerticalHeaderFormat(QCalendarWidget.NoVerticalHeader)
-        self.calendar.setMinimumSize(420, 340)
+        self.calendar.setMinimumSize(420, 300)
         self.calendar.selectionChanged.connect(self.refresh_day)
         self.calendar.currentPageChanged.connect(lambda *_: self.refresh_month())
         left.addWidget(self.calendar)
@@ -112,6 +113,8 @@ class MainWindow(QMainWindow):
         month_layout.addWidget(self.month_label)
         left.addWidget(self.month_box)
         left.addWidget(self._build_reminder_box())
+        self.updater = UpdateController(self)
+        left.addWidget(self.updater.build_box())
         left.addStretch(1)
 
         # Правая часть: доставки за день
@@ -218,8 +221,8 @@ class MainWindow(QMainWindow):
         self.autostart_check.toggled.connect(self._set_autostart)
         form.addRow(self.autostart_check)
 
-        hint = QLabel("Напоминания приходят, пока программа запущена. "
-                      "Крестик сворачивает её к часам, выход — через значок у часов.")
+        hint = QLabel("Приходят, пока программа запущена. Крестик сворачивает её "
+                      "к часам, выход — через значок у часов.")
         hint.setWordWrap(True)
         hint.setStyleSheet("color: gray")
         form.addRow(hint)
@@ -321,6 +324,7 @@ class MainWindow(QMainWindow):
         self.raise_()
         self.activateWindow()
         self.refresh_all()
+        self.updater.show_pending()
 
     def quit_app(self):
         self._really_quit = True

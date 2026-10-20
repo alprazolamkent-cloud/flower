@@ -125,6 +125,7 @@ class UserError(Exception):
 
 class Database:
     def __init__(self, path: str):
+        self.path = path
         self.conn = sqlite3.connect(path)
         self.conn.executescript(SCHEMA)
         existing = {r[1] for r in self.conn.execute("PRAGMA table_info(deliveries)")}
@@ -135,6 +136,14 @@ class Database:
 
     def close(self):
         self.conn.close()
+
+    def backup(self, path: str):
+        """Целостная копия базы (даже если с ней сейчас работают)."""
+        dest = sqlite3.connect(path)
+        try:
+            self.conn.backup(dest)
+        finally:
+            dest.close()
 
     def add(self, d: Delivery) -> int:
         cur = self.conn.execute(
