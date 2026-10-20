@@ -5,7 +5,7 @@ import threading
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
 
 from PySide6.QtCore import QObject, QSettings, QTimer, Signal
 
@@ -16,18 +16,20 @@ API = "https://api.telegram.org/bot{token}/{method}"
 TIMEOUT = 15
 FLUSH_EVERY_MS = 60_000
 MAX_TEXT = 4000  # предел Telegram — 4096 знаков
-POLL_EVERY_MS = 30_000
+POLL_EVERY_MS = 30_000  # запасной таймер: если опрос оборвался, запустить заново
+LONG_POLL = 25  # секунд ожидания новых сообщений за один запрос
+STALE_COMMAND = timedelta(minutes=15)  # команду старше этого не выполняем (программа была выключена)
 
 
 class TelegramError(Exception):
     pass
 
 
-def _call(token: str, method: str, params: dict | None = None) -> dict:
+def _call(token: str, method: str, params: dict | None = None, timeout: float = TIMEOUT) -> dict:
     data = urllib.parse.urlencode(params or {}).encode()
     req = urllib.request.Request(API.format(token=token.strip(), method=method), data=data)
     try:
-        with urllib.request.urlopen(req, timeout=TIMEOUT) as response:
+        with urllib.request.urlopen(req, timeout=timeout) as response:
             payload = json.load(response)
     except urllib.error.HTTPError as e:
         try:
@@ -61,11 +63,20 @@ def find_chats(token: str) -> list[tuple[str, str]]:
 ANNOUNCE_PREFIX = "!"
 
 
-def get_updates(token: str, offset: int | None) -> list[dict]:
-    params = {"timeout": 0}
+def get_updates(token: str, offset: int | None, wait: int = LONG_POLL) -> list[dict]:
+    """Новые сообщения. wait — сколько секунд Telegram держит запрос, если новых нет:
+    ответ на команду приходит почти сразу, а не через полминуты."""
+    params = {"timeout": wait}
     if offset is not None:
         params["offset"] = offset  # подтверждает получение всего, что раньше
-    return _call(token, "getUpdates", params).get("result", [])
+    return _call(token, "getUpdates", params, timeout=wait + 15).get("result", [])
+
+
+def register_commands(token: str):
+    """Меню команд бота (кнопка «/» в Telegram)."""
+    from .bot_commands import MENU
+    _call(token, "setMyCommands", {"commands": json.dumps(
+        [{"command": name, "description": text} for name, text in MENU], ensure_ascii=False)})
 
 
 def parse_announcements(updates: list[dict], chat_id: str) -> list[tuple[int, str, datetime]]:
@@ -153,7 +164,7 @@ def not_closed_text(shift: Shift) -> str:
 # ----- отправка в фоне -----
 
 class TelegramInbox(QObject):
-    """Раз в полминуты забирает новые сообщения бота и сохраняет объявления хозяина."""
+    """Слушает бота: объявления хозяина («!…») и команды («/касса»). Опрос не прерывается."""
 
     fetched = Signal(list, str)  # (обновления, текст ошибки) — из фонового потока
     arrived = Signal(list)  # id новых объявлений — для главного окна
@@ -162,6 +173,9 @@ class TelegramInbox(QObject):
         super().__init__(parent)
         self.db = db
         self.busy = False
+        self.handler = None  # (текст) -> ответ или None; задаёт главное окно
+        self.reply = None  # (текст ответа) -> None; задаёт главное окно
+        self._registered_token = ""
         self.fetched.connect(self._on_fetched)
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.poll)
@@ -181,24 +195,58 @@ class TelegramInbox(QObject):
 
     def _fetch(self, token: str, offset: int | None):
         try:
+            if self._registered_token != token:
+                try:
+                    register_commands(token)
+                    self._registered_token = token
+                except TelegramError:
+                    pass  # меню — удобство, без него команды всё равно работают
             self.fetched.emit(get_updates(token, offset), "")
         except TelegramError as e:
             self.fetched.emit([], str(e))
 
+    def _schedule_next(self, delay_ms: int):
+        QTimer.singleShot(delay_ms, self.poll)
+
     def _on_fetched(self, updates: list, error: str):
         self.busy = False
         if error:
+            self._schedule_next(15_000)  # нет связи — не долбить сервер
             return
+        self._schedule_next(200)  # сразу ждём следующие сообщения
         first_time = self._offset() is None
         offset = max((u["update_id"] for u in updates), default=-1) + 1
         if updates or first_time:  # 0 — «подключились, старых сообщений не было»
             QSettings("FlowerDeliveries", "FlowerDeliveries").setValue("tg_offset", offset)
         if first_time:
             return  # старые сообщения, написанные до подключения (например «привет»), не показываем
-        new_ids = [i for update_id, text, date in parse_announcements(updates, settings()["chat_id"])
+        chat_id = settings()["chat_id"]
+        new_ids = [i for update_id, text, date in parse_announcements(updates, chat_id)
                    if (i := self.db.add_announcement(text, date, update_id)) is not None]
         if new_ids:
             self.arrived.emit(new_ids)
+        if self.handler is not None and self.reply is not None:
+            self._answer_commands(updates, chat_id)
+
+    def _answer_commands(self, updates: list, chat_id: str):
+        stale = False
+        for update in updates:
+            message = update.get("message") or {}
+            if str((message.get("chat") or {}).get("id")) != str(chat_id):
+                continue  # чужой человек — игнорируем
+            text = (message.get("text") or "").strip()
+            if not text or text.startswith(ANNOUNCE_PREFIX):
+                continue
+            sent = datetime.fromtimestamp(message.get("date", 0))
+            if datetime.now() - sent > STALE_COMMAND:
+                stale = stale or text.startswith("/")
+                continue  # пока программа не работала, ничего не выполняем
+            answer = self.handler(text)
+            if answer:
+                self.reply(answer)
+        if stale:
+            self.reply("Программа была выключена или без интернета и пропустила часть команд. "
+                       "Повторите, если они ещё нужны.")
 
 
 class TelegramSender(QObject):
@@ -251,3 +299,5 @@ class TelegramSender(QObject):
                 self.db.mark_message_sent(message_id, datetime.now())
                 self.last_error = ""
         self.busy = False
+        if not any(error for _, error in results) and self.db.unsent_messages(limit=1):
+            QTimer.singleShot(300, self.flush)  # пока отправляли, пришли новые — не ждать минуту

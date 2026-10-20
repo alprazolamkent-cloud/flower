@@ -255,8 +255,9 @@ def test_inbox_skips_old_messages_on_first_connect(db, monkeypatch):
     monkeypatch.setattr(QSettings, "value", lambda self, key, default=None: store.get(key, default))
     monkeypatch.setattr(QSettings, "setValue", lambda self, key, value: store.__setitem__(key, value))
     monkeypatch.setattr(telegram, "settings", lambda: {"token": "t", "chat_id": "777", "on_start": True, "on_close": True})
+    monkeypatch.setattr(telegram.QTimer, "singleShot", lambda *a: None)
     inbox = telegram.TelegramInbox.__new__(telegram.TelegramInbox)  # без таймера и потоков
-    inbox.db, inbox.busy = db, False
+    inbox.db, inbox.busy, inbox.handler, inbox.reply = db, False, None, None
     arrived = []
     inbox.arrived = type("S", (), {"emit": lambda self, ids: arrived.append(ids)})()
 

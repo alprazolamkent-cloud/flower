@@ -20,6 +20,8 @@ from .icon import flower_icon
 from .messaging import KINDS, SHORT, build_action, render
 from . import backup, telegram, theme
 from .announcements_dialog import HistoryDialog, UnreadDialog, short
+from .bot_commands import BotContext, BotHandler, chunk
+from .version import VERSION
 from .duties_dialog import ChecklistDialog
 from .settings_dialog import (
     SettingsDialog, backup_dir, backup_keep, grace_minutes, last_backup, lead_minutes, salary_rules,
@@ -127,6 +129,9 @@ class MainWindow(QMainWindow):
         self.telegram = telegram.TelegramSender(db, self)
         self.inbox = telegram.TelegramInbox(db, self)
         self.inbox.arrived.connect(self._on_announcements)
+        self.bot = BotHandler()
+        self.inbox.handler = lambda text: self.bot.handle(text, self._bot_context())
+        self.inbox.reply = self._bot_reply
         self.settings = QSettings("FlowerDeliveries", "FlowerDeliveries")
 
         self.setWindowTitle("Доставки цветов")
@@ -622,23 +627,46 @@ class MainWindow(QMainWindow):
                 QSystemTrayIcon.Information, 5000,
             )
 
+    def _bot_context(self) -> BotContext:
+        return BotContext(
+            db=self.db, now=datetime.now(), change=shift_change(), grace=grace_minutes(),
+            water=water_schedule(), rules=salary_rules, version=VERSION, last_backup=last_backup(),
+            backup_now=self._bot_backup)
+
+    def _bot_reply(self, text: str):
+        for part in chunk(text):
+            self.telegram.queue(part)
+
+    def _bot_backup(self) -> str:
+        """Копия по команде из Telegram: что получилось, одним сообщением."""
+        result = self.run_backup()
+        if result is None:
+            return "Копию сделать не удалось."
+        text = "Копия сделана на компьютере"
+        if result.extra:
+            text += " и на флешке / в папке"
+        if result.extra_error:
+            text += f". На флешку не получилось: {result.extra_error}"
+        return text + "."
+
     def run_backup(self):
-        """Копия базы на компьютер и, если настроено, на флешку."""
+        """Копия базы на компьютер и, если настроено, на флешку. Возвращает результат или None."""
         if self.db.path == ":memory:":
-            return
+            return None
         now = datetime.now()
         try:
             result = backup.make_backups(self.db, backup_dir(), backup_keep(), now)
         except Exception as e:  # noqa: BLE001 — копия не должна мешать работе
             self.tray.showMessage("Резервная копия", f"Не удалось сделать копию: {e}",
                                   QSystemTrayIcon.Warning, 30_000)
-            return
+            return None
         set_last_backup(now)
         if result.extra_error and self._backup_warned != now.date():
             self._backup_warned = now.date()
             self.tray.showMessage("Резервная копия",
                                   f"На флешку не скопировано ({result.extra_error}). "
                                   "Копия сохранена только на компьютере.", QSystemTrayIcon.Warning, 30_000)
+        return result
 
     # ----- объявления -----
 
