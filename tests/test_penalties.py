@@ -5,6 +5,7 @@ import sys
 from datetime import date, datetime, time, timedelta
 
 import pytest
+import shiboken6
 from PySide6.QtCore import QSettings
 from PySide6.QtWidgets import QApplication
 
@@ -199,10 +200,11 @@ def test_settings_catalog_and_rules(monkeypatch):
     assert settings_dialog.salary_rules().writeoff_base == "total"  # неизвестное значение — безопасный вариант
 
 
-def test_catalog_editor_keeps_ids(monkeypatch):
+def test_catalog_editor_keeps_ids(monkeypatch, request):
     from app.salary_dialog import PenaltyCatalogEditor
     app = QApplication.instance() or QApplication(sys.argv)
     editor = PenaltyCatalogEditor(KINDS)
+    request.addfinalizer(lambda: shiboken6.delete(editor))  # иначе виджет умирает после приложения и роняет выход
     editor.max_used_id = 6  # номера 5 и 6 когда-то были и убраны — их не отдаём
     editor.table.removeRow(0)  # убрали санкцию 1
     editor._add_row(None, "Опоздал", 300)
