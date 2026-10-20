@@ -2,6 +2,7 @@
 
 import calendar
 import html
+from collections.abc import Callable
 from datetime import date, datetime, time
 
 from PySide6.QtCore import Qt
@@ -428,10 +429,11 @@ class CabinetDialog(QDialog):
     """Личный кабинет: смены и итоги за месяц. Админ может смотреть любого сотрудника или всех."""
 
     def __init__(self, parent, db: Database, user: User, change: time, grace: int, year: int, month: int,
-                 water: WaterSchedule | None = None, rules: SalaryRules | None = None):
+                 water: WaterSchedule | None = None,
+                 rules: Callable[[int], SalaryRules] | None = None):
         super().__init__(parent)
         self.db, self.user, self.change, self.grace, self.water = db, user, change, grace, water
-        self.rules = rules
+        self.rules = rules  # правила зарплаты для сотрудника (у кого-то могут быть свои ступени)
         self.year, self.month = year, month
         self.shifts: list[Shift] = []
         self.setWindowTitle("Личный кабинет")
@@ -622,23 +624,46 @@ class CabinetDialog(QDialog):
             for u in self.db.users():
                 shifts = [s for s in self.shifts if s.user_id == u.id]
                 if shifts:
-                    sal = calculate(shifts, self.db.adjustments(u.id, self.month_key()), self.rules)
+                    sal = calculate(shifts, self.db.adjustments(u.id, self.month_key()), self.rules(u.id))
                     lines.append(f"{u.name or u.login}: <b>{money(sal.total)}</b>")
             self.salary_label.setText(" &nbsp;·&nbsp; ".join(lines) or "Смен за месяц нет.")
             return
-        sal = calculate(self.shifts, self.db.adjustments(person, self.month_key()), self.rules)
-        parts = [f"Смены: {sal.shifts} × {money(self.rules.shift_rate)} = {money(sal.base)}"]
-        if self.rules.flowers_percent:
-            parts.append(f"Цветы: {money(sal.flowers)} × {self.rules.flowers_percent:g}% = {money(sal.percent_part)}")
+        rules = self.rules(person)
+        sal = calculate(self.shifts, self.db.adjustments(person, self.month_key()), rules)
+        parts = [f"Смены: {sal.shifts} × {money(rules.shift_rate)} = {money(sal.base)}"]
+        bonus_line = self._bonus_text(sal, rules)
         if sal.shortage:
             parts.append(f"<span style='color:{C.red}'>Недостача: −{money(sal.shortage)}</span>")
         for a in sal.adjustments:
             sign = "+" if a.amount > 0 else "−"
             parts.append(f"{_html(a.reason)}: {sign}{money(abs(a.amount))}")
-        text = " &nbsp;·&nbsp; ".join(parts) + f"<br><b style='font-size:15px'>Итого: {money(sal.total)}</b>"
+        text = " &nbsp;·&nbsp; ".join(parts)
+        if bonus_line:
+            text += "<br>" + bonus_line
+        text += f"<br><b style='font-size:15px'>Итого: {money(sal.total)}</b>"
         if sal.not_closed:
             text += f" &nbsp;<span style='color:{C.gray}'>(несданные смены не учтены: {sal.not_closed})</span>"
         self.salary_label.setText(text)
+
+    @staticmethod
+    def _bonus_text(sal, rules: SalaryRules) -> str:
+        """Строка про премию: средний приход, достигнутая ступень и сколько до следующей."""
+        if not rules.active_tiers():
+            return ""
+        avg = money(round(sal.average))
+        text = f"Приход: {money(sal.revenue)}, в среднем {avg} за смену"
+        if sal.tier is None:
+            text += (f" — <span style='color:{C.red}'>план не выполнен (нужно от {money(sal.plan)}), "
+                     "премии нет</span>")
+        else:
+            source = "со сверх плана " if rules.above_plan_only else ""
+            text += (f" → ступень «от {money(sal.tier.per_shift)}»: <b style='color:{C.green}'>"
+                     f"{sal.tier.percent:g}% {source}с {money(sal.bonus_base)} = {money(sal.bonus)}</b>")
+        if sal.next_tier is not None and sal.shifts:
+            short = money(round(sal.next_tier.per_shift - sal.average))
+            text += (f"<br><span style='color:{C.gray}'>До ступени «от {money(sal.next_tier.per_shift)}» "
+                     f"({sal.next_tier.percent:g}%) не хватает {short} в среднем за смену</span>")
+        return text
 
     def _adjust(self):
         person = self.person_box.currentData()

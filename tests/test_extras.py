@@ -7,7 +7,7 @@ import pytest
 
 from app import backup, telegram
 from app.db import Database, Delivery, UserError
-from app.salary import SalaryRules, calculate
+from app.salary import SalaryRules, Tier, calculate
 
 CH = time(8, 0)
 
@@ -69,21 +69,38 @@ def _closed_shift(db, user, day, closing, cash_sales, flowers):
 
 def test_salary_calculation(db):
     anna = db.add_user("anna", "Анна", "1")
-    _closed_shift(db, anna, date(2026, 10, 1), 10000, 10000, 30000)  # сходится
-    _closed_shift(db, anna, date(2026, 10, 3), 9700, 10000, 20000)  # недостача 300
+    _closed_shift(db, anna, date(2026, 10, 1), 10000, 10000, 30000)  # сходится, приход 30 000
+    _closed_shift(db, anna, date(2026, 10, 3), 9700, 10000, 20000)  # недостача 300, приход 20 000
     db.open_shift(anna.id, 0, datetime(2026, 10, 5, 8, 0), CH)  # не сдана
     db.add_adjustment(anna.id, "2026-10", -5000, "аванс", None, datetime(2026, 10, 10, 12, 0))
     db.add_adjustment(anna.id, "2026-10", 1000, "премия", None, datetime(2026, 10, 15, 12, 0))
     db.add_adjustment(anna.id, "2026-11", -9999, "другой месяц", None, datetime(2026, 11, 1, 12, 0))
 
     shifts = db.shifts_between(date(2026, 10, 1), date(2026, 10, 31), anna.id)
-    sal = calculate(shifts, db.adjustments(anna.id, "2026-10"), SalaryRules(2000, 5, True))
-    assert (sal.shifts, sal.base, sal.flowers, sal.percent_part) == (2, 4000, 50000, 2500)
+    tiers = [Tier(30000, 7), Tier(20000, 3), Tier(25000, 5)]  # порядок не важен
+    sal = calculate(shifts, db.adjustments(anna.id, "2026-10"), SalaryRules(2000, tiers, False, True))
+    assert (sal.shifts, sal.base, sal.revenue, sal.average) == (2, 4000, 50000, 25000)
+    assert sal.tier == Tier(25000, 5) and sal.next_tier == Tier(30000, 7) and sal.plan == 20000
+    assert (sal.bonus_base, sal.bonus) == (50000, 2500)  # 5% со всего прихода
     assert (sal.shortage, sal.not_closed, sal.adjustments_total) == (300, 1, -4000)
     assert sal.total == 4000 + 2500 - 300 - 4000
 
-    no_deduct = calculate(shifts, [], SalaryRules(2000, 5, False))
-    assert no_deduct.shortage == 0 and no_deduct.total == 6500
+    above = calculate(shifts, [], SalaryRules(2000, tiers, True, False))
+    # сверх плана: 50 000 − 2 смены × 20 000 = 10 000, 5% = 500; недостачу не вычитаем
+    assert (above.bonus_base, above.bonus, above.shortage) == (10000, 500, 0)
+
+
+def test_salary_plan_not_met_and_no_tiers(db):
+    anna = db.add_user("anna", "Анна", "1")
+    _closed_shift(db, anna, date(2026, 10, 1), 0, 0, 18000)
+    shifts = db.shifts_between(date(2026, 10, 1), date(2026, 10, 31), anna.id)
+    sal = calculate(shifts, [], SalaryRules(1500, [Tier(20000, 3), Tier(0, 0)]))
+    assert sal.tier is None and sal.bonus == 0 and sal.next_tier == Tier(20000, 3)  # план не выполнен
+    assert sal.total == 1500
+    flat = calculate(shifts, [], SalaryRules(1500, []))
+    assert flat.bonus == 0 and flat.plan == 0
+    empty = calculate([], [], SalaryRules(1500, [Tier(0, 5)]))
+    assert empty.tier is None and empty.total == 0  # нет смен — нет премии
 
 
 def test_adjustment_validation_and_delete(db):
@@ -251,3 +268,16 @@ def test_inbox_skips_old_messages_on_first_connect(db, monkeypatch):
     store.clear()  # новый бот, а в нём старый «привет» и даже «!» до подключения
     inbox._on_fetched([_update(1, 777, "! написано до подключения")], "")
     assert len(arrived) == 1 and store["tg_offset"] == 2
+
+
+def test_salary_rules_use_employee_tiers(monkeypatch):
+    import json
+    from PySide6.QtCore import QSettings
+    from app import settings_dialog
+    store = {"salary_rate": "2000", "bonus_tiers": json.dumps([[30000, 5]]),
+             "bonus_overrides": json.dumps({"7": [[20000, 3]]}), "bonus_above_plan": "true"}
+    monkeypatch.setattr(QSettings, "value", lambda self, key, default=None: store.get(key, default))
+    assert settings_dialog.salary_rules().tiers == [Tier(30000, 5)]
+    assert settings_dialog.salary_rules(7).tiers == [Tier(20000, 3)]  # свои ступени
+    assert settings_dialog.salary_rules(8).tiers == [Tier(30000, 5)]  # остальным — общие
+    assert settings_dialog.salary_rules(7).above_plan_only and settings_dialog.salary_rules().shift_rate == 2000

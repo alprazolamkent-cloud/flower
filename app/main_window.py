@@ -509,7 +509,7 @@ class MainWindow(QMainWindow):
     def open_cabinet(self):
         CabinetDialog(self, self.db, self.user, shift_change(), grace_minutes(),
                       self.calendar.yearShown(), self.calendar.monthShown(), water_schedule(),
-                      salary_rules()).exec()
+                      salary_rules).exec()
 
     def active_shifts(self) -> list[Shift]:
         """Кто сейчас на смене (или ещё может её сдать)."""

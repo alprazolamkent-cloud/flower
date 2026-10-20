@@ -1,5 +1,6 @@
 """Окно настроек — только для администратора."""
 
+import json
 import os
 import sys
 from datetime import date, datetime, time
@@ -7,7 +8,7 @@ from datetime import date, datetime, time
 from PySide6.QtCore import QDate, QSettings, QTime, QTimer, QUrl
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QDateEdit, QDialog, QDialogButtonBox, QDoubleSpinBox, QFileDialog, QFormLayout,
+    QCheckBox, QComboBox, QDateEdit, QDialog, QDialogButtonBox, QFileDialog, QFormLayout,
     QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPushButton, QSpinBox, QTabWidget,
     QTimeEdit, QVBoxLayout, QWidget,
 )
@@ -15,7 +16,8 @@ from PySide6.QtWidgets import (
 from . import autostart, backup, telegram, theme
 from .db import UserError
 from .duties_dialog import DutiesEditor
-from .salary import SalaryRules
+from .salary import SalaryRules, Tier
+from .salary_dialog import EmployeeTiersDialog, TiersEditor
 from .shifts import DEFAULT_CHANGE, DEFAULT_GRACE_MINUTES, WaterSchedule
 from .templates_dialog import TemplatesDialog
 from .theme import C
@@ -62,10 +64,40 @@ def theme_mode() -> str:
     return mode if mode in theme.THEMES else "light"
 
 
-def salary_rules() -> SalaryRules:
+def _tiers_from(raw) -> list[Tier]:
+    return [Tier(int(a), float(p)) for a, p in raw]
+
+
+def bonus_tiers() -> list[Tier]:
+    try:
+        return _tiers_from(json.loads(str(_settings().value("bonus_tiers", "[]"))))
+    except (ValueError, TypeError):
+        return []
+
+
+def bonus_overrides() -> dict[int, list[Tier]]:
+    """Свои ступени отдельных сотрудников: id сотрудника -> ступени."""
+    try:
+        raw = json.loads(str(_settings().value("bonus_overrides", "{}")))
+        return {int(k): _tiers_from(v) for k, v in raw.items()}
+    except (ValueError, TypeError, AttributeError):
+        return {}
+
+
+def _dump_tiers(tiers: list[Tier]) -> list:
+    return [[t.per_shift, t.percent] for t in tiers]
+
+
+def salary_rules(user_id: int | None = None) -> SalaryRules:
+    """Правила зарплаты; для сотрудника со своими ступенями — его ступени."""
     s = _settings()
-    return SalaryRules(int(s.value("salary_rate", 0)), float(s.value("salary_percent", 0)),
-                       str(s.value("salary_deduct", "true")) == "true")
+    tiers = bonus_overrides().get(user_id) if user_id is not None else None
+    return SalaryRules(
+        shift_rate=int(s.value("salary_rate", 0)),
+        tiers=tiers if tiers is not None else bonus_tiers(),
+        above_plan_only=str(s.value("bonus_above_plan", "false")) == "true",
+        deduct_shortage=str(s.value("salary_deduct", "true")) == "true",
+    )
 
 
 def backup_dir() -> str:
@@ -205,31 +237,51 @@ class SettingsDialog(QDialog):
     def _salary_tab(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
-        box = QGroupBox("Как считать зарплату флориста")
-        form = QFormLayout(box)
         rules = salary_rules()
+
+        base = QGroupBox("Ставка")
+        base_form = QFormLayout(base)
         self.rate_box = QSpinBox()
         self.rate_box.setRange(0, 100_000)
         self.rate_box.setSingleStep(100)
         self.rate_box.setGroupSeparatorShown(True)
         self.rate_box.setSuffix(" ₽")
         self.rate_box.setValue(rules.shift_rate)
-        form.addRow("Ставка за смену:", self.rate_box)
-        self.percent_box = QDoubleSpinBox()
-        self.percent_box.setRange(0, 100)
-        self.percent_box.setDecimals(1)
-        self.percent_box.setSuffix(" %")
-        self.percent_box.setValue(rules.flowers_percent)
-        form.addRow("Процент с продажи цветов:", self.percent_box)
+        base_form.addRow("За каждую сданную смену:", self.rate_box)
         self.deduct_check = QCheckBox("Вычитать недостачу кассы из зарплаты")
         self.deduct_check.setChecked(rules.deduct_shortage)
-        form.addRow(self.deduct_check)
-        form.addRow(_gray_label("Зарплата = смены × ставка + цветы × процент − недостачи ± аванс, премия, штраф.\n"
-                                "Считаются только сданные смены. Зарплату видно в личном кабинете.\n"
-                                "Аванс, премию или штраф добавляйте в кабинете, выбрав сотрудника."))
-        layout.addWidget(box)
+        base_form.addRow(self.deduct_check)
+        layout.addWidget(base)
+
+        bonus = QGroupBox("Премия от прихода — только при выполнении плана")
+        bonus_layout = QVBoxLayout(bonus)
+        bonus_layout.addWidget(_gray_label(
+            "Берётся средний приход сотрудника за смену за месяц (приход ÷ сданные смены).\n"
+            "Срабатывает самая высокая ступень, до которой он дотянул.\n"
+            "Первая ступень — это план: не дотянул до неё — премии нет. Пустые (—) не считаются."))
+        self.tiers_editor = TiersEditor(bonus_tiers())
+        bonus_layout.addWidget(self.tiers_editor)
+        form = QFormLayout()
+        self.above_box = QComboBox()
+        self.above_box.addItem("со всего прихода за месяц", False)
+        self.above_box.addItem("только с прихода сверх плана", True)
+        self.above_box.setCurrentIndex(1 if rules.above_plan_only else 0)
+        form.addRow("Процент считать:", self.above_box)
+        bonus_layout.addLayout(form)
+        self.overrides = bonus_overrides()
+        own = QPushButton("Свои ступени для сотрудника…")
+        own.clicked.connect(self._employee_tiers)
+        bonus_layout.addWidget(own)
+        layout.addWidget(bonus)
+        layout.addWidget(_gray_label("Зарплата = смены × ставка + премия − недостачи ± аванс, премия, штраф.\n"
+                                     "Аванс, премию или штраф добавляйте в личном кабинете, выбрав сотрудника."))
         layout.addStretch(1)
         return page
+
+    def _employee_tiers(self):
+        dlg = EmployeeTiersDialog(self, self.db, self.tiers_editor.tiers(), self.overrides)
+        if dlg.exec() == QDialog.Accepted:
+            self.overrides = dlg.overrides
 
     def _telegram_tab(self) -> QWidget:
         page = QWidget()
@@ -423,8 +475,11 @@ class SettingsDialog(QDialog):
         settings.setValue("water_every", self.water_every.value())
         settings.setValue("water_anchor", self.water_anchor.date().toString("yyyy-MM-dd"))
         settings.setValue("salary_rate", self.rate_box.value())
-        settings.setValue("salary_percent", self.percent_box.value())
         settings.setValue("salary_deduct", _bool(self.deduct_check.isChecked()))
+        settings.setValue("bonus_tiers", json.dumps(_dump_tiers(self.tiers_editor.tiers())))
+        settings.setValue("bonus_above_plan", _bool(self.above_box.currentData()))
+        settings.setValue("bonus_overrides", json.dumps(
+            {str(uid): _dump_tiers(tiers) for uid, tiers in self.overrides.items()}))
         if self.token_edit.text().strip() != telegram.settings()["token"]:
             settings.remove("tg_offset")  # другой бот — читать его сообщения с начала
         settings.setValue("tg_token", self.token_edit.text().strip())
