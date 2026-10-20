@@ -121,9 +121,9 @@ def test_outbox_dedup_and_sent(db):
     assert not db.queue_message("привет ещё раз", datetime(2026, 10, 20, 9, 1), key="not_closed:1")
     db.queue_message("без ключа", datetime(2026, 10, 20, 9, 2))
     items = db.unsent_messages()
-    assert [t for _, t in items] == ["привет", "без ключа"]
+    assert [t for _, t, _ in items] == ["привет", "без ключа"]
     db.mark_message_sent(items[0][0], datetime(2026, 10, 20, 9, 3))
-    assert [t for _, t in db.unsent_messages()] == ["без ключа"]
+    assert [t for _, t, _ in db.unsent_messages()] == ["без ключа"]
 
 
 def test_shift_closed_text(db):
@@ -205,11 +205,12 @@ def test_cannot_delete_user_during_shift(db):
 
 def test_long_telegram_text_is_shortened(db, monkeypatch):
     monkeypatch.setattr(telegram, "configured", lambda: True)
+    monkeypatch.setattr(telegram, "settings", lambda: {"chats": ["777"]})
     sender = telegram.TelegramSender.__new__(telegram.TelegramSender)  # без таймера Qt
     sender.db = db
     monkeypatch.setattr(telegram.QTimer, "singleShot", lambda *a: None)
     sender.queue("x" * 10_000)
-    [(_, text)] = db.unsent_messages()
+    [(_, text, _chat)] = db.unsent_messages()
     assert len(text) <= telegram.MAX_TEXT
 
 
@@ -254,7 +255,7 @@ def test_inbox_skips_old_messages_on_first_connect(db, monkeypatch):
     store = {}
     monkeypatch.setattr(QSettings, "value", lambda self, key, default=None: store.get(key, default))
     monkeypatch.setattr(QSettings, "setValue", lambda self, key, value: store.__setitem__(key, value))
-    monkeypatch.setattr(telegram, "settings", lambda: {"token": "t", "chat_id": "777", "on_start": True, "on_close": True})
+    monkeypatch.setattr(telegram, "settings", lambda: {"token": "t", "chat_id": "777", "chats": ["777"], "on_start": True, "on_close": True})
     monkeypatch.setattr(telegram.QTimer, "singleShot", lambda *a: None)
     inbox = telegram.TelegramInbox.__new__(telegram.TelegramInbox)  # без таймера и потоков
     inbox.db, inbox.busy, inbox.handler, inbox.reply = db, False, None, None

@@ -136,6 +136,11 @@ CREATE TABLE IF NOT EXISTS telegram_outbox (
     created_at TEXT NOT NULL,
     sent_at    TEXT
 );
+CREATE TABLE IF NOT EXISTS telegram_chats (
+    chat_id   TEXT PRIMARY KEY,
+    title     TEXT NOT NULL DEFAULT '',
+    last_seen TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS duties (
     id       INTEGER PRIMARY KEY AUTOINCREMENT,
     text     TEXT    NOT NULL,
@@ -256,6 +261,9 @@ class Database:
         for column, sql in SHIFT_MIGRATIONS.items():
             if column not in existing:
                 self.conn.execute(sql)
+        existing = {r[1] for r in self.conn.execute("PRAGMA table_info(telegram_outbox)")}
+        if "chat_id" not in existing:  # очередь, созданная до поддержки нескольких чатов
+            self.conn.execute("ALTER TABLE telegram_outbox ADD COLUMN chat_id TEXT")
         self.conn.commit()
 
     def close(self):
@@ -606,17 +614,33 @@ class Database:
 
     # ----- очередь сообщений в Telegram -----
 
-    def queue_message(self, text: str, now: datetime, key: str | None = None) -> bool:
-        """Поставить сообщение в очередь. С тем же key второй раз не ставится. True — поставлено."""
+    def queue_message(self, text: str, now: datetime, key: str | None = None, chat: str | None = None) -> bool:
+        """Поставить сообщение в очередь для одного чата. С тем же key второй раз не ставится.
+        chat=None — только у старых сообщений до появления нескольких чатов: уйдёт во все. True — поставлено."""
         cur = self.conn.execute(
-            "INSERT OR IGNORE INTO telegram_outbox (key, text, created_at) VALUES (?, ?, ?)",
-            (key, text, _ts(now)))
+            "INSERT OR IGNORE INTO telegram_outbox (key, text, created_at, chat_id) VALUES (?, ?, ?, ?)",
+            (key, text, _ts(now), chat))
         self.conn.commit()
         return cur.rowcount > 0
 
-    def unsent_messages(self, limit: int = 20) -> list[tuple[int, str]]:
+    def unsent_messages(self, limit: int = 20) -> list[tuple[int, str, str | None]]:
+        """Неотправленные: (id, текст, чат или None — всем)."""
         return self.conn.execute(
-            "SELECT id, text FROM telegram_outbox WHERE sent_at IS NULL ORDER BY id LIMIT ?", (limit,)).fetchall()
+            "SELECT id, text, chat_id FROM telegram_outbox WHERE sent_at IS NULL ORDER BY id LIMIT ?",
+            (limit,)).fetchall()
+
+    def remember_chat(self, chat_id: str, title: str, now: datetime):
+        """Кто писал боту (в том числе посторонние) — чтобы хозяин мог выбрать своих в настройках."""
+        self.conn.execute(
+            "INSERT INTO telegram_chats (chat_id, title, last_seen) VALUES (?, ?, ?)"
+            " ON CONFLICT (chat_id) DO UPDATE SET title = excluded.title, last_seen = excluded.last_seen",
+            (str(chat_id), title, _ts(now)))
+        self.conn.commit()
+
+    def seen_chats(self) -> list[tuple[str, str]]:
+        """[(chat_id, имя)] — сначала писавшие недавно."""
+        return self.conn.execute(
+            "SELECT chat_id, title FROM telegram_chats ORDER BY last_seen DESC, chat_id").fetchall()
 
     def mark_message_sent(self, message_id: int, now: datetime):
         self.conn.execute("UPDATE telegram_outbox SET sent_at=? WHERE id=?", (_ts(now), message_id))

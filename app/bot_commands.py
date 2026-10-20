@@ -471,18 +471,19 @@ class Pending:
 class BotHandler:
     """Разбирает сообщения хозяина. Помнит неподтверждённую запись на 5 минут."""
 
-    pending: Pending | None = field(default=None)
+    pending: dict[str, Pending] = field(default_factory=dict)  # у каждого чата свой вопрос «да / нет»
 
-    def handle(self, text: str, ctx: BotContext) -> str | None:
-        """Ответ на сообщение или None, если это не команда (обычная переписка с ботом)."""
+    def handle(self, text: str, ctx: BotContext, chat: str = "", author: str = "") -> str | None:
+        """Ответ на сообщение или None, если это не команда (обычная переписка с ботом).
+        chat — кто пишет (хозяев может быть несколько: «да» одного не подтверждает вопрос другого)."""
         parsed = parse_command(text)
         if parsed is None:
             return None
         name, args = parsed
         if name in ("yes", "no"):
-            return self._answer(name == "yes", ctx)
+            return self._answer(name == "yes", ctx, chat)
         if name in ADJUSTMENTS:
-            return self._ask_adjustment(name, args, ctx)
+            return self._ask_adjustment(name, args, ctx, chat, author)
         if name in COMMANDS:
             try:
                 return COMMANDS[name](ctx, args)
@@ -490,13 +491,13 @@ class BotHandler:
                 return f"Не получилось выполнить команду: {e}"
         return "Не знаю такой команды. Список: /help"
 
-    def _answer(self, yes: bool, ctx: BotContext) -> str | None:
-        pending, self.pending = self.pending, None
+    def _answer(self, yes: bool, ctx: BotContext, chat: str) -> str | None:
+        pending = self.pending.pop(chat, None)
         if pending is None or ctx.now > pending.expires:
             return None  # вопроса нет или он устарел — «да» без вопроса ничего не делает
         return pending.run() if yes else "Отменено, ничего не записано."
 
-    def _ask_adjustment(self, kind: str, args: str, ctx: BotContext) -> str:
+    def _ask_adjustment(self, kind: str, args: str, ctx: BotContext, chat: str, author: str) -> str:
         title, sign, default_reason = ADJUSTMENTS[kind]
         amount = parse_amount(args)
         if amount is None or amount <= 0:
@@ -510,16 +511,17 @@ class BotHandler:
                         flags=re.IGNORECASE).strip() or default_reason
         month = f"{business_day(ctx.now, ctx.change):%Y-%m}"
         db, now = ctx.db, ctx.now
+        source = f"из Telegram: {author}" if author else "из Telegram"
 
         def run() -> str:
             try:
-                db.add_adjustment(user.id, month, sign * amount, f"{reason} (из Telegram)", None, now)
+                db.add_adjustment(user.id, month, sign * amount, f"{reason} ({source})", None, now)
             except UserError as e:
                 return f"Не записано: {e}"
             return f"✅ Записано: {title.lower()} {user.name or user.login} {'+' if sign > 0 else '−'}{money(amount)} " \
                    f"({reason}). Видно в кабинете за {month[5:]}.{month[:4]}."
 
-        self.pending = Pending(ctx.now + CONFIRM_FOR, run)
+        self.pending[chat] = Pending(ctx.now + CONFIRM_FOR, run)
         return (f"Записать: {title.lower()} {user.name or user.login} {'+' if sign > 0 else '−'}{money(amount)} "
                 f"за {MONTHS[int(month[5:]) - 1]} («{reason}»)?\nОтветьте «да» или «нет» (действует 5 минут).")
 

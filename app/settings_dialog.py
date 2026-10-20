@@ -5,12 +5,12 @@ import os
 import sys
 from datetime import date, datetime, time
 
-from PySide6.QtCore import QDate, QSettings, QTime, QTimer, QUrl
+from PySide6.QtCore import QDate, QSettings, Qt, QTime, QTimer, QUrl
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDateEdit, QDialog, QDialogButtonBox, QFileDialog, QFormLayout,
-    QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPushButton, QSpinBox, QTabWidget,
-    QTimeEdit, QVBoxLayout, QWidget,
+    QGroupBox, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMessageBox, QPushButton,
+    QSpinBox, QTabWidget, QTimeEdit, QVBoxLayout, QWidget,
 )
 
 from . import autostart, backup, telegram, theme
@@ -128,6 +128,41 @@ def _gray_label(text: str) -> QLabel:
 
 def _bool(value: bool) -> str:
     return "true" if value else "false"
+
+
+class ChatPicker(QDialog):
+    """Кто из написавших боту получает итоги и может им командовать. Отмечать нужно только своих."""
+
+    def __init__(self, parent, chats: list[tuple[str, str]], selected: list[str]):
+        super().__init__(parent)
+        self.setWindowTitle("Кто управляет ботом")
+        self.setMinimumWidth(420)
+        layout = QVBoxLayout(self)
+        hint = QLabel("Эти люди писали вашему боту. Отметьте тех, кому нужны итоги смен и кто может "
+                      "управлять ботом.\nЕсли видите незнакомого — не отмечайте: бот найден посторонним.")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+        self.list = QListWidget()
+        known = {chat_id for chat_id, _ in chats}
+        rows = [(c, t) for c, t in chats] + [(c, "(сейчас в настройках, бот давно не получал от него сообщений)")
+                                              for c in selected if c not in known]
+        for chat_id, title in rows:
+            item = QListWidgetItem(f"{title or '(без имени)'} — {chat_id}")
+            item.setData(Qt.UserRole, chat_id)
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(Qt.Checked if chat_id in selected else Qt.Unchecked)
+            self.list.addItem(item)
+        layout.addWidget(self.list)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Ok).setText("Готово")
+        buttons.button(QDialogButtonBox.Cancel).setText("Отмена")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def selected(self) -> list[str]:
+        return [self.list.item(i).data(Qt.UserRole) for i in range(self.list.count())
+                if self.list.item(i).checkState() == Qt.Checked]
 
 
 class SettingsDialog(QDialog):
@@ -292,7 +327,9 @@ class SettingsDialog(QDialog):
             "1. В Telegram найдите <b>@BotFather</b>, отправьте <b>/newbot</b> и придумайте боту имя.<br>"
             "2. BotFather пришлёт <b>токен</b> — длинную строку с двоеточием. Вставьте её ниже.<br>"
             "3. Откройте своего нового бота и напишите ему что угодно, например «привет».<br>"
-            "4. Нажмите «Найти мой чат», затем «Отправить проверку» и «Сохранить».")
+            "4. Нажмите «Найти чаты…», отметьте себя, затем «Отправить проверку» и «Сохранить».<br>"
+            "<b>Второй человек:</b> пусть найдёт вашего бота в Telegram и тоже напишет ему «привет», "
+            "а вы снова нажмите «Найти чаты…» и отметьте обоих. Итоги смен придут обоим, командовать смогут оба.")
         steps.setWordWrap(True)
         layout.addWidget(steps)
 
@@ -307,12 +344,13 @@ class SettingsDialog(QDialog):
         token_row.addWidget(show)
         form.addRow("Токен бота:", token_row)
         self.chat_edit = QLineEdit(cfg["chat_id"])
-        find = QPushButton("Найти мой чат")
+        self.chat_edit.setPlaceholderText("номера через запятую, например 123456789, 987654321")
+        find = QPushButton("Найти чаты…")
         find.clicked.connect(self._find_chat)
         chat_row = QHBoxLayout()
         chat_row.addWidget(self.chat_edit, 1)
         chat_row.addWidget(find)
-        form.addRow("Чат:", chat_row)
+        form.addRow("Чаты:", chat_row)
         self.tg_start = QCheckBox("Сообщать о начале смены")
         self.tg_start.setChecked(cfg["on_start"])
         form.addRow(self.tg_start)
@@ -323,7 +361,7 @@ class SettingsDialog(QDialog):
                                 "Нет интернета — сообщения дождутся связи и уйдут позже.\n"
                                 "Объявление сотрудникам: напишите боту сообщение, начиная с «!».\n"
                                 "Команды: /help — полный список (касса, выручка, зарплата, доставки…).\n"
-                                "Бот слушает только этот чат — лучше личный, не групповой."))
+                                "Бот слушает только эти чаты — лучше личные, не групповые."))
         layout.addLayout(form)
         test = QPushButton("Отправить проверку")
         test.clicked.connect(self._test_telegram)
@@ -401,30 +439,39 @@ class SettingsDialog(QDialog):
         if not token:
             QMessageBox.warning(self, "Telegram", "Сначала вставьте токен бота.")
             return
-        try:
-            chats = telegram.find_chats(token)
+        chats = list(self.db.seen_chats())  # кто писал боту, пока программа его слушала
+        try:  # плюс то, что Telegram ещё не отдал программе (первая настройка, программа пока не слушает)
+            known = {c for c, _ in chats}
+            chats += [(c, t) for c, t in telegram.find_chats(token) if c not in known]
         except telegram.TelegramError as e:
-            QMessageBox.warning(self, "Telegram", f"Не получилось: {e}")
-            return
+            if not chats:
+                QMessageBox.warning(self, "Telegram", f"Не получилось: {e}")
+                return
         if not chats:
             QMessageBox.information(self, "Telegram", "Бот пока не получал сообщений.\n"
                                     "Откройте бота в Telegram, напишите ему «привет» и нажмите ещё раз.")
             return
-        chat_id, title = chats[-1]
-        self.chat_edit.setText(chat_id)
-        QMessageBox.information(self, "Telegram", f"Нашёл чат: {title or chat_id}.\nТеперь нажмите «Отправить проверку».")
+        picker = ChatPicker(self, chats, telegram.chat_ids(self.chat_edit.text()))
+        if picker.exec() == QDialog.Accepted:
+            self.chat_edit.setText(", ".join(picker.selected()))
 
     def _test_telegram(self):
-        token, chat_id = self.token_edit.text().strip(), self.chat_edit.text().strip()
-        if not token or not chat_id:
+        token, chats = self.token_edit.text().strip(), telegram.chat_ids(self.chat_edit.text())
+        if not token or not chats:
             QMessageBox.warning(self, "Telegram", "Заполните токен и чат.")
             return
-        try:
-            telegram.send_message(token, chat_id, "🌸 Проверка: программа «Доставки цветов» подключена.")
-        except telegram.TelegramError as e:
-            QMessageBox.warning(self, "Telegram", f"Не отправилось: {e}")
-            return
-        QMessageBox.information(self, "Telegram", "Отправлено! Проверьте Telegram. Не забудьте «Сохранить».")
+        failed = []
+        for chat in chats:
+            try:
+                telegram.send_message(token, chat, "🌸 Проверка: программа «Доставки цветов» подключена.")
+            except telegram.TelegramError as e:
+                failed.append(f"{chat}: {e}")
+        if failed:
+            QMessageBox.warning(self, "Telegram", "Не отправилось:\n" + "\n".join(failed)
+                                + "\n\nЧеловек должен сначала написать боту «привет» (бот не может писать первым).")
+        else:
+            QMessageBox.information(self, "Telegram", f"Отправлено ({len(chats)})! Проверьте Telegram. "
+                                    "Не забудьте «Сохранить».")
 
     def _choose_backup_dir(self):
         folder = QFileDialog.getExistingDirectory(self, "Куда копировать", self.backup_edit.text())
@@ -485,7 +532,7 @@ class SettingsDialog(QDialog):
         if self.token_edit.text().strip() != telegram.settings()["token"]:
             settings.remove("tg_offset")  # другой бот — читать его сообщения с начала
         settings.setValue("tg_token", self.token_edit.text().strip())
-        settings.setValue("tg_chat_id", self.chat_edit.text().strip())
+        settings.setValue("tg_chat_id", ", ".join(telegram.chat_ids(self.chat_edit.text())))
         settings.setValue("tg_on_start", _bool(self.tg_start.isChecked()))
         settings.setValue("tg_on_close", _bool(self.tg_close.isChecked()))
         settings.setValue("backup_dir", self.backup_edit.text().strip())

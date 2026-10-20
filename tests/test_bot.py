@@ -204,7 +204,7 @@ def test_adjustment_cancel_expire_and_errors(shop):
     assert handler.handle("да", late) is None and shop.adjustments(1, "2026-10") == []  # вопрос устарел
     assert "Укажите сумму" in handler.handle("/аванс Анна", make_ctx(shop))
     assert "Такого сотрудника нет" in handler.handle("/аванс Мария 500", make_ctx(shop))
-    assert handler.pending is None
+    assert handler.pending == {}
 
 
 def test_new_question_replaces_old(shop):
@@ -229,8 +229,8 @@ def test_inbox_answers_only_owner_and_fresh(db, monkeypatch):
     monkeypatch.setattr(telegram.QTimer, "singleShot", lambda *a: None)
     inbox = telegram.TelegramInbox.__new__(telegram.TelegramInbox)
     inbox.db, inbox.busy = db, False
-    inbox.handler = lambda text: f"ответ на {text}"
-    inbox.reply = replies.append
+    inbox.handler = lambda text, chat, author: f"ответ на {text}"
+    inbox.reply = lambda text, chat: replies.append((chat, text))
     now = int(datetime.now().timestamp())
 
     def update(uid, chat, text, ts=now):
@@ -238,9 +238,159 @@ def test_inbox_answers_only_owner_and_fresh(db, monkeypatch):
 
     inbox._answer_commands([update(1, 777, "/касса"), update(2, 999, "/касса"), update(3, 777, "! объявление"),
                             update(4, 777, "/смена", ts=now - 3600)], "777")
-    assert replies[0] == "ответ на /касса" and "пропустила" in replies[1] and len(replies) == 2
+    assert replies[0] == ("777", "ответ на /касса") and "пропустила" in replies[1][1] and len(replies) == 2
 
 
 def test_menu_matches_commands():
     assert {name for name, _ in bc.MENU} <= set(bc.COMMANDS) | {"help"}
     assert all(name.isascii() and name.islower() for name, _ in bc.MENU)  # Telegram принимает в меню только латиницу
+
+
+# ----- несколько хозяев -----
+
+def test_chat_ids_parsing():
+    assert telegram.chat_ids("111, -100222;333  111") == ["111", "-100222", "333"]
+    assert telegram.chat_ids("") == [] and telegram.chat_ids(["5", 6]) == ["5", "6"]
+
+
+def test_announcements_from_both_owners_only(db):
+    updates = [_u(1, 111, "! от первого"), _u(2, 222, "! от второго"), _u(3, 999, "! чужой")]
+    found = telegram.parse_announcements(updates, "111, 222")
+    assert [t for _, t, _ in found] == ["от первого", "от второго"]
+
+
+def _u(uid, chat, text, ts=1_760_000_000, first_name=""):
+    message = {"chat": {"id": chat}, "text": text, "date": ts}
+    if first_name:
+        message["from"] = {"first_name": first_name}
+    return {"update_id": uid, "message": message}
+
+
+def test_both_owners_get_answers_each_their_own(db, monkeypatch):
+    monkeypatch.setattr(telegram.QTimer, "singleShot", lambda *a: None)
+    inbox = telegram.TelegramInbox.__new__(telegram.TelegramInbox)
+    inbox.db, inbox.busy = db, False
+    seen, replies = [], []
+    inbox.handler = lambda text, chat, author: (seen.append((chat, author)), f"ок {text}")[1]
+    inbox.reply = lambda text, chat: replies.append((chat, text))
+    now = int(datetime.now().timestamp())
+    inbox._answer_commands([_u(1, 111, "/касса", now, "Мария"), _u(2, 222, "/смена", now, "Игорь"),
+                            _u(3, 999, "/касса", now)], "111,222")
+    assert seen == [("111", "Мария"), ("222", "Игорь")]
+    assert replies == [("111", "ок /касса"), ("222", "ок /смена")]  # каждому — его ответ
+
+
+def test_confirmation_is_per_chat(shop):
+    handler = BotHandler()
+    handler.handle("/аванс Анна 1000", make_ctx(shop), "111", "Мария")
+    assert handler.handle("да", make_ctx(shop), "222", "Игорь") is None  # чужое «да» ничего не подтверждает
+    assert shop.adjustments(1, "2026-10") == []
+    assert "Записано" in handler.handle("да", make_ctx(shop), "111", "Мария")
+    [adj] = shop.adjustments(1, "2026-10")
+    assert adj.reason == "аванс (из Telegram: Мария)"  # видно, кто из двоих записал
+
+
+def test_summary_goes_to_every_chat_and_one_failure_does_not_block(db, monkeypatch):
+    monkeypatch.setattr(telegram, "configured", lambda: True)
+    monkeypatch.setattr(telegram, "settings", lambda: {"chats": ["111", "222"], "token": "t"})
+    monkeypatch.setattr(telegram.QTimer, "singleShot", lambda *a: None)
+    sender = telegram.TelegramSender.__new__(telegram.TelegramSender)
+    sender.db, sender.busy, sender.last_error = db, False, ""
+    sender.queue("итоги смены", key="close:1")
+    sender.queue("итоги смены", key="close:1")  # повтор не задваивается
+    sender.queue("только для второго", chat="222")
+    assert [(t, c) for _, t, c in db.unsent_messages()] == \
+        [("итоги смены", "111"), ("итоги смены", "222"), ("только для второго", "222")]
+
+    delivered = []
+
+    def fake_send(token, chat, text):
+        if chat == "111":
+            raise telegram.TelegramError("Forbidden: bot was blocked by the user", permanent=True)
+        delivered.append((chat, text))
+
+    monkeypatch.setattr(telegram, "send_message", fake_send)
+    results = []
+    sender.done = type("S", (), {"emit": lambda self, r: results.append(r)})()
+    sender._send("t", ["111", "222"], db.unsent_messages())
+    sender._on_done(results[0])
+    assert delivered == [("222", "итоги смены"), ("222", "только для второго")]  # второй получил всё
+    assert db.unsent_messages() == []  # у первого окончательный отказ — не крутится вечно
+    assert "blocked" in sender.last_error
+
+
+def test_no_connection_keeps_messages_for_retry(db, monkeypatch):
+    monkeypatch.setattr(telegram.QTimer, "singleShot", lambda *a: None)
+    db.queue_message("итоги", datetime.now(), "k|111", "111")
+    sender = telegram.TelegramSender.__new__(telegram.TelegramSender)
+    sender.db, sender.busy, sender.last_error = db, False, ""
+    monkeypatch.setattr(telegram, "send_message",
+                        lambda *a: (_ for _ in ()).throw(telegram.TelegramError("Нет связи с Telegram")))
+    results = []
+    sender.done = type("S", (), {"emit": lambda self, r: results.append(r)})()
+    sender._send("t", ["111"], db.unsent_messages())
+    sender._on_done(results[0])
+    assert [t for _, t, _ in db.unsent_messages()] == ["итоги"]  # дождётся связи
+
+
+def test_old_queue_without_chat_goes_to_everyone(db, monkeypatch):
+    db.queue_message("старое сообщение", datetime.now())  # до появления нескольких чатов
+    sent = []
+    monkeypatch.setattr(telegram, "send_message", lambda token, chat, text: sent.append(chat))
+    sender = telegram.TelegramSender.__new__(telegram.TelegramSender)
+    results = []
+    sender.done = type("S", (), {"emit": lambda self, r: results.append(r)})()
+    sender._send("t", ["111", "222"], db.unsent_messages())
+    assert sent == ["111", "222"]
+
+
+def test_outbox_migration_adds_chat_column(tmp_path):
+    import sqlite3
+    path = tmp_path / "old.db"
+    conn = sqlite3.connect(path)
+    conn.execute("CREATE TABLE telegram_outbox (id INTEGER PRIMARY KEY AUTOINCREMENT, key TEXT UNIQUE,"
+                 " text TEXT NOT NULL, created_at TEXT NOT NULL, sent_at TEXT)")
+    conn.execute("INSERT INTO telegram_outbox (text, created_at) VALUES ('до обновления', '2026-10-20T09:00:00')")
+    conn.commit()
+    conn.close()
+    database = Database(str(path))
+    assert database.unsent_messages() == [(1, "до обновления", None)]
+    database.close()
+
+
+def test_inbox_remembers_everyone_who_wrote(db, monkeypatch):
+    from PySide6.QtCore import QSettings
+    store = {}
+    monkeypatch.setattr(QSettings, "value", lambda self, key, default=None: store.get(key, default))
+    monkeypatch.setattr(QSettings, "setValue", lambda self, key, value: store.__setitem__(key, value))
+    monkeypatch.setattr(telegram, "settings", lambda: {"token": "t", "chat_id": "111", "chats": ["111"],
+                                                       "on_start": True, "on_close": True})
+    monkeypatch.setattr(telegram.QTimer, "singleShot", lambda *a: None)
+    inbox = telegram.TelegramInbox.__new__(telegram.TelegramInbox)
+    inbox.db, inbox.busy, inbox.handler, inbox.reply = db, False, None, None
+    inbox.arrived = type("S", (), {"emit": lambda self, ids: None})()
+
+    def update(uid, chat, first, last=""):
+        return {"update_id": uid, "message": {"chat": {"id": chat, "first_name": first, "last_name": last},
+                                              "text": "привет", "date": 1_760_000_000}}
+
+    # самое первое подключение: старые «привет» не выполняем, но кто писал — запоминаем
+    inbox._on_fetched([update(1, 111, "Мария"), update(2, 222, "Игорь", "Петров")], "")
+    assert sorted(db.seen_chats()) == [("111", "Мария"), ("222", "Игорь Петров")]
+    inbox._on_fetched([update(3, 999, "Незнакомец")], "")  # посторонний тоже виден — чтобы его не отметили
+    assert ("999", "Незнакомец") in db.seen_chats() and len(db.seen_chats()) == 3
+
+
+def test_chat_picker_selection(db):
+    import sys
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QApplication
+    from app.settings_dialog import ChatPicker
+    app = QApplication.instance() or QApplication(sys.argv)
+    picker = ChatPicker(None, [("111", "Мария"), ("222", "Игорь"), ("999", "Незнакомец")], ["111"])
+    assert picker.selected() == ["111"]  # уже подключённые отмечены, остальные — нет
+    picker.list.item(1).setCheckState(Qt.Checked)
+    assert picker.selected() == ["111", "222"]
+    old = ChatPicker(None, [("222", "Игорь")], ["111", "222"])  # в настройках есть чат, который давно не писал
+    assert old.selected() == ["222", "111"]  # он не пропадает из списка и остаётся отмеченным
+    assert app is not None

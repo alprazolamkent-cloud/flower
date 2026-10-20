@@ -130,7 +130,7 @@ class MainWindow(QMainWindow):
         self.inbox = telegram.TelegramInbox(db, self)
         self.inbox.arrived.connect(self._on_announcements)
         self.bot = BotHandler()
-        self.inbox.handler = lambda text: self.bot.handle(text, self._bot_context())
+        self.inbox.handler = lambda text, chat, author: self.bot.handle(text, self._bot_context(), chat, author)
         self.inbox.reply = self._bot_reply
         self.settings = QSettings("FlowerDeliveries", "FlowerDeliveries")
 
@@ -633,9 +633,10 @@ class MainWindow(QMainWindow):
             water=water_schedule(), rules=salary_rules, version=VERSION, last_backup=last_backup(),
             backup_now=self._bot_backup)
 
-    def _bot_reply(self, text: str):
+    def _bot_reply(self, text: str, chat: str):
+        """Ответ на команду уходит только тому, кто спросил."""
         for part in chunk(text):
-            self.telegram.queue(part)
+            self.telegram.queue(part, chat=chat)
 
     def _bot_backup(self) -> str:
         """Копия по команде из Telegram: что получилось, одним сообщением."""
