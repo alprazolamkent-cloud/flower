@@ -18,7 +18,7 @@ def money(value: int) -> str:
     return f"{value:,}".replace(",", " ") + " ₽"
 
 
-def _money_box() -> QSpinBox:
+def money_box() -> QSpinBox:
     box = QSpinBox()
     box.setRange(0, MAX_MONEY)
     box.setSingleStep(100)
@@ -76,11 +76,11 @@ class DeliveryDialog(QDialog):
         form.addRow("Контакт заказчика:", self.contact_edit)
         self._update_contact_hint()
 
-        self.price_box = _money_box()
+        self.price_box = money_box()
         self.price_box.setValue(delivery.price)
         form.addRow("Взяли с покупателя:", self.price_box)
 
-        self.courier_box = _money_box()
+        self.courier_box = money_box()
         self.courier_box.setValue(delivery.courier_pay)
         form.addRow("Отдали курьеру:", self.courier_box)
 

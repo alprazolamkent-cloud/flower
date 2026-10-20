@@ -1,9 +1,13 @@
 """Расчёт, о каких доставках пора напомнить."""
 
+from __future__ import annotations
+
 import re
 from datetime import datetime, time, timedelta
+from typing import TYPE_CHECKING
 
-from .db import Delivery
+if TYPE_CHECKING:
+    from .db import Delivery
 
 TIME_RE = re.compile(r"(\d{1,2})\s*[:.\-]\s*(\d{2})")
 HOUR_RE = re.compile(r"\b(\d{1,2})\b")

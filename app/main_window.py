@@ -3,7 +3,9 @@
 from datetime import date, datetime, timedelta
 
 from PySide6.QtCore import QDate, QLocale, QSettings, Qt, QTimer, QUrl
-from PySide6.QtGui import QAction, QBrush, QDesktopServices, QColor, QFont, QKeySequence, QShortcut, QTextCharFormat
+from PySide6.QtGui import (
+    QAction, QBrush, QColor, QDesktopServices, QFont, QKeySequence, QShortcut, QTextCharFormat,
+)
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCalendarWidget, QDialog,
     QGroupBox, QHBoxLayout, QHeaderView, QLabel, QMainWindow, QMenu, QMessageBox,
@@ -15,7 +17,9 @@ from .db import Database, Delivery, Totals, User
 from .delivery_dialog import DeliveryDialog, money
 from .icon import flower_icon
 from .messaging import KINDS, SHORT, build_action, render
-from .settings_dialog import SettingsDialog, lead_minutes
+from .settings_dialog import SettingsDialog, grace_minutes, lead_minutes, shift_change
+from .shift_dialogs import CabinetDialog, CashOpDialog, CloseShiftDialog, StartShiftDialog, fmt_dt
+from .shifts import PROBLEM_STATUSES, REMIND_BEFORE_MINUTES, Shift, short_name
 from .templates_dialog import load_templates
 from .update_ui import UpdateController
 from .reminders import due_reminders, reminder_key
@@ -48,6 +52,33 @@ def to_date(qd: QDate) -> date:
     return date(qd.year(), qd.month(), qd.day())
 
 
+class ShiftCalendar(QCalendarWidget):
+    """Календарь, в клетках которого внизу подписано, чья была смена."""
+
+    def __init__(self):
+        super().__init__()
+        self.marks: dict[date, tuple[str, bool]] = {}  # день -> (имена, есть ли проблема)
+
+    def paintCell(self, painter, rect, qdate):
+        super().paintCell(painter, rect, qdate)
+        mark = self.marks.get(to_date(qdate))
+        if not mark:
+            return
+        names, problem = mark
+        painter.save()
+        font = painter.font()
+        font.setPointSizeF(max(6.5, font.pointSizeF() * 0.72))
+        painter.setFont(font)
+        if qdate == self.selectedDate():
+            painter.setPen(QColor("white"))  # на синей подсветке выбранного дня
+        else:
+            painter.setPen(QColor("#c62828" if problem else "#546e7a"))
+        area = rect.adjusted(2, 0, -2, -1)
+        text = painter.fontMetrics().elidedText(names, Qt.ElideRight, area.width())
+        painter.drawText(area, Qt.AlignHCenter | Qt.AlignBottom, text)
+        painter.restore()
+
+
 def totals_text(t: Totals) -> str:
     return (
         f"Доставок: <b>{t.count}</b> (доставлено {t.delivered})"
@@ -69,6 +100,9 @@ class MainWindow(QMainWindow):
         self._really_quit = False
         self._tray_hint_shown = False
         self._last_reminded_day: date | None = None
+        self.shift: Shift | None = None  # несданная смена того, кто сейчас вошёл
+        self._shift_reminded: set[int] = set()
+        self._shift_ended: set[int] = set()
         self.settings = QSettings("FlowerDeliveries", "FlowerDeliveries")
 
         self.setWindowTitle("Доставки цветов")
@@ -83,7 +117,7 @@ class MainWindow(QMainWindow):
         left = QVBoxLayout()
         root.addLayout(left, 0)
 
-        self.calendar = QCalendarWidget()
+        self.calendar = ShiftCalendar()
         self.calendar.setLocale(QLocale(QLocale.Russian, QLocale.Russia))
         self.calendar.setFirstDayOfWeek(Qt.Monday)
         self.calendar.setGridVisible(True)
@@ -102,6 +136,25 @@ class MainWindow(QMainWindow):
         today_btn = QPushButton("Сегодня")
         today_btn.clicked.connect(self.go_today)
         left.addWidget(today_btn)
+
+        self.shift_box = QGroupBox("Смена")
+        shift_layout = QVBoxLayout(self.shift_box)
+        self.shift_label = QLabel()
+        self.shift_label.setWordWrap(True)
+        shift_layout.addWidget(self.shift_label)
+        shift_buttons = QHBoxLayout()
+        self.shift_btn = QPushButton()
+        self.shift_btn.clicked.connect(self.toggle_shift)
+        self.cash_btn = QPushButton("💸 Расход / изъятие")
+        self.cash_btn.setToolTip("Записать расход из кассы или изъятие денег")
+        self.cash_btn.clicked.connect(self.cash_operation)
+        cabinet_btn = QPushButton("👤 Кабинет")
+        cabinet_btn.setToolTip("Личный кабинет: смены и итоги за месяц")
+        cabinet_btn.clicked.connect(self.open_cabinet)
+        for b in (self.shift_btn, self.cash_btn, cabinet_btn):
+            shift_buttons.addWidget(b)
+        shift_layout.addLayout(shift_buttons)
+        left.addWidget(self.shift_box)
 
         self.month_box = QGroupBox()
         month_layout = QVBoxLayout(self.month_box)
@@ -233,16 +286,148 @@ class MainWindow(QMainWindow):
         if dlg.exec() != QDialog.Accepted:
             return False
         self.set_user(dlg.user)
+        if not self._shift_flow():
+            self.set_user(None)
+            return False
+        self.update_shift_box()
         return True
+
+    # ----- смены -----
+
+    def _shift_flow(self) -> bool:
+        """После входа: сдать закончившуюся смену, начать новую. Сотрудник без смены не работает."""
+        now, change, grace = datetime.now(), shift_change(), grace_minutes()
+        self.shift = None
+        pending = self.db.current_shift(self.user.id)
+        just_closed = False
+        if pending is not None:
+            status = pending.status(now, change, grace)
+            if status == "open":
+                self.shift = pending
+                return True
+            if status == "closing":
+                QMessageBox.information(
+                    self, "Сдача смены",
+                    f"Смена закончилась в {pending.end(change):%H:%M}. Сдайте её до "
+                    f"{pending.deadline(change, grace):%H:%M} — иначе она будет отмечена как не сданная.")
+                if CloseShiftDialog(self, self.db, pending, change, grace).exec() != QDialog.Accepted:
+                    if self.user.is_admin:
+                        self.shift = pending
+                        return True
+                    return False
+                just_closed = True
+            else:
+                QMessageBox.warning(
+                    self, "Смена не сдана",
+                    f"Ваша смена за {pending.day:%d.%m} не была сдана вовремя. "
+                    "Администратор увидит это в отчёте.")
+        if self.user.is_admin:
+            return True  # админ может работать и без смены
+        if just_closed:
+            answer = QMessageBox.question(self, "Новая смена", "Смена сдана. Начать новую смену?",
+                                          QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
+            if answer != QMessageBox.Yes:
+                return False
+        dlg = StartShiftDialog(self, self.db, self.user, change)
+        if dlg.exec() != QDialog.Accepted:
+            return False
+        self.shift = dlg.shift
+        return True
+
+    def update_shift_box(self):
+        if self.user is None:
+            self.shift_label.setText("")
+            return
+        if self.shift is None:
+            self.shift_label.setText("Вы не на смене.")
+            self.shift_btn.setText("🟢 Начать смену")
+            self.shift_btn.setVisible(self.user.is_admin)  # сотрудник начинает смену при входе
+            self.cash_btn.setEnabled(False)
+            return
+        change = shift_change()
+        s = self.db.get_shift(self.shift.id) or self.shift
+        text = (f"На смене: <b>{s.user_name or '—'}</b>, с {fmt_dt(s.opened_at)} до "
+                f"{fmt_dt(s.end(change))}.<br>Приняли {money(s.opening_cash)}")
+        if s.expenses:
+            text += f" · расходы {money(s.expenses)}"
+        if s.withdrawals:
+            text += f" · изъятия {money(s.withdrawals)}"
+        self.shift_label.setText(text)
+        self.shift_btn.setText("🔴 Сдать смену")
+        self.shift_btn.setVisible(True)
+        self.cash_btn.setEnabled(True)
+
+    def toggle_shift(self):
+        if self.shift is None:
+            self.start_shift()
+        else:
+            self.close_shift()
+
+    def start_shift(self):
+        dlg = StartShiftDialog(self, self.db, self.user, shift_change())
+        if dlg.exec() == QDialog.Accepted:
+            self.shift = dlg.shift
+            self.update_shift_box()
+            self.refresh_month()
+
+    def close_shift(self):
+        change, grace = shift_change(), grace_minutes()
+        if not self.shift.can_close(datetime.now(), change, grace):
+            QMessageBox.warning(self, "Сдача смены", "Время на сдачу этой смены уже вышло.")
+            self.shift = None
+            self.update_shift_box()
+            return
+        if CloseShiftDialog(self, self.db, self.shift, change, grace).exec() != QDialog.Accepted:
+            return
+        self.shift = None
+        self.refresh_month()
+        if self.user.is_admin:
+            self.update_shift_box()
+            QMessageBox.information(self, "Смена сдана", "Смена сдана.")
+        else:
+            QMessageBox.information(self, "Смена сдана", "Смена сдана. Спасибо за работу!")
+            self.logout()
+
+    def cash_operation(self):
+        if self.shift is not None and CashOpDialog(self, self.db, self.shift, self.user).exec() == QDialog.Accepted:
+            self.update_shift_box()
+
+    def open_cabinet(self):
+        CabinetDialog(self, self.db, self.user, shift_change(), grace_minutes(),
+                      self.calendar.yearShown(), self.calendar.monthShown()).exec()
+
+    def check_shift(self):
+        """Напомнить о скорой пересменке, а в пересменку вывести сотрудника из программы."""
+        if self.user is None or self.shift is None:
+            return
+        now, change, grace = datetime.now(), shift_change(), grace_minutes()
+        end = self.shift.end(change)
+        if end - timedelta(minutes=REMIND_BEFORE_MINUTES) <= now < end \
+                and self.shift.id not in self._shift_reminded:
+            self._shift_reminded.add(self.shift.id)
+            self.tray.showMessage("Скоро пересменка",
+                                  f"Смена заканчивается в {end:%H:%M}. Сдайте смену: кнопка «Сдать смену».",
+                                  QSystemTrayIcon.Warning, 60_000)
+        if now >= end and self.shift.id not in self._shift_ended \
+                and QApplication.activeModalWidget() is None:
+            self._shift_ended.add(self.shift.id)
+            self.tray.showMessage("Смена закончилась",
+                                  f"Сдайте смену до {self.shift.deadline(change, grace):%H:%M}: "
+                                  "войдите в программу и заполните итоги.",
+                                  QSystemTrayIcon.Warning, 60_000)
+            self.logout()
 
     def set_user(self, user: User | None):
         self.user = user
         if user is None:
+            self.shift = None
             self.user_label.setText("")
+            self.update_shift_box()
             return
         role = "админ" if user.is_admin else "сотрудник"
         self.user_label.setText(f"Вы вошли: <b>{user.name or user.login}</b> ({role})")
         self.settings_btn.setVisible(user.is_admin)
+        self.update_shift_box()
 
     def logout(self):
         self.set_user(None)
@@ -295,6 +480,7 @@ class MainWindow(QMainWindow):
             )
 
     def check_reminders(self):
+        self.check_shift()
         now = datetime.now()
         today = now.date()
         deliveries = self.db.for_day(today) + self.db.for_day(today + timedelta(days=1))
@@ -340,10 +526,28 @@ class MainWindow(QMainWindow):
             self.calendar.setDateTextFormat(qd, fmt)
             self._marked_days.append(qd)
 
+        self.refresh_shift_marks(year, month)
         self.month_box.setTitle(f"Итого за {MONTHS[month - 1].lower()} {year}")
         self.month_label.setText(
             totals_text(self.db.totals_for_month(year, month)).replace(" &nbsp;|&nbsp; ", "<br>")
         )
+
+    def refresh_shift_marks(self, year: int, month: int):
+        first = date(year, month, 1) - timedelta(days=7)  # видны и соседние недели
+        last = date(year, month, 28) + timedelta(days=14)
+        now, change, grace = datetime.now(), shift_change(), grace_minutes()
+        show_problems = self.user is not None and self.user.is_admin
+        names: dict[date, list[str]] = {}
+        problems: dict[date, bool] = {}
+        for s in self.db.shifts_between(first, last):
+            names.setdefault(s.day, [])
+            if short_name(s.user_name) not in names[s.day]:
+                names[s.day].append(short_name(s.user_name))
+            bad = (s.status(now, change, grace) in PROBLEM_STATUSES - {"closing"}
+                   or bool(s.difference()) or bool(self.db.handover_difference(s)))
+            problems[s.day] = problems.get(s.day, False) or (show_problems and bad)
+        self.calendar.marks = {d: (", ".join(n), problems[d]) for d, n in names.items()}
+        self.calendar.updateCells()
 
     def refresh_day(self):
         day = self.selected_day()

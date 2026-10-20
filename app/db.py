@@ -1,10 +1,11 @@
-"""Хранение доставок в SQLite."""
+"""Хранение доставок, сотрудников и смен в SQLite."""
 
 import sqlite3
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime, time, timedelta
 
 from .auth import hash_password, verify_password
+from .shifts import KIND_TEXT, CashOp, Shift, delivery_business_day, opening_business_day
 
 
 @dataclass
@@ -78,7 +79,54 @@ CREATE TABLE IF NOT EXISTS users (
     password_hash BLOB    NOT NULL,
     is_admin      INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS shifts (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id       INTEGER,
+    day           TEXT    NOT NULL,
+    opened_at     TEXT    NOT NULL,
+    opening_cash  INTEGER NOT NULL DEFAULT 0,
+    closed_at     TEXT,
+    closing_cash  INTEGER,
+    cash_sales    INTEGER NOT NULL DEFAULT 0,
+    delivery_cash INTEGER NOT NULL DEFAULT 0,
+    courier_cash  INTEGER NOT NULL DEFAULT 0,
+    note          TEXT    NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_shifts_day ON shifts(day);
+CREATE TABLE IF NOT EXISTS cash_ops (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    shift_id   INTEGER NOT NULL,
+    kind       TEXT    NOT NULL,
+    amount     INTEGER NOT NULL,
+    reason     TEXT    NOT NULL DEFAULT '',
+    created_at TEXT    NOT NULL,
+    created_by INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_cash_ops_shift ON cash_ops(shift_id);
 """
+
+SHIFT_SELECT = """
+SELECT s.id, s.user_id, COALESCE(NULLIF(u.name, ''), u.login, ''), s.day, s.opened_at,
+       s.opening_cash, s.closed_at, s.closing_cash, s.cash_sales, s.delivery_cash,
+       s.courier_cash, s.note,
+       COALESCE((SELECT SUM(amount) FROM cash_ops c WHERE c.shift_id = s.id AND c.kind = 'expense'), 0),
+       COALESCE((SELECT SUM(amount) FROM cash_ops c WHERE c.shift_id = s.id AND c.kind = 'withdrawal'), 0)
+FROM shifts s LEFT JOIN users u ON u.id = s.user_id
+"""
+
+
+def _ts(moment: datetime) -> str:
+    return moment.isoformat(timespec="seconds")
+
+
+def _row_to_shift(r) -> Shift:
+    return Shift(
+        id=r[0], user_id=r[1], user_name=r[2], day=date.fromisoformat(r[3]),
+        opened_at=datetime.fromisoformat(r[4]), opening_cash=r[5],
+        closed_at=datetime.fromisoformat(r[6]) if r[6] else None, closing_cash=r[7],
+        cash_sales=r[8], delivery_cash=r[9], courier_cash=r[10], note=r[11],
+        expenses=r[12], withdrawals=r[13],
+    )
 
 # Столбцы, добавленные после первой версии: старые базы дополняются при запуске.
 MIGRATIONS = {
@@ -282,6 +330,8 @@ class Database:
         # Доставки остаются, просто без автора.
         self.conn.execute("UPDATE deliveries SET created_by=NULL WHERE created_by=?", (user_id,))
         self.conn.execute("UPDATE deliveries SET delivered_by=NULL WHERE delivered_by=?", (user_id,))
+        self.conn.execute("UPDATE shifts SET user_id=NULL WHERE user_id=?", (user_id,))
+        self.conn.execute("UPDATE cash_ops SET created_by=NULL WHERE created_by=?", (user_id,))
         self.conn.execute("DELETE FROM users WHERE id=?", (user_id,))
         self.conn.commit()
 
@@ -294,3 +344,103 @@ class Database:
         ).fetchone()
         if is_admin and is_admin[0] and others == 0:
             raise UserError("Должен остаться хотя бы один администратор.")
+
+    # ----- смены и касса -----
+
+    def open_shift(self, user_id: int, opening_cash: int, now: datetime, change: time) -> Shift:
+        if opening_cash < 0:
+            raise UserError("Сумма в кассе не может быть отрицательной.")
+        cur = self.conn.execute(
+            "INSERT INTO shifts (user_id, day, opened_at, opening_cash) VALUES (?, ?, ?, ?)",
+            (user_id, opening_business_day(now, change).isoformat(), _ts(now), opening_cash),
+        )
+        self.conn.commit()
+        return self.get_shift(cur.lastrowid)
+
+    def get_shift(self, shift_id: int) -> Shift | None:
+        row = self.conn.execute(SHIFT_SELECT + " WHERE s.id = ?", (shift_id,)).fetchone()
+        return _row_to_shift(row) if row else None
+
+    def current_shift(self, user_id: int) -> Shift | None:
+        """Последняя несданная смена сотрудника."""
+        row = self.conn.execute(
+            SHIFT_SELECT + " WHERE s.user_id = ? AND s.closed_at IS NULL"
+            " ORDER BY s.opened_at DESC, s.id DESC LIMIT 1", (user_id,),
+        ).fetchone()
+        return _row_to_shift(row) if row else None
+
+    def close_shift(self, shift_id: int, now: datetime, closing_cash: int, cash_sales: int,
+                    delivery_cash: int, courier_cash: int, note: str = "") -> Shift:
+        if min(closing_cash, cash_sales, delivery_cash, courier_cash) < 0:
+            raise UserError("Суммы не могут быть отрицательными.")
+        cur = self.conn.execute(
+            "UPDATE shifts SET closed_at=?, closing_cash=?, cash_sales=?, delivery_cash=?,"
+            " courier_cash=?, note=? WHERE id=? AND closed_at IS NULL",
+            (_ts(now), closing_cash, cash_sales, delivery_cash, courier_cash, note.strip(), shift_id),
+        )
+        self.conn.commit()
+        if cur.rowcount == 0:
+            raise UserError("Эта смена уже сдана.")
+        return self.get_shift(shift_id)
+
+    def previous_shift(self, shift: Shift) -> Shift | None:
+        """Смена, которая шла перед этой (у неё принимали кассу)."""
+        return self.shift_before(shift.opened_at, shift.id)
+
+    def shift_before(self, moment: datetime, before_id: int | None = None) -> Shift | None:
+        ts = _ts(moment)
+        if before_id is None:
+            row = self.conn.execute(
+                SHIFT_SELECT + " WHERE s.opened_at <= ? ORDER BY s.opened_at DESC, s.id DESC LIMIT 1",
+                (ts,)).fetchone()
+        else:
+            row = self.conn.execute(
+                SHIFT_SELECT + " WHERE (s.opened_at < ? OR (s.opened_at = ? AND s.id < ?))"
+                " ORDER BY s.opened_at DESC, s.id DESC LIMIT 1", (ts, ts, before_id)).fetchone()
+        return _row_to_shift(row) if row else None
+
+    def handover_difference(self, shift: Shift) -> int | None:
+        """Принял − сдал предыдущий: минус — при приёме денег оказалось меньше."""
+        prev = self.previous_shift(shift)
+        if prev is None or prev.closing_cash is None:
+            return None
+        return shift.opening_cash - prev.closing_cash
+
+    def shifts_between(self, first: date, last: date, user_id: int | None = None) -> list[Shift]:
+        sql = SHIFT_SELECT + " WHERE s.day BETWEEN ? AND ?"
+        params: list = [first.isoformat(), last.isoformat()]
+        if user_id is not None:
+            sql += " AND s.user_id = ?"
+            params.append(user_id)
+        rows = self.conn.execute(sql + " ORDER BY s.opened_at, s.id", params).fetchall()
+        return [_row_to_shift(r) for r in rows]
+
+    def add_cash_op(self, shift_id: int, kind: str, amount: int, reason: str,
+                    user_id: int | None, now: datetime) -> int:
+        if kind not in KIND_TEXT:
+            raise UserError("Неизвестный тип операции.")
+        if amount <= 0:
+            raise UserError("Введите сумму.")
+        if not reason.strip():
+            raise UserError("Напишите причину." if kind == "expense" else "Напишите, кто забрал деньги.")
+        cur = self.conn.execute(
+            "INSERT INTO cash_ops (shift_id, kind, amount, reason, created_at, created_by)"
+            " VALUES (?, ?, ?, ?, ?, ?)", (shift_id, kind, amount, reason.strip(), _ts(now), user_id),
+        )
+        self.conn.commit()
+        return cur.lastrowid
+
+    def cash_ops(self, shift_id: int) -> list[CashOp]:
+        rows = self.conn.execute(
+            "SELECT c.id, c.kind, c.amount, c.reason, c.created_at,"
+            " COALESCE(NULLIF(u.name, ''), u.login, '')"
+            " FROM cash_ops c LEFT JOIN users u ON u.id = c.created_by"
+            " WHERE c.shift_id = ? ORDER BY c.created_at, c.id", (shift_id,),
+        ).fetchall()
+        return [CashOp(r[0], r[1], r[2], r[3], datetime.fromisoformat(r[4]), r[5]) for r in rows]
+
+    def delivery_cash_for_shift(self, day: date, change: time) -> tuple[int, int]:
+        """(взяли за доставки, отдали курьерам) по доставкам, которые приходятся на смену."""
+        candidates = self.for_day(day) + self.for_day(day + timedelta(days=1))
+        own = [d for d in candidates if delivery_business_day(d, change) == day]
+        return sum(d.price for d in own), sum(d.courier_pay for d in own)

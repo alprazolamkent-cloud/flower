@@ -2,22 +2,42 @@
 
 import sys
 
-from PySide6.QtCore import QSettings, QTimer
+from datetime import time
+
+from PySide6.QtCore import QSettings, QTime, QTimer
 from PySide6.QtWidgets import (
     QCheckBox, QDialog, QDialogButtonBox, QFormLayout, QGroupBox, QHBoxLayout,
-    QLabel, QPushButton, QSpinBox, QVBoxLayout,
+    QLabel, QPushButton, QSpinBox, QTimeEdit, QVBoxLayout,
 )
 
 from . import autostart
+from .shifts import DEFAULT_CHANGE, DEFAULT_GRACE_MINUTES
 from .templates_dialog import TemplatesDialog
 
 DEFAULT_LEAD_MINUTES = 20
 
 
+def _settings() -> QSettings:
+    return QSettings("FlowerDeliveries", "FlowerDeliveries")
+
+
 def lead_minutes() -> int:
     """За сколько минут до доставки напоминать."""
-    settings = QSettings("FlowerDeliveries", "FlowerDeliveries")
-    return int(settings.value("lead_minutes", DEFAULT_LEAD_MINUTES))
+    return int(_settings().value("lead_minutes", DEFAULT_LEAD_MINUTES))
+
+
+def shift_change() -> time:
+    """Время пересменки."""
+    try:
+        h, m = str(_settings().value("shift_change", DEFAULT_CHANGE.strftime("%H:%M"))).split(":")
+        return time(int(h), int(m))
+    except ValueError:
+        return DEFAULT_CHANGE
+
+
+def grace_minutes() -> int:
+    """Сколько минут после пересменки ещё можно сдать смену."""
+    return int(_settings().value("grace_minutes", DEFAULT_GRACE_MINUTES))
 
 
 class SettingsDialog(QDialog):
@@ -46,6 +66,26 @@ class SettingsDialog(QDialog):
         form.addRow(hint)
         layout.addWidget(reminders)
 
+        shifts = QGroupBox("Смены")
+        shift_form = QFormLayout(shifts)
+        self.change_edit = QTimeEdit()
+        self.change_edit.setDisplayFormat("HH:mm")
+        change = shift_change()
+        self.change_edit.setTime(QTime(change.hour, change.minute))
+        shift_form.addRow("Пересменка в:", self.change_edit)
+        self.grace_box = QSpinBox()
+        self.grace_box.setRange(0, 180)
+        self.grace_box.setSuffix(" мин")
+        self.grace_box.setValue(grace_minutes())
+        shift_form.addRow("Сдать после пересменки можно ещё:", self.grace_box)
+        shift_hint = QLabel("За 30 минут до пересменки программа напомнит сдать смену. В момент "
+                            "пересменки сотрудника выводит из программы; сданная после этого смена "
+                            "помечается «с опозданием», а не сданная вовсе — «не сдана».")
+        shift_hint.setWordWrap(True)
+        shift_hint.setStyleSheet("color: gray")
+        shift_form.addRow(shift_hint)
+        layout.addWidget(shifts)
+
         shop = QGroupBox("Магазин")
         row = QHBoxLayout(shop)
         users = QPushButton("👥 Сотрудники…")
@@ -73,7 +113,10 @@ class SettingsDialog(QDialog):
         QTimer.singleShot(0, self.main.manage_users)
 
     def accept(self):
-        QSettings("FlowerDeliveries", "FlowerDeliveries").setValue("lead_minutes", self.lead_box.value())
+        settings = _settings()
+        settings.setValue("lead_minutes", self.lead_box.value())
+        settings.setValue("shift_change", self.change_edit.time().toString("HH:mm"))
+        settings.setValue("grace_minutes", self.grace_box.value())
         if sys.platform == "win32":
             autostart.set_enabled(self.autostart_check.isChecked())
         super().accept()
