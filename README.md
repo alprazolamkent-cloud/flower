@@ -24,8 +24,8 @@
 
 ## Как получить .exe
 
-**Вариант 1. Скачать готовый.** После каждого пуша GitHub сам собирает программу:
-вкладка **Actions** → последняя сборка «Build Windows exe» → внизу артефакт **FlowerDeliveries** → скачать и распаковать `FlowerDeliveries.exe`.
+**Вариант 1. Скачать готовый.** Прямая ссылка на последнюю версию:
+https://github.com/alprazolamkent-cloud/flower/releases/latest/download/FlowerDeliveries.exe
 
 **Вариант 2. Собрать самому.** Установите [Python](https://www.python.org/downloads/) (при установке отметьте «Add Python to PATH») и запустите `build.bat`. Готовая программа появится в `dist\FlowerDeliveries.exe`.
 
