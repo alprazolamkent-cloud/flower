@@ -4,6 +4,7 @@
 В MAX нет постоянной клавиатуры внизу: меню — кнопками под сообщением (нажатие = сообщение от клиента).
 """
 
+import html
 import json
 import re
 import threading
@@ -15,7 +16,7 @@ import uuid
 
 from PySide6.QtCore import QSettings
 
-from .client_bot import MAX_IMAGE_FILE, MAX_PREFIX, ClientBot, Parsed, max_settings
+from .client_bot import MAX_IMAGE_FILE, MAX_PREFIX, ClientBot, Parsed, client_settings, max_settings
 from .client_flow import Incoming
 
 API = "https://platform-api2.max.ru"  # Bot API v2 (официальный клиент MAX)
@@ -64,6 +65,10 @@ def _call(token: str, method: str, path: str, query: dict | None = None, body: d
                        retry_after=5 if e.code == 429 else 0) from None
     except OSError as e:
         raise MaxError(f"Нет связи с MAX: {e}") from None
+
+
+def max_requisites() -> str:
+    return client_settings()["requisites"].strip()
 
 
 def get_me(token: str) -> dict:
@@ -127,18 +132,35 @@ def upload_image(token: str, data: bytes) -> dict:
     return {"token": token_value}
 
 
-def keyboard(markup: dict | None) -> dict | None:
+def keyboard(markup: dict | None, requisites: str = "") -> dict | None:
     """Кнопки Telegram → кнопки MAX. Меню внизу (keyboard) становится кнопками под сообщением,
-    нажатие на которые отправляет их текст от клиента — разговор понимает это так же."""
+    нажатие на которые отправляет их текст от клиента — разговор понимает это так же.
+    requisites — под кнопкой «Я оплатил(а)» добавить «Скопировать реквизиты» (нажал — и в буфере)."""
     if not markup:
         return None
     rows = []
     for row in markup.get("inline_keyboard") or []:
         rows.append([{"type": "callback", "text": b["text"], "payload": b["callback_data"]} for b in row])
+        if requisites and any(b["callback_data"].startswith("paid:") for b in row):
+            rows.insert(len(rows) - 1, [{"type": "clipboard", "text": "📋 Скопировать реквизиты",
+                                         "payload": requisites[:1000]}])
     for row in markup.get("keyboard") or []:
         rows.append([{"type": "request_contact", "text": b["text"]} if b.get("request_contact")
+                     else {"type": "request_geo_location", "text": b["text"]} if b.get("request_location")
                      else {"type": "message", "text": b["text"]} for b in row])
     return {"type": "inline_keyboard", "payload": {"buttons": rows}} if rows else None
+
+
+BOLD_LINES = re.compile(r"^(Заказ №\d+|.+ — [\d  ]+ ₽|💳 К оплате: .+|Здравствуйте!.*|Оплата получена ✅.*)$")
+
+
+def pretty(text: str) -> str:
+    """Текст для MAX с оформлением: что вписал клиент — экранируется (чужой текст не должен стать разметкой),
+    заголовки заказа, цены и «К оплате» — жирным."""
+    lines = []
+    for line in html.escape(text, quote=False).split("\n"):
+        lines.append(f"<b>{line}</b>" if BOLD_LINES.match(line) else line)
+    return "\n".join(lines)
 
 
 def send(token: str, user_id: str, text: str, markup: dict | None = None, image: dict | None = None) -> str:
@@ -146,10 +168,10 @@ def send(token: str, user_id: str, text: str, markup: dict | None = None, image:
     attachments = []
     if image:
         attachments.append({"type": "image", "payload": image})
-    buttons = keyboard(markup)
+    buttons = keyboard(markup, max_requisites())
     if buttons:
         attachments.append(buttons)
-    body = {"text": text[:MAX_TEXT]}
+    body = {"text": pretty(text[:MAX_TEXT]), "format": "html"}
     if attachments:
         body["attachments"] = attachments
     for attempt in range(NOT_READY_RETRIES + 1):

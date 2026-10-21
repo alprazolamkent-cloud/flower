@@ -202,3 +202,23 @@ def test_window_routes_to_max(app, db, store, monkeypatch):
     w._set_assembled(d, True)
     assert flushed and db.unsent_client(max_chats=True)[0][2] == "🌸 Ваш букет готов — можно забирать!"
     w.assembly.hide()
+
+
+def test_pretty_text_and_clipboard(monkeypatch):
+    text = "Заказ №5\n💐 <b>Розы</b> & пионы\n💳 К оплате: 4 200 ₽\nСбер +7 900"
+    out = max_bot.pretty(text)
+    assert out.splitlines()[0] == "<b>Заказ №5</b>" and "&lt;b&gt;Розы&lt;/b&gt; &amp; пионы" in out  # чужая разметка не работает
+    assert "<b>💳 К оплате: 4 200 ₽</b>" in out and out.endswith("Сбер +7 900")
+    assert max_bot.pretty("Нежность — 3 500 ₽") == "<b>Нежность — 3 500 ₽</b>"
+    pay = {"inline_keyboard": [[{"text": "✅ Я оплатил(а)", "callback_data": "paid:5"}]]}
+    rows = keyboard(pay, "Сбер +7 900")["payload"]["buttons"]
+    assert rows[0] == [{"type": "clipboard", "text": "📋 Скопировать реквизиты", "payload": "Сбер +7 900"}]
+    assert rows[1][0]["payload"] == "paid:5"
+    assert len(keyboard(pay)["payload"]["buttons"]) == 1  # реквизитов нет — лишней кнопки нет
+    geo = keyboard({"keyboard": [[{"text": "📍 Отправить геолокацию", "request_location": True}]]})
+    assert geo["payload"]["buttons"][0][0]["type"] == "request_geo_location"
+    sent = {}
+    monkeypatch.setattr(max_bot, "_call", lambda token, method, path, query=None, body=None, **k:
+                        sent.update(body=body) or {"message": {"body": {}}})
+    max_bot.send("mx", "42", "Нежность — 3 500 ₽")
+    assert sent["body"]["format"] == "html" and sent["body"]["text"] == "<b>Нежность — 3 500 ₽</b>"

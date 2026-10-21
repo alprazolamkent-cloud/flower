@@ -226,6 +226,19 @@ class ClientFlow:
             if not text:
                 return res
             data["address"] = "Самовывоз" if text == PICKUP else text
+            if text.startswith("📍"):  # точка на карте: подъезд и квартиру она не покажет
+                go("address_detail", data)
+                res.say("Точку на карте принял 📍 Теперь подъезд, этаж, квартира и домофон — "
+                        "или «—», если это частный дом.", keyboard(["—"], [TO_MENU]))
+                return res
+            go("recipient", data)
+            res.say("Кому букет? Имя и телефон получателя — или нажмите «Себе».", keyboard([SELF], [TO_MENU]))
+            return res
+        if state == "address_detail":
+            if not text:
+                return res
+            if text != "—":
+                data["address"] += f"\n{text}"
             go("recipient", data)
             res.say("Кому букет? Имя и телефон получателя — или нажмите «Себе».", keyboard([SELF], [TO_MENU]))
             return res
@@ -359,8 +372,9 @@ class ClientFlow:
 
     @staticmethod
     def _ask_address(res: Result):
-        res.say("Куда доставить? Улица, дом, квартира, подъезд. Или нажмите «🏪 Заберу сам».",
-                keyboard([PICKUP], [TO_MENU]))
+        res.say("Куда доставить? Напишите адрес (улица, дом, квартира, подъезд) или поделитесь точкой на карте. "
+                "Или нажмите «🏪 Заберу сам».",
+                keyboard([{"text": "📍 Отправить геолокацию", "request_location": True}], [PICKUP], [TO_MENU]))
 
     @staticmethod
     def _ask_card(res: Result):

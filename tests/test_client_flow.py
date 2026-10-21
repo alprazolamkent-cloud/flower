@@ -182,3 +182,28 @@ def test_dates_in_past_rejected(db):
     say(flow, CUSTOM)
     say(flow, "Розы")
     assert "Не понял дату" in texts(say(flow, (NOW - timedelta(days=3)).strftime("%d.%m.%Y") + " 10:00"))
+
+
+def test_address_by_location(db):
+    flow = ClientFlow(db, "")
+    db.touch_client(CHAT_ID, "Иван", "", NOW)
+    db.save_client_state(CHAT_ID, "", {}, phone="+79001234567")
+    say(flow, CUSTOM)
+    say(flow, "Розы")
+    say(flow, "завтра к 15:00")
+    point = "📍 55.750000, 37.610000 — https://yandex.ru/maps/?pt=37.610000,55.750000&z=17"
+    assert "подъезд, этаж" in texts(say(flow, point))
+    assert "Кому букет" in texts(say(flow, "подъезд 2, этаж 5, кв. 40"))
+    say(flow, SELF)
+    say(flow, NO_CARD)
+    order = db.get_client_order(say(flow, SEND).events[0][1])
+    assert order.address == point + "\nподъезд 2, этаж 5, кв. 40"
+    # частный дом: «—» ничего не добавляет
+    say(flow, CUSTOM)
+    say(flow, "Розы")
+    say(flow, "завтра к 15:00")
+    say(flow, point)
+    say(flow, "—")
+    say(flow, SELF)
+    say(flow, NO_CARD)
+    assert db.get_client_order(say(flow, SEND).events[0][1]).address == point
