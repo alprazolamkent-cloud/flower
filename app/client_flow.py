@@ -124,11 +124,15 @@ def order_summary(o: ClientOrder | dict) -> str:
 def payment_text(o: ClientOrder, requisites: str, qr: bool = False) -> str:
     """Что клиент видит при оплате. С QR-кодом (он идёт картинкой к этому тексту) — коротко: подпись к фото
     ограничена, а сумму QR не подставляет, её вводят вручную."""
+    if qr and requisites.strip():  # на выбор: QR или перевод
+        return (f"Заказ №{o.id}\n💳 К оплате: {money(o.amount)}\n\nОплатить можно любым способом:\n"
+                f"1. QR-кодом — отсканируйте его в приложении банка и введите сумму {money(o.amount)} (в QR её нет).\n"
+                f"2. Переводом:\n{requisites.strip()}\n\n"
+                "После оплаты нажмите «Я оплатил(а)» или пришлите скриншот.")
     if qr:
-        extra = f"\n{requisites.strip()}" if requisites.strip() else ""
         return (f"Заказ №{o.id}\n💳 К оплате: {money(o.amount)}\n\n"
                 f"Отсканируйте QR-код в приложении банка и введите сумму {money(o.amount)} — "
-                f"в QR её нет.{extra}\n\nПосле оплаты нажмите «Я оплатил(а)» или пришлите скриншот.")
+                f"в QR её нет.\n\nПосле оплаты нажмите «Я оплатил(а)» или пришлите скриншот.")
     return (f"Заказ №{o.id}\n{order_summary(o)}\n\n💳 К оплате: {money(o.amount)}\n{requisites.strip()}\n\n"
             "После оплаты нажмите «Я оплатил(а)» или пришлите сюда скриншот перевода.")
 

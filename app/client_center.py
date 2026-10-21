@@ -6,9 +6,9 @@ from datetime import datetime
 from PySide6.QtCore import QSize, Qt, QUrl
 from PySide6.QtGui import QColor, QDesktopServices, QFont, QIcon, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QDialog, QDialogButtonBox, QFormLayout, QFrame, QHBoxLayout, QInputDialog, QLabel,
-    QLineEdit, QListWidget, QListWidgetItem, QMessageBox, QPlainTextEdit, QPushButton, QSplitter, QTabWidget,
-    QTextBrowser, QVBoxLayout, QWidget,
+    QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QFrame, QHBoxLayout, QInputDialog,
+    QLabel, QLineEdit, QListWidget, QListWidgetItem, QMessageBox, QPlainTextEdit, QPushButton, QSplitter,
+    QTabWidget, QTextBrowser, QVBoxLayout, QWidget,
 )
 
 from .client_bot import QR_FILE, bot_link, client_configured, client_settings, is_max, max_settings
@@ -147,6 +147,8 @@ class ClientCenter(QDialog):
         self.fee_box = money_box()
         self.fee_box.setMaximumWidth(200)
         form.addRow("Из неё за доставку:", self.fee_box)
+        self.pay_box = QComboBox()
+        form.addRow("Как оплатит клиент:", self.pay_box)
         fee_hint = QLabel("Доставка попадёт в «Взяли» у доставки — как обычно.")
         fee_hint.setStyleSheet(f"color: {C.gray}")
         form.addRow(fee_hint)
@@ -237,7 +239,8 @@ class ClientCenter(QDialog):
         self.reject_btn.setVisible(open_)
         self.shot_btn.setVisible(o.has_paid_photo)
         self.day_btn.setVisible(o.status == "confirmed" and o.delivery_id is not None)
-        self.price_btn.setText("💳 Отправить новую сумму" if o.status != "new" else "💳 Отправить сумму и реквизиты")
+        self.price_btn.setText("💳 Отправить новую сумму" if o.status != "new" else "💳 Отправить сумму и оплату")
+        self._fill_pay_methods()
         amount = o.amount
         if not amount and o.showcase_id:  # букет с витрины — подставить его цену, флорист добавит доставку
             item = self.db.get_showcase_item(o.showcase_id)
@@ -249,6 +252,25 @@ class ClientCenter(QDialog):
         hint = HINTS.get(o.status, "")
         self.order_hint.setText(f"<span style='color:{C.gray}'>{hint}</span>" if hint else "")
 
+    def _fill_pay_methods(self):
+        """Способ оплаты выбирают, только если подключены оба: QR-код и реквизиты для перевода."""
+        has_qr = self.db.get_file(QR_FILE) is not None
+        has_text = bool(client_settings()["requisites"].strip())
+        options = [("Любой — на выбор клиента", "both"), ("Только QR-код", "qr"), ("Только перевод", "transfer")] \
+            if has_qr and has_text else []
+        current = self.pay_box.currentData()
+        self.pay_box.blockSignals(True)
+        self.pay_box.clear()
+        for title, key in options:
+            self.pay_box.addItem(title, key)
+        if current:
+            self.pay_box.setCurrentIndex(max(self.pay_box.findData(current), 0))
+        self.pay_box.blockSignals(False)
+        self.pay_box.setVisible(bool(options))
+        label = self.price_frame.layout().labelForField(self.pay_box)
+        if label is not None:
+            label.setVisible(bool(options))
+
     def _send_price(self):
         o = self._order()
         if o is None:
@@ -259,6 +281,11 @@ class ClientCenter(QDialog):
             QMessageBox.warning(self, "Оплата", "Не загружен QR-код и не вписаны реквизиты для оплаты.\n"
                                 "Администратор добавляет их: Настройки → Клиенты.")
             return
+        method = self.pay_box.currentData() or "both"
+        if method == "qr":
+            requisites = ""
+        elif method == "transfer":
+            qr = None
         if o.status == "paid_claimed" and QMessageBox.question(
                 self, "Новая сумма", "Клиент уже сообщил, что оплатил. Всё равно отправить новую сумму?",
                 QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:

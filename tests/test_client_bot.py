@@ -399,13 +399,24 @@ def test_payment_by_qr_code(window):
     c.price_btn.click()
     [(chat, text, markup, has_photo)] = outbox(db)
     assert chat == "555" and has_photo and markup["inline_keyboard"][0][0]["callback_data"] == f"paid:{o.id}"
-    assert "Отсканируйте QR-код" in text and "введите сумму 4 200 ₽" in text and "Сбер" in text
+    assert "QR-кодом" in text and "введите сумму 4 200 ₽" in text and "Сбер" in text
     assert "Ленина" not in text  # с картинкой подпись короткая: заказ клиент и так знает
+    assert "любым способом" in text and c.pay_box.isVisibleTo(c) and c.pay_box.count() == 3  # оба способа — на выбор
+    c.pay_box.setCurrentIndex(c.pay_box.findData("qr"))
+    c.price_btn.click()
+    only_qr = outbox(db)[-1]
+    assert only_qr[3] and "Отсканируйте" in only_qr[1] and "Сбер" not in only_qr[1] and "любым" not in only_qr[1]
+    c.pay_box.setCurrentIndex(c.pay_box.findData("transfer"))
+    c.price_btn.click()
+    only_transfer = outbox(db)[-1]
+    assert not only_transfer[3] and "Сбер" in only_transfer[1] and "QR" not in only_transfer[1]
+    c.pay_box.setCurrentIndex(c.pay_box.findData("both"))
     assert db.get_client_order(o.id).status == "priced"
     # без QR — по-старому, текстом с реквизитами
     db.set_file("payment_qr", None)
     c.price_btn.click()
     assert "Отсканируйте" not in outbox(db)[-1][1] and not outbox(db)[-1][3] and "Сбер" in outbox(db)[-1][1]
+    assert c.pay_box.isHidden()  # один способ — выбирать нечего
 
 
 def test_settings_qr_saved(window):
