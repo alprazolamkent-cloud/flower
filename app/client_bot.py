@@ -39,6 +39,7 @@ def client_settings() -> dict:
     }
 
 
+QR_FILE = "payment_qr"  # QR-код для оплаты (картинка) лежит в базе, в таблице app_files
 MAX_PREFIX = "max:"  # клиенты из MAX хранятся как «max:номер», из Telegram — просто номер чата
 
 

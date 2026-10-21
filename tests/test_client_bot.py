@@ -386,3 +386,40 @@ def test_settings_clients_tab(window, monkeypatch):
     assert (cfg["token"], cfg["requisites"]) == ("new-bot", "Тинькофф +7 900")
     assert w.db.showcase()[0].file_id == ""  # другой бот — фото загрузим заново
     dlg.deleteLater()
+
+
+def test_payment_by_qr_code(window):
+    w, db = window, window.db
+    o = client_order(w)
+    w.open_clients()
+    c = w.client_center
+    db.set_file("payment_qr", jpeg("black", 200, 200))
+    c.amount_box.setValue(4200)
+    c.fee_box.setValue(700)
+    c.price_btn.click()
+    [(chat, text, markup, has_photo)] = outbox(db)
+    assert chat == "555" and has_photo and markup["inline_keyboard"][0][0]["callback_data"] == f"paid:{o.id}"
+    assert "Отсканируйте QR-код" in text and "введите сумму 4 200 ₽" in text and "Сбер" in text
+    assert "Ленина" not in text  # с картинкой подпись короткая: заказ клиент и так знает
+    assert db.get_client_order(o.id).status == "priced"
+    # без QR — по-старому, текстом с реквизитами
+    db.set_file("payment_qr", None)
+    c.price_btn.click()
+    assert "Отсканируйте" not in outbox(db)[-1][1] and not outbox(db)[-1][3] and "Сбер" in outbox(db)[-1][1]
+
+
+def test_settings_qr_saved(window):
+    from app.settings_dialog import SettingsDialog
+    w = window
+    dlg = SettingsDialog(w)
+    assert dlg._qr is None
+    dlg._set_qr(jpeg("black", 300, 300))
+    dlg.accept()
+    assert w.db.get_file("payment_qr")
+    dlg2 = SettingsDialog(w)
+    assert dlg2._qr is not None and not dlg2.qr_label.pixmap().isNull()
+    dlg2._set_qr(None)
+    dlg2.accept()
+    assert w.db.get_file("payment_qr") is None
+    dlg.deleteLater()
+    dlg2.deleteLater()

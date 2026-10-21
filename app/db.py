@@ -204,6 +204,10 @@ CREATE TABLE IF NOT EXISTS announcement_reads (
     read_at         TEXT    NOT NULL,
     PRIMARY KEY (announcement_id, user_id)
 );
+CREATE TABLE IF NOT EXISTS app_files (
+    name TEXT PRIMARY KEY,
+    data BLOB NOT NULL
+);
 CREATE TABLE IF NOT EXISTS showcase (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     title       TEXT    NOT NULL,
@@ -518,6 +522,19 @@ class ClientStore:
         """Telegram запомнил фото — дальше отправляем по номеру, не загружая заново."""
         self.conn.execute("UPDATE showcase SET file_id=? WHERE id=?", (file_id, item_id))
         self.conn.commit()
+
+    def set_file(self, name: str, data: bytes | None):
+        """Файл программы (например, QR-код для оплаты). None — удалить."""
+        if data is None:
+            self.conn.execute("DELETE FROM app_files WHERE name=?", (name,))
+        else:
+            self.conn.execute("INSERT INTO app_files (name, data) VALUES (?, ?)"
+                              " ON CONFLICT (name) DO UPDATE SET data=excluded.data", (name, data))
+        self.conn.commit()
+
+    def get_file(self, name: str) -> bytes | None:
+        r = self.conn.execute("SELECT data FROM app_files WHERE name=?", (name,)).fetchone()
+        return r[0] if r else None
 
     def reset_showcase_file_ids(self):
         """Другой бот — старые номера фото ему не подходят, загрузим заново."""

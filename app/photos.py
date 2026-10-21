@@ -39,23 +39,24 @@ def shrink(data: bytes, max_side: int = MAX_SIDE) -> bytes:
     return to_jpeg(image, max_side, 80)
 
 
-def load_photo(path: str) -> bytes:
+def load_photo(path: str, max_side: int = MAX_SIDE, quality: int = 85) -> bytes:
     """Фото из файла: повернуть как снято (телефон пишет поворот отдельно), уменьшить, JPEG."""
     reader = QImageReader(path)
     reader.setAutoTransform(True)
     image = reader.read()
     if image.isNull():
         raise PhotoError(f"Не получилось открыть фото: {reader.errorString()}")
-    return to_jpeg(image)
+    return to_jpeg(image, max_side, quality)
 
 
-def pick_photo(parent) -> bytes | None:
-    """Спросить файл и вернуть готовое фото (или None, если передумали / не открылось)."""
-    path, _ = QFileDialog.getOpenFileName(parent, "Выберите фото", "", FILTER)
+def pick_photo(parent, title: str = "Выберите фото", max_side: int = MAX_SIDE, quality: int = 85) -> bytes | None:
+    """Спросить файл и вернуть готовое фото (или None, если передумали / не открылось).
+    QR-код просят крупнее и без сильного сжатия, чтобы он сканировался."""
+    path, _ = QFileDialog.getOpenFileName(parent, title, "", FILTER)
     if not path:
         return None
     try:
-        return load_photo(path)
+        return load_photo(path, max_side, quality)
     except PhotoError as e:
         QMessageBox.warning(parent, "Фото", str(e))
         return None

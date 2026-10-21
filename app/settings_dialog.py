@@ -15,13 +15,14 @@ from PySide6.QtWidgets import (
 
 from . import autostart, backup, max_bot, telegram, theme
 from .audit_dialog import AuditDialog
-from .client_bot import bot_link, client_settings, max_settings
+from .client_bot import QR_FILE, bot_link, client_settings, max_settings
 from .db import UserError
 from .duties_dialog import DutiesEditor
 from .salary import DEFAULT_PENALTY_KINDS, WRITEOFF_BASES, PenaltyKind, SalaryRules, Tier
 from .holidays import DEFAULT_TEXT as DEFAULT_HOLIDAYS
 from .holidays import Holidays, parse_holidays
 from .heartbeat import watch_enabled
+from .photos import pick_photo, pixmap
 from .reports import parse_time
 from .salary_dialog import EmployeeTiersDialog, HolidaysDialog, PenaltyCatalogEditor, TiersEditor
 from .shifts import DEFAULT_CHANGE, DEFAULT_GRACE_MINUTES, WaterSchedule
@@ -607,7 +608,7 @@ class SettingsDialog(QDialog):
             "1. В Telegram откройте <b>@BotFather</b>, отправьте <b>/newbot</b>. Имя — «Страна Чудес», "
             "логин — латиницей и с bot на конце (например StranaChudesFlowers_bot).<br>"
             "2. Вставьте присланный токен ниже, нажмите «Проверить» и «Сохранить».<br>"
-            "3. Впишите реквизиты для оплаты — бот пришлёт их клиенту вместе с суммой.<br>"
+            "3. Загрузите QR-код для оплаты (картинкой) и/или впишите реквизиты — бот пришлёт их клиенту вместе с суммой.<br>"
             "4. Ссылку на бота дайте клиентам: в профиле Instagram, на визитке, в статусе WhatsApp.<br>"
             "Фото и описание бота меняются там же, в BotFather: /setuserpic и /setdescription.<br>"
             "<b>MAX</b> — по желанию, вместе с Telegram или вместо него: бот создаёт ИП на dev.max.ru "
@@ -660,13 +661,33 @@ class SettingsDialog(QDialog):
         form.addRow("", self.max_status)
         self.shop_edit = QLineEdit(cfg["shop"])
         form.addRow("Название в приветствии:", self.shop_edit)
+        self._qr = self.db.get_file(QR_FILE)
+        self._qr_changed = False
+        self.qr_label = QLabel()
+        self.qr_label.setFixedSize(120, 120)
+        self.qr_label.setAlignment(Qt.AlignCenter)
+        self.qr_label.setStyleSheet(f"border: 1px dashed {C.card_border}; color: {C.gray};")
+        qr_pick = QPushButton("Выбрать картинку…")
+        qr_pick.clicked.connect(self._pick_qr)
+        qr_clear = QPushButton("Убрать")
+        qr_clear.clicked.connect(lambda: self._set_qr(None))
+        qr_buttons = QVBoxLayout()
+        qr_buttons.addWidget(qr_pick)
+        qr_buttons.addWidget(qr_clear)
+        qr_buttons.addStretch(1)
+        qr_row = QHBoxLayout()
+        qr_row.addWidget(self.qr_label)
+        qr_row.addLayout(qr_buttons)
+        qr_row.addStretch(1)
+        form.addRow("QR-код для оплаты:", qr_row)
+        self._set_qr(self._qr, changed=False)
         self.requisites_edit = QPlainTextEdit(cfg["requisites"])
-        self.requisites_edit.setPlaceholderText("Перевод по номеру +7 900 000-00-00 (Сбербанк, получатель Мария И.)")
-        self.requisites_edit.setFixedHeight(70)
-        form.addRow("Реквизиты для оплаты:", self.requisites_edit)
-        form.addRow(_gray_label("Сумму флорист вписывает каждый раз сам (букет + доставка), бот присылает её\n"
-                                "с реквизитами и кнопкой «Я оплатил(а)». Заказ попадает в доставки, когда\n"
-                                "флорист подтвердит, что деньги пришли."))
+        self.requisites_edit.setPlaceholderText("необязательно: например, «Получатель — ИП Иванова М.П.»")
+        self.requisites_edit.setFixedHeight(60)
+        form.addRow("Текст к оплате:", self.requisites_edit)
+        form.addRow(_gray_label("Сумму флорист вписывает каждый раз сам (букет + доставка). Бот присылает клиенту\n"
+                                "QR-код, сумму текстом (в статическом QR её нет — клиент вводит сама) и кнопку\n"
+                                "«Я оплатил(а)». Заказ попадает в доставки, когда флорист подтвердит оплату."))
         form.addRow(_gray_label("Бот работает, пока компьютер включён и есть интернет. Что клиенты напишут,\n"
                                 "пока он выключен, бот получит позже (Telegram хранит сообщения сутки)."))
         layout.addLayout(form)
@@ -696,6 +717,21 @@ class SettingsDialog(QDialog):
         link = bot_link(self._client_username)
         self.client_status.setText(f"<span style='color:{C.green}'>✅ Работает: @{self._client_username}</span> — "
                                    f"ссылка для клиентов: <a href='{link}'>{link}</a>. Не забудьте «Сохранить».")
+
+    def _set_qr(self, data: bytes | None, changed: bool = True):
+        self._qr = data
+        self._qr_changed |= changed
+        pm = pixmap(data, 116)
+        if pm.isNull():
+            self.qr_label.clear()
+            self.qr_label.setText("нет QR-кода")
+        else:
+            self.qr_label.setPixmap(pm)
+
+    def _pick_qr(self):
+        data = pick_photo(self, "QR-код для оплаты", max_side=1600, quality=95)
+        if data is not None:
+            self._set_qr(data)
 
     def _check_max_bot(self):
         token = self.max_token_edit.text().strip()
@@ -914,6 +950,7 @@ class SettingsDialog(QDialog):
             ("токен бота MAX", max_settings()["token"], self.max_token_edit.text().strip(), True),
             ("название магазина в боте", client_settings()["shop"], self.shop_edit.text().strip(), False),
             ("реквизиты для оплаты", client_settings()["requisites"], self.requisites_edit.toPlainText().strip(), True),
+            ("QR-код для оплаты", "", "изменён" if self._qr_changed else "", False),
             ("флешка / папка для копий", backup_dir(), self.backup_edit.text().strip(), False),
             ("хранить копий", backup_keep(), self.keep_box.value(), False),
         ]
@@ -940,6 +977,8 @@ class SettingsDialog(QDialog):
         settings.setValue("client_token", client_token)
         settings.setValue("client_shop", self.shop_edit.text().strip())
         settings.setValue("client_requisites", self.requisites_edit.toPlainText().strip())
+        if self._qr_changed:
+            self.db.set_file(QR_FILE, self._qr)
         max_token = self.max_token_edit.text().strip()
         if max_token != max_settings()["token"]:  # другой бот MAX — читать с начала
             for key in ("max_marker", "max_bot_username", "max_api"):

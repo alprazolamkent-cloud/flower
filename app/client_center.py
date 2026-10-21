@@ -11,7 +11,7 @@ from PySide6.QtWidgets import (
     QTextBrowser, QVBoxLayout, QWidget,
 )
 
-from .client_bot import bot_link, client_configured, client_settings, is_max, max_settings
+from .client_bot import QR_FILE, bot_link, client_configured, client_settings, is_max, max_settings
 from .client_flow import MENU, inline, payment_text
 from .db import ORDER_STATUS, ClientOrder, ShowcaseItem, UserError
 from .delivery_dialog import money, money_box
@@ -254,9 +254,10 @@ class ClientCenter(QDialog):
         if o is None:
             return
         requisites = client_settings()["requisites"].strip()
-        if not requisites:
-            QMessageBox.warning(self, "Реквизиты", "Не вписаны реквизиты для оплаты.\n"
-                                "Администратор вписывает их: Настройки → Клиенты.")
+        qr = self.db.get_file(QR_FILE)
+        if not requisites and not qr:
+            QMessageBox.warning(self, "Оплата", "Не загружен QR-код и не вписаны реквизиты для оплаты.\n"
+                                "Администратор добавляет их: Настройки → Клиенты.")
             return
         if o.status == "paid_claimed" and QMessageBox.question(
                 self, "Новая сумма", "Клиент уже сообщил, что оплатил. Всё равно отправить новую сумму?",
@@ -267,7 +268,8 @@ class ClientCenter(QDialog):
         except UserError as e:
             QMessageBox.warning(self, "Сумма", str(e))
             return
-        self._to_client(o.chat_id, payment_text(o, requisites), markup=inline(("✅ Я оплатил(а)", f"paid:{o.id}")))
+        self._to_client(o.chat_id, payment_text(o, requisites, bool(qr)), photo=qr,
+                        markup=inline(("✅ Я оплатил(а)", f"paid:{o.id}")))
         self.main.audit("Клиенту отправлена сумма", f"заказ из бота №{o.id}: {money(o.amount)}"
                         + (f" (доставка {money(o.delivery_fee)})" if o.delivery_fee else ""))
         self._changed(o.id)
