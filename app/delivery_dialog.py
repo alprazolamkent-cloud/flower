@@ -2,14 +2,16 @@
 
 from datetime import date
 
-from PySide6.QtCore import QDate
+from PySide6.QtCore import QDate, Qt
+from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDateEdit, QDialog, QDialogButtonBox, QFormLayout, QHBoxLayout, QLabel,
-    QLineEdit, QMessageBox, QPlainTextEdit, QSpinBox,
+    QLineEdit, QMessageBox, QPlainTextEdit, QPushButton, QSpinBox, QToolButton,
 )
 
 from .db import Delivery
 from .messaging import CHANNELS
+from .photos import PhotoViewer, pick_photo, pixmap
 from .theme import C
 
 MAX_MONEY = 10_000_000
@@ -30,9 +32,11 @@ def money_box() -> QSpinBox:
 
 
 class DeliveryDialog(QDialog):
-    def __init__(self, parent, delivery: Delivery):
+    def __init__(self, parent, delivery: Delivery, db=None, on_photo=None):
+        """db и on_photo(фото, окно) — для фото букета (у сохранённой доставки)."""
         super().__init__(parent)
         self.delivery = delivery
+        self.db, self.on_photo = db, on_photo
         self.setWindowTitle("Новая доставка" if delivery.id is None else "Изменить доставку")
         self.setMinimumWidth(460)
 
@@ -69,6 +73,8 @@ class DeliveryDialog(QDialog):
         self.source_box.addItem("— не указано —", "")
         for channel in CHANNELS:
             self.source_box.addItem(channel, channel)
+        if delivery.source and delivery.source not in CHANNELS:  # «Telegram-бот» и т.п. — не терять при сохранении
+            self.source_box.addItem(delivery.source, delivery.source)
         index = self.source_box.findData(delivery.source)
         self.source_box.setCurrentIndex(max(index, 0))
         self.source_box.currentIndexChanged.connect(self._update_contact_hint)
@@ -104,12 +110,41 @@ class DeliveryDialog(QDialog):
         status.addStretch(1)
         form.addRow("", status)
 
+        if db is not None and delivery.id is not None and on_photo is not None:
+            self.photo_row = QHBoxLayout()
+            form.addRow("Фото букета:", self.photo_row)
+            self._show_photos()
+
         buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
         buttons.button(QDialogButtonBox.Save).setText("Сохранить")
         buttons.button(QDialogButtonBox.Cancel).setText("Отмена")
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         form.addRow(buttons)
+
+    def _show_photos(self):
+        while self.photo_row.count():
+            item = self.photo_row.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        photos = self.db.delivery_photos(self.delivery.id)
+        for _, at, data, by in photos[-4:]:
+            thumb = QToolButton()
+            thumb.setIcon(QIcon(pixmap(data, 112)))
+            thumb.setIconSize(pixmap(data, 56).size())
+            thumb.setToolTip(f"{by or 'фото'}, {at:%d.%m %H:%M} — нажмите, чтобы открыть")
+            thumb.clicked.connect(lambda _=False, b=data: PhotoViewer(self, b, "Фото букета").exec())
+            self.photo_row.addWidget(thumb)
+        add = QPushButton("📷 Добавить фото…")
+        add.clicked.connect(self._add_photo)
+        self.photo_row.addWidget(add, 0, Qt.AlignVCenter)
+        self.photo_row.addStretch(1)
+
+    def _add_photo(self):
+        data = pick_photo(self)
+        if data is not None:
+            self.on_photo(data, self)
+            self._show_photos()
 
     def _delivered_toggled(self, delivered: bool):
         """Доставили — значит, и собрали: «собрано» отмечается само и не снимается."""

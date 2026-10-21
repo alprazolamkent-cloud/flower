@@ -1,5 +1,6 @@
 """Хранение доставок, сотрудников и смен в SQLite."""
 
+import json
 import sqlite3
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta
@@ -36,6 +37,8 @@ class Delivery:
     assembled_by: int | None = None
     assembled_at: datetime | None = None
     assembled_by_name: str = ""
+    client_chat: str = ""  # заказ из бота клиентов: чат заказчика (статусы ему уходят сами)
+    photos: int = 0  # сколько фото букета прикреплено
 
     def sent(self, kind: str) -> bool:
         return kind in self.messages.split(",")
@@ -201,6 +204,75 @@ CREATE TABLE IF NOT EXISTS announcement_reads (
     read_at         TEXT    NOT NULL,
     PRIMARY KEY (announcement_id, user_id)
 );
+CREATE TABLE IF NOT EXISTS showcase (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    title       TEXT    NOT NULL,
+    description TEXT    NOT NULL DEFAULT '',
+    price       INTEGER NOT NULL DEFAULT 0,
+    photo       BLOB,
+    file_id     TEXT    NOT NULL DEFAULT '',
+    active      INTEGER NOT NULL DEFAULT 1,
+    position    INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS client_chats (
+    chat_id   TEXT PRIMARY KEY,
+    name      TEXT NOT NULL DEFAULT '',
+    username  TEXT NOT NULL DEFAULT '',
+    phone     TEXT NOT NULL DEFAULT '',
+    state     TEXT NOT NULL DEFAULT '',
+    data      TEXT NOT NULL DEFAULT '{}',
+    last_seen TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS client_orders (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id      TEXT    NOT NULL,
+    created_at   TEXT    NOT NULL,
+    updated_at   TEXT    NOT NULL,
+    showcase_id  INTEGER,
+    items        TEXT    NOT NULL DEFAULT '',
+    day          TEXT    NOT NULL,
+    time         TEXT    NOT NULL DEFAULT '',
+    address      TEXT    NOT NULL DEFAULT '',
+    recipient    TEXT    NOT NULL DEFAULT '',
+    client_phone TEXT    NOT NULL DEFAULT '',
+    card         TEXT    NOT NULL DEFAULT '',
+    status       TEXT    NOT NULL DEFAULT 'new',
+    amount       INTEGER NOT NULL DEFAULT 0,
+    delivery_fee INTEGER NOT NULL DEFAULT 0,
+    paid_photo   BLOB,
+    delivery_id  INTEGER,
+    note         TEXT    NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS client_messages (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id   TEXT    NOT NULL,
+    at        TEXT    NOT NULL,
+    incoming  INTEGER NOT NULL,
+    text      TEXT    NOT NULL DEFAULT '',
+    photo     BLOB,
+    author    TEXT    NOT NULL DEFAULT '',
+    read      INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_client_messages_chat ON client_messages(chat_id, id);
+CREATE TABLE IF NOT EXISTS client_outbox (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id    TEXT NOT NULL,
+    text       TEXT NOT NULL DEFAULT '',
+    markup     TEXT NOT NULL DEFAULT '',
+    photo      BLOB,
+    file_id    TEXT NOT NULL DEFAULT '',
+    ref        TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    sent_at    TEXT
+);
+CREATE TABLE IF NOT EXISTS delivery_photos (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    delivery_id INTEGER NOT NULL,
+    at          TEXT    NOT NULL,
+    photo       BLOB    NOT NULL,
+    by_name     TEXT    NOT NULL DEFAULT '',
+    sent_admins INTEGER NOT NULL DEFAULT 0
+);
 CREATE TABLE IF NOT EXISTS shift_duties (
     shift_id INTEGER NOT NULL,
     duty_id  INTEGER NOT NULL,
@@ -266,6 +338,12 @@ MIGRATIONS = {
     "assembled": "ALTER TABLE deliveries ADD COLUMN assembled INTEGER NOT NULL DEFAULT 0",
     "assembled_by": "ALTER TABLE deliveries ADD COLUMN assembled_by INTEGER",
     "assembled_at": "ALTER TABLE deliveries ADD COLUMN assembled_at TEXT",
+    "client_chat": "ALTER TABLE deliveries ADD COLUMN client_chat TEXT NOT NULL DEFAULT ''",
+}
+
+USER_MIGRATIONS = {
+    "tg_chat": "ALTER TABLE users ADD COLUMN tg_chat TEXT NOT NULL DEFAULT ''",  # Telegram флориста в боте клиентов
+    "tg_code": "ALTER TABLE users ADD COLUMN tg_code TEXT NOT NULL DEFAULT ''",  # код для привязки
 }
 
 COLUMNS = ("d.id, d.day, d.time, d.items, d.recipient, d.phone, d.address, d.price,"
@@ -273,7 +351,8 @@ COLUMNS = ("d.id, d.day, d.time, d.items, d.recipient, d.phone, d.address, d.pri
            " COALESCE(NULLIF(uc.name, ''), uc.login, ''), COALESCE(NULLIF(ud.name, ''), ud.login, ''),"
            " d.source, d.customer_contact, d.messages, d.delete_requested_at,"
            " COALESCE(NULLIF(ur.name, ''), ur.login, ''),"
-           " d.assembled, d.assembled_by, d.assembled_at, COALESCE(NULLIF(ua.name, ''), ua.login, '')")
+           " d.assembled, d.assembled_by, d.assembled_at, COALESCE(NULLIF(ua.name, ''), ua.login, ''),"
+           " d.client_chat, (SELECT COUNT(*) FROM delivery_photos p WHERE p.delivery_id = d.id)")
 FROM = ("deliveries d LEFT JOIN users uc ON uc.id = d.created_by"
         " LEFT JOIN users ud ON ud.id = d.delivered_by"
         " LEFT JOIN users ur ON ur.id = d.delete_requested_by"
@@ -305,6 +384,8 @@ def _row_to_delivery(row) -> Delivery:
         assembled_by=row[20],
         assembled_at=datetime.fromisoformat(row[21]) if row[21] else None,
         assembled_by_name=row[22],
+        client_chat=row[23],
+        photos=row[24],
     )
 
 
@@ -312,7 +393,389 @@ class UserError(Exception):
     """Ошибка с понятным пользователю текстом."""
 
 
-class Database:
+# ----- бот клиентов: витрина, заказы, переписка, фото букетов -----
+
+ORDER_STATUS = {
+    "new": "новый — назначьте сумму",
+    "priced": "ждёт оплаты",
+    "paid_claimed": "клиент оплатил — проверьте",
+    "confirmed": "принят",
+    "rejected": "отклонён",
+}
+
+
+@dataclass
+class ShowcaseItem:
+    id: int
+    title: str
+    description: str = ""
+    price: int = 0
+    photo: bytes | None = None
+    file_id: str = ""
+    active: bool = True
+    position: int = 0
+
+
+@dataclass
+class ClientChat:
+    chat_id: str
+    name: str = ""
+    username: str = ""
+    phone: str = ""
+    state: str = ""
+    data: dict = field(default_factory=dict)
+    last_seen: datetime | None = None
+
+
+@dataclass
+class ClientOrder:
+    id: int
+    chat_id: str
+    created_at: datetime
+    updated_at: datetime
+    day: date
+    time: str = ""
+    items: str = ""
+    address: str = ""
+    recipient: str = ""
+    client_phone: str = ""
+    card: str = ""
+    status: str = "new"
+    amount: int = 0
+    delivery_fee: int = 0
+    has_paid_photo: bool = False
+    delivery_id: int | None = None
+    showcase_id: int | None = None
+    note: str = ""
+    client_name: str = ""
+
+
+@dataclass
+class ClientMessage:
+    id: int
+    chat_id: str
+    at: datetime
+    incoming: bool
+    text: str
+    has_photo: bool = False
+    author: str = ""
+    read: bool = False
+
+
+ORDER_SELECT = (
+    "SELECT o.id, o.chat_id, o.created_at, o.updated_at, o.day, o.time, o.items, o.address, o.recipient,"
+    " o.client_phone, o.card, o.status, o.amount, o.delivery_fee, o.paid_photo IS NOT NULL, o.delivery_id,"
+    " o.showcase_id, o.note, COALESCE(NULLIF(c.name, ''), c.username, '')"
+    " FROM client_orders o LEFT JOIN client_chats c ON c.chat_id = o.chat_id")
+
+
+def _row_to_order(r) -> ClientOrder:
+    return ClientOrder(id=r[0], chat_id=r[1], created_at=datetime.fromisoformat(r[2]),
+                       updated_at=datetime.fromisoformat(r[3]), day=date.fromisoformat(r[4]), time=r[5],
+                       items=r[6], address=r[7], recipient=r[8], client_phone=r[9], card=r[10], status=r[11],
+                       amount=r[12], delivery_fee=r[13], has_paid_photo=bool(r[14]), delivery_id=r[15],
+                       showcase_id=r[16], note=r[17], client_name=r[18])
+
+
+class ClientStore:
+    """Методы для бота клиентов (подмешиваются в Database)."""
+
+    conn: sqlite3.Connection
+
+    # --- витрина ---
+
+    def showcase(self, only_active: bool = False) -> list[ShowcaseItem]:
+        sql = "SELECT id, title, description, price, photo, file_id, active, position FROM showcase"
+        if only_active:
+            sql += " WHERE active = 1"
+        rows = self.conn.execute(sql + " ORDER BY position, id").fetchall()
+        return [ShowcaseItem(r[0], r[1], r[2], r[3], r[4], r[5], bool(r[6]), r[7]) for r in rows]
+
+    def get_showcase_item(self, item_id: int) -> ShowcaseItem | None:
+        return next((i for i in self.showcase() if i.id == item_id), None)
+
+    def save_showcase_item(self, item: ShowcaseItem) -> int:
+        if not item.title.strip():
+            raise UserError("Напишите название букета.")
+        if item.price < 0:
+            raise UserError("Цена не может быть отрицательной.")
+        if item.id:
+            old = self.get_showcase_item(item.id)
+            file_id = item.file_id if old is None or old.photo == item.photo else ""  # новое фото — новый file_id
+            self.conn.execute("UPDATE showcase SET title=?, description=?, price=?, photo=?, file_id=?, active=?"
+                              " WHERE id=?", (item.title.strip(), item.description.strip(), item.price, item.photo,
+                                              file_id, int(item.active), item.id))
+        else:
+            position = self.conn.execute("SELECT COALESCE(MAX(position), 0) + 1 FROM showcase").fetchone()[0]
+            cur = self.conn.execute(
+                "INSERT INTO showcase (title, description, price, photo, active, position) VALUES (?, ?, ?, ?, ?, ?)",
+                (item.title.strip(), item.description.strip(), item.price, item.photo, int(item.active), position))
+            item.id = cur.lastrowid
+        self.conn.commit()
+        return item.id
+
+    def set_showcase_file_id(self, item_id: int, file_id: str):
+        """Telegram запомнил фото — дальше отправляем по номеру, не загружая заново."""
+        self.conn.execute("UPDATE showcase SET file_id=? WHERE id=?", (file_id, item_id))
+        self.conn.commit()
+
+    def reset_showcase_file_ids(self):
+        """Другой бот — старые номера фото ему не подходят, загрузим заново."""
+        self.conn.execute("UPDATE showcase SET file_id=''")
+        self.conn.commit()
+
+    def delete_showcase_item(self, item_id: int):
+        self.conn.execute("DELETE FROM showcase WHERE id=?", (item_id,))
+        self.conn.commit()
+
+    def move_showcase_item(self, item_id: int, step: int):
+        items = self.showcase()
+        index = next((i for i, x in enumerate(items) if x.id == item_id), None)
+        if index is None or not 0 <= index + step < len(items):
+            return
+        items[index], items[index + step] = items[index + step], items[index]
+        for position, x in enumerate(items):
+            self.conn.execute("UPDATE showcase SET position=? WHERE id=?", (position, x.id))
+        self.conn.commit()
+
+    # --- клиенты ---
+
+    def client_chat(self, chat_id: str) -> ClientChat | None:
+        r = self.conn.execute("SELECT chat_id, name, username, phone, state, data, last_seen FROM client_chats"
+                              " WHERE chat_id=?", (str(chat_id),)).fetchone()
+        if r is None:
+            return None
+        try:
+            data = json.loads(r[5] or "{}")
+        except ValueError:
+            data = {}
+        return ClientChat(r[0], r[1], r[2], r[3], r[4], data, datetime.fromisoformat(r[6]))
+
+    def touch_client(self, chat_id: str, name: str, username: str, now: datetime) -> ClientChat:
+        self.conn.execute(
+            "INSERT INTO client_chats (chat_id, name, username, last_seen) VALUES (?, ?, ?, ?)"
+            " ON CONFLICT (chat_id) DO UPDATE SET name=excluded.name, username=excluded.username,"
+            " last_seen=excluded.last_seen", (str(chat_id), name, username, _ts(now)))
+        self.conn.commit()
+        return self.client_chat(chat_id)
+
+    def save_client_state(self, chat_id: str, state: str, data: dict, phone: str | None = None):
+        self.conn.execute("UPDATE client_chats SET state=?, data=? WHERE chat_id=?",
+                          (state, json.dumps(data, ensure_ascii=False), str(chat_id)))
+        if phone:
+            self.conn.execute("UPDATE client_chats SET phone=? WHERE chat_id=?", (phone, str(chat_id)))
+        self.conn.commit()
+
+    def client_chats(self) -> list[tuple[ClientChat, int, ClientMessage | None]]:
+        """Переписки для окна «Клиенты»: (клиент, непрочитанных, последнее сообщение), свежие сверху."""
+        result = []
+        for (chat_id,) in self.conn.execute(
+                "SELECT chat_id FROM client_messages GROUP BY chat_id ORDER BY MAX(id) DESC").fetchall():
+            unread = self.conn.execute("SELECT COUNT(*) FROM client_messages WHERE chat_id=? AND incoming=1"
+                                       " AND read=0", (chat_id,)).fetchone()[0]
+            last = self.client_messages(chat_id, limit=1)
+            result.append((self.client_chat(chat_id) or ClientChat(chat_id), unread, last[-1] if last else None))
+        return result
+
+    # --- заказы ---
+
+    def add_client_order(self, chat_id: str, now: datetime, day: date, time: str, items: str, address: str,
+                         recipient: str, client_phone: str, card: str, showcase_id: int | None = None) -> ClientOrder:
+        cur = self.conn.execute(
+            "INSERT INTO client_orders (chat_id, created_at, updated_at, showcase_id, items, day, time, address,"
+            " recipient, client_phone, card) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (str(chat_id), _ts(now), _ts(now), showcase_id, items, day.isoformat(), time, address, recipient,
+             client_phone, card))
+        self.conn.commit()
+        return self.get_client_order(cur.lastrowid)
+
+    def get_client_order(self, order_id: int) -> ClientOrder | None:
+        r = self.conn.execute(ORDER_SELECT + " WHERE o.id=?", (order_id,)).fetchone()
+        return _row_to_order(r) if r else None
+
+    def client_orders(self, chat_id: str | None = None, open_only: bool = False, limit: int = 200) -> list[ClientOrder]:
+        sql, params = ORDER_SELECT + " WHERE 1=1", []
+        if chat_id is not None:
+            sql += " AND o.chat_id=?"
+            params.append(str(chat_id))
+        if open_only:
+            sql += " AND o.status IN ('new', 'priced', 'paid_claimed')"
+        rows = self.conn.execute(sql + " ORDER BY o.id DESC LIMIT ?", (*params, limit)).fetchall()
+        return [_row_to_order(r) for r in rows]
+
+    def price_client_order(self, order_id: int, amount: int, delivery_fee: int, now: datetime) -> ClientOrder:
+        if amount <= 0:
+            raise UserError("Впишите сумму к оплате.")
+        if not 0 <= delivery_fee <= amount:
+            raise UserError("Доставка не может быть больше всей суммы.")
+        self.conn.execute("UPDATE client_orders SET amount=?, delivery_fee=?, status='priced', updated_at=?"
+                          " WHERE id=? AND status IN ('new', 'priced', 'paid_claimed')",
+                          (amount, delivery_fee, _ts(now), order_id))
+        self.conn.commit()
+        return self.get_client_order(order_id)
+
+    def set_client_order_status(self, order_id: int, status: str, now: datetime, note: str | None = None):
+        self.conn.execute("UPDATE client_orders SET status=?, updated_at=? WHERE id=?", (status, _ts(now), order_id))
+        if note is not None:
+            self.conn.execute("UPDATE client_orders SET note=? WHERE id=?", (note, order_id))
+        self.conn.commit()
+
+    def set_paid_photo(self, order_id: int, photo: bytes, now: datetime):
+        self.conn.execute("UPDATE client_orders SET paid_photo=?, status='paid_claimed', updated_at=? WHERE id=?"
+                          " AND status IN ('priced', 'paid_claimed')", (photo, _ts(now), order_id))
+        self.conn.commit()
+
+    def paid_photo(self, order_id: int) -> bytes | None:
+        r = self.conn.execute("SELECT paid_photo FROM client_orders WHERE id=?", (order_id,)).fetchone()
+        return r[0] if r else None
+
+    def confirm_client_order(self, order_id: int, user_id: int | None, now: datetime) -> Delivery:
+        """Оплата пришла: заказ становится доставкой в календаре (букет ещё не собран)."""
+        order = self.get_client_order(order_id)
+        if order is None:
+            raise UserError("Такого заказа нет.")
+        if order.status == "confirmed" and order.delivery_id:
+            raise UserError("Заказ уже принят.")
+        if order.amount <= 0:
+            raise UserError("Сначала назначьте сумму и отправьте её клиенту.")
+        chat = self.client_chat(order.chat_id)
+        name = chat.name if chat else ""
+        d = Delivery(day=order.day, time=order.time,
+                     items=order.items + (f"\nОткрытка: {order.card}" if order.card else ""),
+                     recipient=order.recipient, address=order.address, price=order.delivery_fee,
+                     created_by=user_id, source="Telegram-бот",
+                     customer_contact=" ".join(x for x in (name, order.client_phone) if x),
+                     client_chat=order.chat_id)
+        self.add(d)
+        self.conn.execute("UPDATE client_orders SET status='confirmed', delivery_id=?, updated_at=? WHERE id=?",
+                          (d.id, _ts(now), order_id))
+        self.conn.commit()
+        return d
+
+    def order_for_delivery(self, delivery_id: int) -> ClientOrder | None:
+        r = self.conn.execute(ORDER_SELECT + " WHERE o.delivery_id=?", (delivery_id,)).fetchone()
+        return _row_to_order(r) if r else None
+
+    # --- переписка ---
+
+    def add_client_message(self, chat_id: str, incoming: bool, text: str, now: datetime, photo: bytes | None = None,
+                           author: str = "") -> int:
+        cur = self.conn.execute(
+            "INSERT INTO client_messages (chat_id, at, incoming, text, photo, author, read) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (str(chat_id), _ts(now), int(incoming), text, photo, author, int(not incoming)))
+        self.conn.commit()
+        return cur.lastrowid
+
+    def client_messages(self, chat_id: str, limit: int = 200) -> list[ClientMessage]:
+        rows = self.conn.execute(
+            "SELECT id, chat_id, at, incoming, text, photo IS NOT NULL, author, read FROM client_messages"
+            " WHERE chat_id=? ORDER BY id DESC LIMIT ?", (str(chat_id), limit)).fetchall()
+        return [ClientMessage(r[0], r[1], datetime.fromisoformat(r[2]), bool(r[3]), r[4], bool(r[5]), r[6], bool(r[7]))
+                for r in reversed(rows)]
+
+    def client_message_photo(self, message_id: int) -> bytes | None:
+        r = self.conn.execute("SELECT photo FROM client_messages WHERE id=?", (message_id,)).fetchone()
+        return r[0] if r else None
+
+    def mark_client_read(self, chat_id: str):
+        self.conn.execute("UPDATE client_messages SET read=1 WHERE chat_id=? AND incoming=1", (str(chat_id),))
+        self.conn.commit()
+
+    def client_unread(self) -> int:
+        return self.conn.execute("SELECT COUNT(*) FROM client_messages WHERE incoming=1 AND read=0").fetchone()[0]
+
+    # --- очередь сообщений клиентам ---
+
+    def queue_client(self, chat_id: str, text: str, now: datetime, markup: dict | None = None,
+                     photo: bytes | None = None, file_id: str = "", ref: str = ""):
+        """Сообщение клиенту через бота. ref — «showcase:5»: после отправки запомнить file_id фото витрины."""
+        self.conn.execute("INSERT INTO client_outbox (chat_id, text, markup, photo, file_id, ref, created_at)"
+                          " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                          (str(chat_id), text, json.dumps(markup, ensure_ascii=False) if markup else "", photo,
+                           file_id, ref, _ts(now)))
+        self.conn.commit()
+
+    def unsent_client(self, limit: int = 20) -> list[tuple[int, str, str, str, bytes | None, str, str]]:
+        return self.conn.execute("SELECT id, chat_id, text, markup, photo, file_id, ref FROM client_outbox"
+                                 " WHERE sent_at IS NULL ORDER BY id LIMIT ?", (limit,)).fetchall()
+
+    def mark_client_sent(self, outbox_id: int, now: datetime):
+        self.conn.execute("UPDATE client_outbox SET sent_at=?, photo=NULL WHERE id=?", (_ts(now), outbox_id))
+        self.conn.commit()
+
+    # --- фото букетов ---
+
+    def add_delivery_photo(self, delivery_id: int, photo: bytes, by_name: str, now: datetime) -> int:
+        cur = self.conn.execute("INSERT INTO delivery_photos (delivery_id, at, photo, by_name) VALUES (?, ?, ?, ?)",
+                                (delivery_id, _ts(now), photo, by_name))
+        self.conn.commit()
+        return cur.lastrowid
+
+    def delivery_photos(self, delivery_id: int) -> list[tuple[int, datetime, bytes, str]]:
+        rows = self.conn.execute("SELECT id, at, photo, by_name FROM delivery_photos WHERE delivery_id=? ORDER BY id",
+                                 (delivery_id,)).fetchall()
+        return [(r[0], datetime.fromisoformat(r[1]), r[2], r[3]) for r in rows]
+
+    def photos_for_admins(self) -> list[tuple[int, int, bytes, str]]:
+        """Фото, которые ещё не ушли администраторам: (номер, доставка, фото, кто снял)."""
+        return self.conn.execute("SELECT id, delivery_id, photo, by_name FROM delivery_photos WHERE sent_admins=0"
+                                 " ORDER BY id LIMIT 5").fetchall()
+
+    def mark_photo_sent(self, photo_id: int):
+        self.conn.execute("UPDATE delivery_photos SET sent_admins=1 WHERE id=?", (photo_id,))
+        self.conn.commit()
+
+    def prune_photos(self, before: datetime) -> int:
+        """Удалить фото букетов, переписки и оплат старше before (витрину не трогаем): база не пухнет.
+        Возвращает, сколько удалено."""
+        removed = 0
+        for sql in ("DELETE FROM delivery_photos WHERE at < ?",
+                    "UPDATE client_messages SET photo=NULL WHERE photo IS NOT NULL AND at < ?",
+                    "UPDATE client_orders SET paid_photo=NULL WHERE paid_photo IS NOT NULL AND updated_at < ?",
+                    "UPDATE client_outbox SET photo=NULL WHERE photo IS NOT NULL AND created_at < ?"):
+            removed += self.conn.execute(sql, (_ts(before),)).rowcount
+        self.conn.commit()
+        if removed:
+            self.conn.execute("VACUUM")  # вернуть место на диске (и копии станут меньше)
+        return removed
+
+    # --- флористы в боте клиентов ---
+
+    def link_code(self, user_id: int) -> str:
+        """Код (8 цифр), который флорист отправляет боту (/start КОД), чтобы бот знал его и просил фото букетов."""
+        r = self.conn.execute("SELECT tg_code FROM users WHERE id=?", (user_id,)).fetchone()
+        if r and r[0]:
+            return r[0]
+        import secrets
+        code = f"{secrets.randbelow(90_000_000) + 10_000_000}"
+        self.conn.execute("UPDATE users SET tg_code=? WHERE id=?", (code, user_id))
+        self.conn.commit()
+        return code
+
+    def link_staff(self, code: str, chat_id: str) -> "User | None":
+        code = code.strip()
+        r = self.conn.execute("SELECT id FROM users WHERE tg_code=? AND tg_code<>''", (code,)).fetchone()
+        if r is None:
+            return None
+        self.conn.execute("UPDATE users SET tg_chat='' WHERE tg_chat=?", (str(chat_id),))
+        self.conn.execute("UPDATE users SET tg_chat=?, tg_code='' WHERE id=?", (str(chat_id), r[0]))
+        self.conn.commit()
+        return next((u for u in self.users() if u.id == r[0]), None)
+
+    def staff_chat(self, user_id: int) -> str:
+        r = self.conn.execute("SELECT tg_chat FROM users WHERE id=?", (user_id,)).fetchone()
+        return r[0] if r else ""
+
+    def staff_by_chat(self, chat_id: str) -> "User | None":
+        r = self.conn.execute("SELECT id FROM users WHERE tg_chat=? AND tg_chat<>''", (str(chat_id),)).fetchone()
+        return next((u for u in self.users() if u.id == r[0]), None) if r else None
+
+    def unlink_staff(self, user_id: int):
+        self.conn.execute("UPDATE users SET tg_chat='' WHERE id=?", (user_id,))
+        self.conn.commit()
+
+
+class Database(ClientStore):
     def __init__(self, path: str):
         self.path = path
         self.conn = sqlite3.connect(path)
@@ -323,6 +786,10 @@ class Database:
                 self.conn.execute(sql)
         if "assembled" not in existing:  # до появления «собрано»: доставленные, конечно, были собраны
             self.conn.execute("UPDATE deliveries SET assembled = 1 WHERE delivered = 1")
+        existing = {r[1] for r in self.conn.execute("PRAGMA table_info(users)")}
+        for column, sql in USER_MIGRATIONS.items():
+            if column not in existing:
+                self.conn.execute(sql)
         existing = {r[1] for r in self.conn.execute("PRAGMA table_info(shifts)")}
         for column, sql in SHIFT_MIGRATIONS.items():
             if column not in existing:
@@ -367,12 +834,12 @@ class Database:
         cur = self.conn.execute(
             "INSERT INTO deliveries (day, time, items, recipient, phone, address,"
             " price, courier_pay, delivered, created_by, delivered_by,"
-            " source, customer_contact, messages, assembled, assembled_by, assembled_at)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " source, customer_contact, messages, assembled, assembled_by, assembled_at, client_chat)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (d.day.isoformat(), d.time, d.items, d.recipient, d.phone, d.address,
              d.price, d.courier_pay, int(d.delivered), d.created_by,
              d.delivered_by if d.delivered else None, d.source, d.customer_contact, d.messages,
-             *self._assembly_values(d)),
+             *self._assembly_values(d), d.client_chat),
         )
         self.conn.commit()
         d.id = cur.lastrowid
@@ -445,6 +912,7 @@ class Database:
 
     def delete(self, delivery_id: int):
         self.conn.execute("DELETE FROM deliveries WHERE id=?", (delivery_id,))
+        self.conn.execute("DELETE FROM delivery_photos WHERE delivery_id=?", (delivery_id,))
         self.conn.commit()
 
     def for_day(self, day: date) -> list[Delivery]:

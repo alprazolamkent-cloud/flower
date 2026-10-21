@@ -9,12 +9,13 @@ from PySide6.QtCore import QDate, QSettings, Qt, QTime, QTimer, QUrl
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDateEdit, QDialog, QDialogButtonBox, QDoubleSpinBox, QFileDialog, QFormLayout,
-    QGroupBox, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMessageBox, QPushButton,
-    QSpinBox, QTabWidget, QTimeEdit, QVBoxLayout, QWidget,
+    QGroupBox, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMessageBox, QPlainTextEdit,
+    QPushButton, QSpinBox, QTabWidget, QTimeEdit, QVBoxLayout, QWidget,
 )
 
 from . import autostart, backup, telegram, theme
 from .audit_dialog import AuditDialog
+from .client_bot import bot_link, client_settings
 from .db import UserError
 from .duties_dialog import DutiesEditor
 from .salary import DEFAULT_PENALTY_KINDS, WRITEOFF_BASES, PenaltyKind, SalaryRules, Tier
@@ -250,6 +251,7 @@ class SettingsDialog(QDialog):
         self.tabs.addTab(self._salary_tab(), "Зарплата")
         self.tabs.addTab(self._penalty_tab(), "Санкции")
         self.tabs.addTab(self._telegram_tab(), "Telegram")
+        self.tabs.addTab(self._clients_tab(), "Клиенты")
         self.tabs.addTab(self._reports_tab(), "Отчёты")
         self.tabs.addTab(self._backup_tab(), "Копии")
         self.tabs.addTab(self._program_tab(), "Программа")
@@ -594,6 +596,83 @@ class SettingsDialog(QDialog):
         layout.addStretch(1)
         return page
 
+    def _clients_tab(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        cfg = client_settings()
+        steps = QLabel(
+            "<b>Бот для клиентов</b> — отдельный от бота администраторов. Клиенты смотрят витрину, заказывают "
+            "букет и пишут флористу, а заказы и сообщения появляются в окне «🛍 Клиенты».<br><br>"
+            "<b>Как подключить</b> (один раз):<br>"
+            "1. В Telegram откройте <b>@BotFather</b>, отправьте <b>/newbot</b>. Имя — «Страна Чудес», "
+            "логин — латиницей и с bot на конце (например StranaChudesFlowers_bot).<br>"
+            "2. Вставьте присланный токен ниже, нажмите «Проверить» и «Сохранить».<br>"
+            "3. Впишите реквизиты для оплаты — бот пришлёт их клиенту вместе с суммой.<br>"
+            "4. Ссылку на бота дайте клиентам: в профиле Instagram, на визитке, в статусе WhatsApp.<br>"
+            "Фото и описание бота меняются там же, в BotFather: /setuserpic и /setdescription.")
+        steps.setWordWrap(True)
+        layout.addWidget(steps)
+        form = QFormLayout()
+        self.client_token_edit = QLineEdit(cfg["token"])
+        self.client_token_edit.setEchoMode(QLineEdit.Password)
+        self.client_token_edit.setPlaceholderText("токен второго бота, 1234567890:AAH…")
+        show = QCheckBox("показать")
+        show.toggled.connect(
+            lambda on: self.client_token_edit.setEchoMode(QLineEdit.Normal if on else QLineEdit.Password))
+        check = QPushButton("Проверить")
+        check.clicked.connect(self._check_client_bot)
+        token_row = QHBoxLayout()
+        token_row.addWidget(self.client_token_edit, 1)
+        token_row.addWidget(show)
+        token_row.addWidget(check)
+        form.addRow("Токен бота:", token_row)
+        self.client_status = QLabel()
+        self.client_status.setOpenExternalLinks(True)
+        self.client_status.setTextInteractionFlags(Qt.TextBrowserInteraction)
+        self._client_username = ""
+        if cfg["token"] and cfg["username"]:
+            link = bot_link(cfg["username"])
+            self.client_status.setText(f"Бот @{cfg['username']}, ссылка для клиентов: <a href='{link}'>{link}</a>")
+        form.addRow("", self.client_status)
+        self.shop_edit = QLineEdit(cfg["shop"])
+        form.addRow("Название в приветствии:", self.shop_edit)
+        self.requisites_edit = QPlainTextEdit(cfg["requisites"])
+        self.requisites_edit.setPlaceholderText("Перевод по номеру +7 900 000-00-00 (Сбербанк, получатель Мария И.)")
+        self.requisites_edit.setFixedHeight(70)
+        form.addRow("Реквизиты для оплаты:", self.requisites_edit)
+        form.addRow(_gray_label("Сумму флорист вписывает каждый раз сам (букет + доставка), бот присылает её\n"
+                                "с реквизитами и кнопкой «Я оплатил(а)». Заказ попадает в доставки, когда\n"
+                                "флорист подтвердит, что деньги пришли."))
+        form.addRow(_gray_label("Бот работает, пока компьютер включён и есть интернет. Что клиенты напишут,\n"
+                                "пока он выключен, бот получит позже (Telegram хранит сообщения сутки)."))
+        layout.addLayout(form)
+        if self.main.client_bot.last_error:
+            error = QLabel(f"<span style='color:{C.red}'>Последняя ошибка бота: "
+                           f"{self.main.client_bot.last_error}</span>")
+            error.setWordWrap(True)
+            layout.addWidget(error)
+        layout.addStretch(1)
+        return page
+
+    def _check_client_bot(self):
+        token = self.client_token_edit.text().strip()
+        if not token:
+            QMessageBox.warning(self, "Бот для клиентов", "Сначала вставьте токен бота.")
+            return
+        if token == self.token_edit.text().strip():
+            QMessageBox.warning(self, "Бот для клиентов", "Это токен бота для администраторов. "
+                                "Для клиентов нужен отдельный бот — создайте его в @BotFather (/newbot).")
+            return
+        try:
+            me = telegram.get_me(token)
+        except telegram.TelegramError as e:
+            self.client_status.setText(f"<span style='color:{C.red}'>Не работает: {e}</span>")
+            return
+        self._client_username = me.get("username", "")
+        link = bot_link(self._client_username)
+        self.client_status.setText(f"<span style='color:{C.green}'>✅ Работает: @{self._client_username}</span> — "
+                                   f"ссылка для клиентов: <a href='{link}'>{link}</a>. Не забудьте «Сохранить».")
+
     def _backup_tab(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
@@ -791,6 +870,9 @@ class SettingsDialog(QDialog):
             ("сообщать о начале смены", old_tg["on_start"], self.tg_start.isChecked(), False),
             ("итоги при сдаче", old_tg["on_close"], self.tg_close.isChecked(), False),
             ("следить за связью", watch_enabled(), self.tg_watch.isChecked(), False),
+            ("токен бота для клиентов", client_settings()["token"], self.client_token_edit.text().strip(), True),
+            ("название магазина в боте", client_settings()["shop"], self.shop_edit.text().strip(), False),
+            ("реквизиты для оплаты", client_settings()["requisites"], self.requisites_edit.toPlainText().strip(), True),
             ("флешка / папка для копий", backup_dir(), self.backup_edit.text().strip(), False),
             ("хранить копий", backup_keep(), self.keep_box.value(), False),
         ]
@@ -800,8 +882,24 @@ class SettingsDialog(QDialog):
             self.db.log_action(self.main.user, "Настройки изменены", "; ".join(changes))
 
     def accept(self):
+        client_token = self.client_token_edit.text().strip()
+        if client_token and client_token == self.token_edit.text().strip():
+            self.tabs.setCurrentIndex(self.tabs.indexOf(self.client_token_edit.parentWidget()))
+            QMessageBox.warning(self, "Бот для клиентов", "Токен бота для клиентов совпадает с ботом администраторов. "
+                                "Нужен отдельный бот — иначе они будут мешать друг другу.")
+            return
         self._log_changes()
         settings = _settings()
+        if client_token != client_settings()["token"]:  # другой бот: читать с начала, фото витрины загрузить заново
+            settings.remove("client_offset")
+            settings.remove("client_bot_username")
+            self.db.reset_showcase_file_ids()
+        if self._client_username:
+            settings.setValue("client_bot_username", self._client_username)
+        settings.setValue("client_token", client_token)
+        settings.setValue("client_shop", self.shop_edit.text().strip())
+        settings.setValue("client_requisites", self.requisites_edit.toPlainText().strip())
+        QTimer.singleShot(0, self.main.client_bot.poll)  # новый бот — сразу начать слушать
         settings.setValue("lead_minutes", self.lead_box.value())
         settings.setValue("late_minutes", self.late_box.value())
         settings.setValue("assembly_minutes", self.assembly_box.value())

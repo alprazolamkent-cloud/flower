@@ -138,14 +138,23 @@ def test_plan_empty(db):
 # ----- копия в Telegram -----
 
 def test_zip_and_extract(db, tmp_path):
-    db.add(Delivery(day=NOW.date(), items="Розы"))
+    from app.db import ShowcaseItem
+    d = Delivery(day=NOW.date(), items="Розы")
+    db.add(d)
+    db.add_delivery_photo(d.id, b"photo" * 1000, "Анна", NOW)
+    db.add_client_message("5", True, "вот пример", NOW, b"photo")
+    db.save_showcase_item(ShowcaseItem(0, "Нежность", price=100, photo=b"showcase"))
     copy = str(tmp_path / "deliveries-2026.db")
     db.backup(copy)
     archive = backup.zip_copy(copy, NOW)
     assert archive.endswith(".zip") and os.path.basename(archive).isascii()
     restored = Database(backup.extract_db(archive))
     assert restored.for_day(NOW.date())[0].items == "Розы"
+    # в Telegram — без фото букетов и переписки (предел 50 МБ), витрина остаётся
+    assert restored.delivery_photos(d.id) == [] and restored.client_messages("5")[0].text == "вот пример"
+    assert not restored.client_messages("5")[0].has_photo and restored.showcase()[0].photo == b"showcase"
     restored.close()
+    assert len(db.delivery_photos(d.id)) == 1  # в самой базе всё на месте
     bad = tmp_path / "bad.zip"
     bad.write_bytes(b"not a zip")
     with pytest.raises(UserError):
@@ -241,7 +250,7 @@ def test_daily_backup_to_telegram(window, monkeypatch, tmp_path):
     sent = []
     monkeypatch.setattr(w.telegram, "send_file", lambda path, caption, tag, chats=None: sent.append((path, tag)))
     monkeypatch.setattr(w, "run_backup", lambda: backup.BackupResult(str(tmp_path / "copy.db")))
-    (tmp_path / "copy.db").write_bytes(b"sqlite")
+    w.db.backup(str(tmp_path / "copy.db"))
     w.db.path = str(tmp_path / "live.db")  # не ":memory:"
     day = date.today()
     w._maybe_send_backup(datetime.combine(day, time(8, 10)))  # ночную смену ещё сдают — рано

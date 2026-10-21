@@ -16,7 +16,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout, QWidget,
 )
 
-from .db import Database, Delivery, Totals, User
+from .db import ORDER_STATUS, Database, Delivery, Totals, User
 from .delivery_dialog import DeliveryDialog, money
 from .icon import flower_icon
 from .messaging import KINDS, SHORT, build_action, render
@@ -41,6 +41,10 @@ from .templates_dialog import load_templates
 from .theme import C
 from .update_ui import UpdateController
 from .assembly_dialog import SNOOZE, AssemblyReminder
+from .client_bot import ClientBot, client_configured
+from .client_center import NEEDS_ACTION, ClientCenter, StaffLinkDialog, needs_action
+from .client_flow import order_summary
+from .photos import PhotoViewer
 from .heartbeat import Heartbeat
 from .reminders import assembly_due, assembly_escalations, due_reminders, overdue_deliveries, reminder_key
 from .shift_plan import ShiftPlanDialog
@@ -65,10 +69,18 @@ WRAP_UP_TO = {COL_RECIPIENT: 170, COL_CUSTOMER: 160}  # длинное — пе�
 MIN_WIDTH = {COL_ITEMS: 220, COL_ADDRESS: 160}  # главные столбцы: всё свободное место, но не уже этого
 
 REMINDER_CHECK_MS = 30_000
+CLIENT_WAIT = timedelta(minutes=10)  # заказ из бота ждёт флориста — напоминать в программе
+CLIENT_ESCALATE = timedelta(minutes=20)  # …а потом сказать администраторам
+PHOTO_SAME_BOUQUET = timedelta(minutes=15)  # ещё фото следом — к тому же букету
+PHOTOS_KEEP = timedelta(days=30)  # фото букетов, переписки и оплат старше — удаляются (витрина остаётся)
 
 WATER_REMIND_AFTER = timedelta(hours=4)  # через сколько после начала смены напомнить про воду
 BACKUP_EVERY = timedelta(hours=24)
 ANNOUNCE_FOR = timedelta(days=7)  # сколько дней новое объявление всплывает тем, кто его не прочитал
+
+
+def order_status_text(o) -> str:
+    return ORDER_STATUS.get(o.status, o.status)
 
 
 def to_date(qd: QDate) -> date:
@@ -192,6 +204,14 @@ class MainWindow(QMainWindow):
             lambda text: self.telegram.queue(text, key=f"back:{datetime.now():%Y%m%d%H%M}"))
         self.inbox = telegram.TelegramInbox(db, self)
         self.inbox.arrived.connect(self._on_announcements)
+        self.telegram.photos_sent.connect(self._admin_photos_sent)
+        self.client_bot = ClientBot(db, self)  # отдельный бот «для клиентов»: витрина, заказы, фото букетов
+        self.client_bot.event.connect(self._on_client_event)
+        self.client_center: ClientCenter | None = None
+        self._photo_wanted: dict[int, list[int]] = {}  # сотрудник → доставки, к которым бот просил фото
+        self._last_photo: dict[int, tuple[str, int, datetime]] = {}  # сотрудник → (альбом, доставка, когда)
+        self._client_nag_at: datetime | None = None
+        self._photos_pruned: date | None = None
         self.bot = BotHandler()
         self._current_bot_chat = None  # чат того, чью команду обрабатываем сейчас
         self._current_bot_author = ""
@@ -301,6 +321,8 @@ class MainWindow(QMainWindow):
         user_menu = QMenu(self.user_btn)
         password_action = user_menu.addAction("🔑 Сменить пароль")
         password_action.triggered.connect(self.change_password)
+        link_action = user_menu.addAction("📱 Telegram для фото букетов")
+        link_action.triggered.connect(self.link_telegram)
         self.user_btn.setMenu(user_menu)
         top.addWidget(self.user_btn)
         self.ann_btn = QPushButton("📢 Объявления")
@@ -340,6 +362,11 @@ class MainWindow(QMainWindow):
             b.setMinimumHeight(32)
             buttons.addWidget(b)
         buttons.addStretch(1)
+        self.clients_btn = QPushButton("🛍 Клиенты")
+        self.clients_btn.setToolTip("Заказы и сообщения из Telegram-бота для клиентов, витрина букетов")
+        self.clients_btn.setMinimumHeight(32)
+        self.clients_btn.clicked.connect(self.open_clients)
+        buttons.addWidget(self.clients_btn)
         right.addLayout(buttons)
 
         self.table = QTableWidget(0, len(HEADERS))
@@ -364,7 +391,7 @@ class MainWindow(QMainWindow):
         self.day_totals = QLabel()
         right.addWidget(self.day_totals)
 
-        self.hint = QLabel("💐 — букет собран, ✓ — доставлено. Двойной щелчок — изменить.")
+        self.hint = QLabel("💐 — букет собран (📷 — есть фото), ✓ — доставлено. Двойной щелчок — изменить.")
         self.hint.setStyleSheet(f"color: {C.gray}")
         right.addWidget(self.hint)
 
@@ -378,6 +405,7 @@ class MainWindow(QMainWindow):
 
         self.refresh_month()
         self.refresh_day()
+        self.update_clients_button()
         QTimer.singleShot(2000, self.check_reminders)
 
     # ----- напоминания и трей -----
@@ -731,6 +759,8 @@ class MainWindow(QMainWindow):
     def quit_app(self):
         self._really_quit = True
         self.assembly.hide()
+        if self.client_center is not None:
+            self.client_center.hide()
         self.tray.hide()
         QApplication.quit()
 
@@ -901,6 +931,11 @@ class MainWindow(QMainWindow):
         self._check_assembly(now)
         self._check_reports(now)
         self._maybe_send_backup(now)
+        self._check_clients(now)
+        self._flush_admin_photos()
+        if self._photos_pruned != now.date():  # раз в день
+            self._photos_pruned = now.date()
+            self.db.prune_photos(now - PHOTOS_KEEP)
         deliveries = self.db.for_day(today) + self.db.for_day(today + timedelta(days=1))
         due = due_reminders(deliveries, now, lead_minutes(), self._reminded)
         for d in due:
@@ -1020,6 +1055,9 @@ class MainWindow(QMainWindow):
             assembled.setCheckState(Qt.Checked if d.assembled else Qt.Unchecked)
             assembled.setToolTip(f"Собрано{' — ' + d.assembled_by_name if d.assembled_by_name else ''}"
                                  if d.assembled else "Не собрано")
+            if d.photos:
+                assembled.setText("📷")
+                assembled.setToolTip(assembled.toolTip() + ". Есть фото — двойной щелчок, чтобы посмотреть")
             cells = {
                 COL_ASSEMBLED: assembled,
                 COL_DONE: done,
@@ -1117,8 +1155,10 @@ class MainWindow(QMainWindow):
         delivered = item.checkState() == Qt.Checked
         self.db.set_delivered(d.id, delivered, self.user.id, datetime.now())
         self.audit("Доставка отмечена доставленной" if delivered else "Отметка «Доставлено» снята", describe_delivery(d))
+        if delivered and d.client_chat:
+            self._after_delivered(d)  # заказ из бота: клиенту сообщение уходит само
         self.refresh_all()
-        if delivered and d.customer_contact and not d.sent("delivered"):
+        if delivered and d.customer_contact and not d.client_chat and not d.sent("delivered"):
             QTimer.singleShot(0, lambda: self._offer_delivered_message(d))
 
     def _offer_delivered_message(self, d: Delivery):
@@ -1135,6 +1175,15 @@ class MainWindow(QMainWindow):
         if d is None:
             return
         text = render(load_templates()[kind], d)
+        if d.client_chat:  # заказ из бота — пишем прямо в бот, без копирования
+            if not client_configured():
+                QMessageBox.warning(self, "Сообщение заказчику", "Бот для клиентов не подключён (Настройки → Клиенты).")
+                return
+            self._to_client(d.client_chat, text)
+            self.db.mark_message(d.id, kind)
+            QMessageBox.information(self, "Сообщение заказчику", "Отправлено клиенту в Telegram-бот.")
+            self.refresh_day()
+            return
         action = build_action(d.source, d.customer_contact, text)
         if action.copy_text:
             QApplication.clipboard().setText(text)
@@ -1150,11 +1199,17 @@ class MainWindow(QMainWindow):
             SettingsDialog(self).exec()
 
     def _on_double_click(self, item: QTableWidgetItem):
-        if item.column() not in (COL_DONE, COL_ASSEMBLED):
+        if item.column() == COL_ASSEMBLED and 0 <= item.row() < len(self.deliveries):
+            d = self.deliveries[item.row()]
+            photos = self.db.delivery_photos(d.id) if d.photos else []
+            if photos:
+                _, at, data, by = photos[-1]
+                PhotoViewer(self, data, f"Букет: {d.time} — {by or 'фото'}, {at:%d.%m %H:%M}").exec()
+        elif item.column() not in (COL_DONE, COL_ASSEMBLED):
             self.edit_delivery()
 
     def _open_dialog(self, delivery: Delivery) -> bool:
-        dlg = DeliveryDialog(self, delivery)
+        dlg = DeliveryDialog(self, delivery, self.db, lambda data, parent: self._photo_added(delivery, data, parent))
         return dlg.exec() == DeliveryDialog.Accepted
 
     def _show_day(self, day: date):
@@ -1187,6 +1242,10 @@ class MainWindow(QMainWindow):
             changes = delivery_changes(before, d)
             if changes:
                 self.audit("Доставка изменена", f"{describe_delivery(before)}: {changes}")
+            if d.assembled and not was_assembled and not d.delivered:
+                self._after_assembled(d)
+            if d.delivered and not was_delivered:
+                self._after_delivered(d)
             self._show_day(d.day)
         else:
             self.refresh_day()  # отменили — вернуть исходные значения
@@ -1306,12 +1365,15 @@ class MainWindow(QMainWindow):
         if d is not None:
             self.db.set_delivered(d.id, True, self.user.id if self.user else None, datetime.now())
             self.audit("Доставка отмечена доставленной", describe_delivery(d))
+            self._after_delivered(d)
             self.refresh_all()
         self._check_assembly(datetime.now())
 
     def _set_assembled(self, d: Delivery, assembled: bool):
         self.db.set_assembled(d.id, assembled, self.user.id if self.user else None, datetime.now())
         self.audit("Букет собран" if assembled else "Отметка «Собрано» снята", describe_delivery(d))
+        if assembled:
+            self._after_assembled(d)
         self.refresh_all()
 
     # ----- план смены -----
@@ -1330,6 +1392,7 @@ class MainWindow(QMainWindow):
     def _backup_caption() -> str:
         return (f"💾 Копия базы AloFlorist, {datetime.now():%d.%m.%Y %H:%M}.\n"
                 "Восстановить: ⚙ Настройки → Копии → «Восстановить из копии» и выбрать этот файл. "
+                "Фото букетов и переписки здесь нет (они в копиях на компьютере). "
                 "Никому не пересылайте: в нём телефоны клиентов.")
 
     def _maybe_send_backup(self, now: datetime):
@@ -1427,3 +1490,201 @@ class MainWindow(QMainWindow):
         self.telegram.queue(f"ℹ️ {who or 'Администратор'}: удаление {verdict} — {describe_delivery(d)}",
                             key=f"deldone:{d.id}:{verdict}:{datetime.now():%Y%m%d%H%M%S}",
                             except_chat=self._current_bot_chat)
+
+    # ----- бот для клиентов -----
+
+    def update_clients_button(self):
+        n = needs_action(self.db)
+        self.clients_btn.setText(f"🛍 Клиенты ({n})" if n else "🛍 Клиенты")
+        self.clients_btn.setStyleSheet(f"color: {C.orange}; font-weight: bold;" if n else "")
+
+    def open_clients(self, chat_id: str = ""):
+        if self.client_center is None:
+            self.client_center = ClientCenter(self)
+        else:
+            self.client_center.refresh()
+        if chat_id:
+            self.client_center.open_chat(chat_id)
+        self.client_center.show()
+        self.client_center.raise_()
+        self.client_center.activateWindow()
+
+    def link_telegram(self):
+        if self.user is not None:
+            StaffLinkDialog(self, self.db, self.user).exec()
+
+    def show_delivery(self, d: Delivery):
+        """Показать доставку в списке (из окна «Клиенты»)."""
+        self.show_window()
+        self._show_day(d.day)
+        for row, x in enumerate(self.deliveries):
+            if x.id == d.id:
+                self.table.selectRow(row)
+        self.raise_()
+        self.activateWindow()
+
+    def _author(self) -> str:
+        return (self.user.name or self.user.login) if self.user else ""
+
+    def _to_client(self, chat_id: str, text: str, photo: bytes | None = None, author: str = ""):
+        """Сообщение клиенту через бота; остаётся в переписке в окне «Клиенты»."""
+        self.db.add_client_message(chat_id, False, text, datetime.now(), photo, author=author or self._author())
+        self.client_bot.queue(chat_id, text, photo)
+
+    def _client_alert(self, title: str, text: str):
+        self.tray.showMessage(title, text, QSystemTrayIcon.Information, 60_000)
+        QApplication.beep()
+        QApplication.alert(self)
+
+    def _on_client_event(self, ev: tuple):
+        kind = ev[0]
+        if kind == "order":
+            o = self.db.get_client_order(ev[1])
+            if o is not None:
+                self._client_alert("🛍 Новый заказ из бота",
+                                   f"№{o.id}: {o.day:%d.%m} {o.time}, {(o.items.splitlines() or [''])[0]}")
+                self.telegram.queue(f"🛍 Новый заказ из бота №{o.id}\nКлиент: {o.client_name or '—'}\n"
+                                    f"{order_summary(o)}\n\nСумму назначает флорист в программе: «🛍 Клиенты».",
+                                    key=f"client_order:{o.id}")
+        elif kind == "paid":
+            o = self.db.get_client_order(ev[1])
+            if o is not None:
+                self._client_alert("💳 Клиент оплатил", f"Заказ №{o.id} — {money(o.amount)}. "
+                                   "Проверьте поступление и примите заказ в «🛍 Клиенты».")
+                self.telegram.queue(f"💳 Клиент сообщил об оплате заказа №{o.id} ({money(o.amount)}). "
+                                    "Проверьте поступление — принимает флорист в программе.",
+                                    key=f"client_paid:{o.id}:{o.amount}")
+        elif kind == "message":
+            chats = self.db.client_chats()
+            last = chats[0][2] if chats else None
+            who = chats[0][0].name if chats else ""
+            preview = ("📷 фото " if last and last.has_photo else "") + (last.text if last else "")
+            self._client_alert(f"💬 Сообщение от клиента{': ' + who if who else ''}", preview[:120] or "…")
+        elif kind == "staff":
+            user = next((u for u in self.db.users() if u.id == ev[1]), None)
+            if user is not None:
+                self.db.log_action(user, "Telegram для фото привязан", "")
+                self.tray.showMessage("Telegram привязан", f"{user.name or user.login} будет присылать фото букетов",
+                                      QSystemTrayIcon.Information, 10_000)
+        elif kind == "staff_photo":
+            self._staff_photo(ev[1], ev[2], ev[3] if len(ev) > 3 else "")
+        self.update_clients_button()
+        if self.client_center is not None and self.client_center.isVisible():
+            self.client_center.refresh(showcase=False)  # витрину не трогаем: там могут быть несохранённые правки
+
+    def _check_clients(self, now: datetime):
+        """Заказ из бота ждёт флориста: напоминать в программе, а через 20 минут — сказать администраторам."""
+        waiting = [o for o in self.db.client_orders(open_only=True)
+                   if o.status in NEEDS_ACTION and now - o.updated_at >= CLIENT_WAIT]
+        for o in waiting:
+            if now - o.updated_at >= CLIENT_ESCALATE:
+                minutes = int((now - o.updated_at).total_seconds() // 60)
+                self.telegram.queue(f"⏳ Заказ из бота №{o.id} ждёт флориста уже {minutes} мин: "
+                                    f"{order_status_text(o)}", key=f"client_wait:{o.id}:{o.status}:{o.updated_at:%Y%m%d%H%M%S}")
+        if waiting and (self._client_nag_at is None or now - self._client_nag_at >= CLIENT_WAIT):
+            self._client_nag_at = now
+            self._client_alert("🛍 Клиент ждёт ответа",
+                               f"Заказ №{waiting[0].id}: {order_status_text(waiting[0])}. Откройте «🛍 Клиенты».")
+        self.update_clients_button()
+
+    def _after_assembled(self, d: Delivery):
+        """Букет собран: клиенту из бота — весточка, флористу с привязанным Telegram — просьба прислать фото."""
+        d = self.db.get_delivery(d.id) or d
+        if d.client_chat and not d.sent("assembled") and client_configured():
+            pickup = d.address.strip().lower() == "самовывоз"
+            self._to_client(d.client_chat, "🌸 Ваш букет готов — можно забирать!" if pickup
+                            else "💐 Ваш букет собран и скоро поедет к получателю!")
+            self.db.mark_message(d.id, "assembled")
+        chat = self.db.staff_chat(self.user.id) if self.user is not None and client_configured() else ""
+        if chat:
+            self._photo_wanted.setdefault(self.user.id, []).append(d.id)
+            what = (d.items.splitlines() or ["букет"])[0]
+            self.client_bot.queue(chat, f"📷 Пришлите фото букета: {d.time or '—'} — {what}"
+                                  + ("\nЗаказ из бота — фото увидит клиент." if d.client_chat else ""))
+
+    def _after_delivered(self, d: Delivery):
+        """Доставлено: клиенту из бота сообщение уходит само (шаблон «Букет доставлен»)."""
+        d = self.db.get_delivery(d.id) or d
+        if not d.client_chat or d.sent("delivered") or not client_configured():
+            return
+        if d.address.strip().lower() == "самовывоз":
+            text = "Спасибо, что забрали букет! 🌸 Будем рады видеть вас снова."
+        else:
+            text = render(load_templates()["delivered"], d)
+        self._to_client(d.client_chat, text)
+        self.db.mark_message(d.id, "delivered")
+
+    def _photo_target(self, user_id: int, album: str, now: datetime) -> Delivery | None:
+        """К какой доставке фото: тот же альбом → та же; потом — о которой бот просил; ещё фото следом —
+        к тому же букету; иначе — последний собранный этим сотрудником без фото."""
+        last = self._last_photo.get(user_id)
+        if last and album and last[0] == album:
+            return self.db.get_delivery(last[1])
+        wanted = self._photo_wanted.get(user_id, [])
+        while wanted:
+            d = self.db.get_delivery(wanted.pop(0))
+            if d is not None:
+                return d
+        if last and now - last[2] <= PHOTO_SAME_BOUQUET:
+            return self.db.get_delivery(last[1])
+        today = now.date()
+        recent = [d for k in (-1, 0, 1) for d in self.db.for_day(today + timedelta(days=k))
+                  if d.assembled_by == user_id and not d.photos and d.assembled_at
+                  and now - d.assembled_at <= timedelta(hours=6)]
+        return max(recent, key=lambda d: d.assembled_at, default=None)
+
+    def _staff_photo(self, user_id: int, data: bytes, album: str = ""):
+        """Флорист прислал фото букета в бот."""
+        now = datetime.now()
+        user = next((u for u in self.db.users() if u.id == user_id), None)
+        name = (user.name or user.login) if user else ""
+        chat = self.db.staff_chat(user_id)
+        d = self._photo_target(user_id, album, now)
+        if d is None:
+            self.client_bot.queue(chat, "Не понял, к какому букету это фото 🙈 Сначала отметьте букет собранным "
+                                        "в программе — тогда я попрошу фото.")
+            return
+        same = self._last_photo.get(user_id, ("", 0, now))[1] == d.id
+        self._last_photo[user_id] = (album, d.id, now)
+        self.db.add_delivery_photo(d.id, data, name, now)
+        self.db.log_action(user, "Фото букета", describe_delivery(d))
+        if not same:
+            self.client_bot.queue(chat, f"📷 Фото добавлено: {d.time or '—'} — {(d.items.splitlines() or [''])[0]}"
+                                  + ("\nКлиенту отправил." if d.client_chat else ""))
+        if d.client_chat and client_configured():
+            self._to_client(d.client_chat, "" if same else "Вот ваш букет 😍", data, author=name)
+        self._flush_admin_photos()
+        self.refresh_day()
+
+    def _photo_added(self, d: Delivery, data: bytes, parent):
+        """Фото добавили в окне доставки (с компьютера)."""
+        self.db.add_delivery_photo(d.id, data, self._author(), datetime.now())
+        self.audit("Фото букета добавлено", describe_delivery(d))
+        if d.client_chat and client_configured() and QMessageBox.question(
+                parent, "Фото клиенту", "Отправить это фото клиенту в Telegram?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes) == QMessageBox.Yes:
+            self._to_client(d.client_chat, "Вот ваш букет 😍", data)
+        self._flush_admin_photos()
+
+    def _flush_admin_photos(self):
+        """Фото букетов — администраторам (через их бота). Не настроен — некому, не копим."""
+        pending = self.db.photos_for_admins()
+        if not pending:
+            return
+        if not telegram.configured():
+            for photo_id, *_ in pending:
+                self.db.mark_photo_sent(photo_id)
+            return
+        items = []
+        for photo_id, delivery_id, data, by_name in pending:
+            d = self.db.get_delivery(delivery_id)
+            caption = f"📷 Букет{' — ' + by_name if by_name else ''}\n" + (describe_delivery(d) if d else "доставка удалена")
+            if d is not None and d.client_chat:
+                caption += "\nЗаказ из бота — фото у клиента"
+            items.append((photo_id, data, caption))
+        self.telegram.send_photos(items)
+
+    def _admin_photos_sent(self, results: list):
+        for photo_id, ok in results:
+            if ok:
+                self.db.mark_photo_sent(photo_id)

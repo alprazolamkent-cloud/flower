@@ -2,6 +2,8 @@
 
 import glob
 import os
+import shutil
+import sqlite3
 import tempfile
 import zipfile
 from dataclasses import dataclass
@@ -63,11 +65,35 @@ def latest(folder: str) -> str | None:
     return copies[-1] if copies else None
 
 
+def without_photos(db_copy: str) -> str:
+    """Копия базы без фото букетов, переписки и оплат (витрина остаётся): для Telegram, где предел 50 МБ.
+    Полные копии с фото — на компьютере и флешке."""
+    path = os.path.join(tempfile.mkdtemp(prefix="aloflorist-"), os.path.basename(db_copy))
+    shutil.copyfile(db_copy, path)
+    conn = sqlite3.connect(path)
+    try:
+        tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        if "delivery_photos" in tables:
+            conn.execute("DELETE FROM delivery_photos")
+            conn.execute("UPDATE client_messages SET photo=NULL")
+            conn.execute("UPDATE client_orders SET paid_photo=NULL")
+            conn.execute("UPDATE client_outbox SET photo=NULL, sent_at=COALESCE(sent_at, created_at)")
+        conn.commit()
+        conn.execute("VACUUM")
+    finally:
+        conn.close()
+    return path
+
+
 def zip_copy(db_copy: str, now: datetime) -> str:
     """Архив копии для отправки в Telegram (база сжимается в несколько раз). Лежит во временной папке."""
     path = os.path.join(tempfile.gettempdir(), f"AloFlorist-backup-{now:%Y-%m-%d_%H-%M}.zip")
-    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
-        z.write(db_copy, os.path.basename(db_copy))
+    light = without_photos(db_copy)
+    try:
+        with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
+            z.write(light, os.path.basename(db_copy))
+    finally:
+        shutil.rmtree(os.path.dirname(light), ignore_errors=True)
     return path
 
 

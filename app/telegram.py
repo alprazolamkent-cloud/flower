@@ -28,9 +28,10 @@ class TelegramError(Exception):
     """permanent=True — Telegram отказал по существу (бот заблокирован, чат не найден): повторять бесполезно.
     Нет связи — не permanent, попробуем позже."""
 
-    def __init__(self, message: str, permanent: bool = False):
+    def __init__(self, message: str, permanent: bool = False, retry_after: int = 0):
         super().__init__(message)
         self.permanent = permanent
+        self.retry_after = retry_after  # Telegram попросил подождать (слишком много сообщений подряд)
 
 
 def _call(token: str, method: str, params: dict | None = None, timeout: float = TIMEOUT,
@@ -51,13 +52,67 @@ def _call(token: str, method: str, params: dict | None = None, timeout: float = 
         raise TelegramError(f"Нет связи с Telegram: {e}") from None
     if not payload.get("ok"):
         raise TelegramError(payload.get("description") or "Telegram вернул ошибку",
-                            permanent=payload.get("error_code") in (400, 403))
+                            permanent=payload.get("error_code") in (400, 403),
+                            retry_after=int((payload.get("parameters") or {}).get("retry_after") or 0))
     return payload
 
 
-def send_message(token: str, chat_id: str, text: str) -> int:
-    """Отправить сообщение; возвращает его номер (нужен, чтобы потом править)."""
-    return _call(token, "sendMessage", {"chat_id": chat_id, "text": text}).get("result", {}).get("message_id", 0)
+def send_message(token: str, chat_id: str, text: str, markup: dict | None = None) -> int:
+    """Отправить сообщение; возвращает его номер (нужен, чтобы потом править). markup — кнопки."""
+    params = {"chat_id": chat_id, "text": text}
+    if markup:
+        params["reply_markup"] = json.dumps(markup, ensure_ascii=False)
+    return _call(token, "sendMessage", params).get("result", {}).get("message_id", 0)
+
+
+MAX_CAPTION = 1000  # подпись к фото — до 1024 знаков
+
+
+def send_photo(token: str, chat_id: str, caption: str = "", photo: bytes | None = None, file_id: str = "",
+               markup: dict | None = None) -> str:
+    """Фото с подписью: файлом или по номеру, который Telegram выдал раньше. Возвращает номер фото
+    (file_id) — в следующий раз отправим по нему, не загружая заново."""
+    if len(caption) > MAX_CAPTION:
+        caption = caption[:MAX_CAPTION - 1] + "…"
+    fields = {"chat_id": str(chat_id), "caption": caption}
+    if markup:
+        fields["reply_markup"] = json.dumps(markup, ensure_ascii=False)
+    if file_id:
+        result = _call(token, "sendPhoto", {**fields, "photo": file_id}).get("result", {})
+    else:
+        body, content_type = multipart(fields, "photo", "photo.jpg", photo or b"", "image/jpeg")
+        result = _call(token, "sendPhoto", timeout=60, body=body, content_type=content_type).get("result", {})
+    sizes = result.get("photo") or []
+    return max(sizes, key=lambda p: p.get("width", 0)).get("file_id", "") if sizes else ""
+
+
+def answer_callback(token: str, callback_id: str, text: str = ""):
+    """Кнопка под сообщением нажата — убрать «часики» на ней."""
+    _call(token, "answerCallbackQuery", {"callback_query_id": callback_id, "text": text})
+
+
+FILE_URL = "https://api.telegram.org/file/bot{token}/{path}"
+MAX_DOWNLOAD = 10 * 1024 * 1024
+
+
+def download_file(token: str, file_id: str) -> bytes:
+    """Скачать файл, который прислали боту (фото)."""
+    path = _call(token, "getFile", {"file_id": file_id}).get("result", {}).get("file_path", "")
+    if not path:
+        raise TelegramError("Telegram не отдал файл", permanent=True)
+    try:
+        with urllib.request.urlopen(FILE_URL.format(token=token.strip(), path=path), timeout=60) as response:
+            data = response.read(MAX_DOWNLOAD + 1)
+    except OSError as e:
+        raise TelegramError(f"Нет связи с Telegram: {e}") from None
+    if len(data) > MAX_DOWNLOAD:
+        raise TelegramError("файл слишком большой", permanent=True)
+    return data
+
+
+def get_me(token: str) -> dict:
+    """Кто этот бот: {"username": ..., "first_name": ...}. Заодно проверка токена."""
+    return _call(token, "getMe").get("result", {})
 
 
 def edit_message(token: str, chat_id: str, message_id: int, text: str):
@@ -75,7 +130,8 @@ def pin_message(token: str, chat_id: str, message_id: int):
 MAX_FILE = 49 * 1024 * 1024  # бот может отправить файл до 50 МБ
 
 
-def multipart(fields: dict[str, str], file_field: str, filename: str, data: bytes) -> tuple[bytes, str]:
+def multipart(fields: dict[str, str], file_field: str, filename: str, data: bytes,
+              mime: str = "application/octet-stream") -> tuple[bytes, str]:
     """Тело запроса multipart/form-data с одним файлом: (тело, Content-Type)."""
     boundary = uuid.uuid4().hex
     parts = []
@@ -83,7 +139,7 @@ def multipart(fields: dict[str, str], file_field: str, filename: str, data: byte
         parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n{value}\r\n'.encode())
     safe = "".join(c if c.isascii() and c not in '"\\\r\n' else "_" for c in filename)  # имя латиницей
     parts.append((f'--{boundary}\r\nContent-Disposition: form-data; name="{file_field}"; filename="{safe}"\r\n'
-                  "Content-Type: application/octet-stream\r\n\r\n").encode() + data + b"\r\n")
+                  f"Content-Type: {mime}\r\n\r\n").encode() + data + b"\r\n")
     parts.append(f"--{boundary}--\r\n".encode())
     return b"".join(parts), f"multipart/form-data; boundary={boundary}"
 
@@ -345,13 +401,16 @@ class TelegramSender(QObject):
 
     done = Signal(list)  # [(id сообщения, текст ошибки или "")]
     file_sent = Signal(str, list)  # (метка, [ошибки по чатам]) — после отправки файла
+    photos_sent = Signal(list)  # [(номер фото, отправлено ли)] — фото букетов администраторам
 
     def __init__(self, db, parent=None):
         super().__init__(parent)
         self.db = db
         self.busy = False
+        self.photos_busy = False
         self.last_error = ""
         self.done.connect(self._on_done)
+        self.photos_sent.connect(lambda _: setattr(self, "photos_busy", False))
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.flush)
         self.timer.start(FLUSH_EVERY_MS)
@@ -386,6 +445,29 @@ class TelegramSender(QObject):
             except (TelegramError, OSError) as e:
                 errors.append(f"{chat}: {e}")
         self.file_sent.emit(tag, errors)
+
+    def send_photos(self, items: list[tuple[int, bytes, str]]):
+        """Фото букетов всем администраторам: [(номер, фото, подпись)]. Итог — сигнал photos_sent."""
+        cfg = settings()
+        if self.photos_busy or not items or not (cfg["token"] and cfg["chats"]):
+            return
+        self.photos_busy = True
+        threading.Thread(target=self._send_photos, args=(cfg["token"], cfg["chats"], items), daemon=True).start()
+
+    def _send_photos(self, token: str, chats: list[str], items: list[tuple[int, bytes, str]]):
+        results = []
+        for photo_id, data, caption in items:
+            try:
+                for chat in chats:
+                    try:
+                        send_photo(token, chat, caption, data)
+                    except TelegramError as e:
+                        if not e.permanent:
+                            raise
+            except TelegramError:
+                break  # нет связи — остальные фото в следующий раз
+            results.append((photo_id, True))
+        self.photos_sent.emit(results)
 
     def flush(self):
         cfg = settings()
