@@ -11,7 +11,7 @@ from PySide6.QtWidgets import (
     QTextBrowser, QVBoxLayout, QWidget,
 )
 
-from .client_bot import bot_link, client_configured, client_settings
+from .client_bot import bot_link, client_configured, client_settings, is_max, max_settings
 from .client_flow import MENU, inline, payment_text
 from .db import ORDER_STATUS, ClientOrder, ShowcaseItem, UserError
 from .delivery_dialog import money, money_box
@@ -389,9 +389,11 @@ class ClientCenter(QDialog):
 
     def _chat_name(self, chat_id: str) -> str:
         chat = self.db.client_chat(chat_id)
+        where = " · MAX" if is_max(chat_id) else ""
         if chat is None:
-            return chat_id
-        return " ".join(x for x in (chat.name, f"@{chat.username}" if chat.username else "") if x) or chat_id
+            return chat_id + where
+        return (" ".join(x for x in (chat.name, f"@{chat.username}" if chat.username else "") if x)
+                or chat_id) + where
 
     @staticmethod
     def _chat_line(title: str, preview: str) -> str:
@@ -652,16 +654,20 @@ class ClientCenter(QDialog):
             self._refresh_showcase(self._item.id)
 
 
+def max_link(username: str, start: str = "") -> str:
+    return f"https://max.ru/{username}" + (f"?start={start}" if start else "") if username else ""
+
+
 class StaffLinkDialog(QDialog):
-    """Флорист привязывает свой Telegram к боту клиентов, чтобы присылать фото собранных букетов."""
+    """Флорист привязывает свой Telegram или MAX к боту клиентов, чтобы присылать фото собранных букетов."""
 
     def __init__(self, parent, db, user):
         super().__init__(parent)
         self.db, self.user = db, user
-        self.setWindowTitle("Telegram для фото букетов")
-        self.setMinimumWidth(520)
+        self.setWindowTitle("Телефон для фото букетов")
+        self.setMinimumWidth(540)
         layout = QVBoxLayout(self)
-        cfg = client_settings()
+        cfg, mx = client_settings(), max_settings()
         text = QLabel()
         text.setWordWrap(True)
         text.setOpenExternalLinks(True)
@@ -670,28 +676,34 @@ class StaffLinkDialog(QDialog):
         buttons = QDialogButtonBox(QDialogButtonBox.Close)
         buttons.button(QDialogButtonBox.Close).setText("Закрыть")
         buttons.rejected.connect(self.reject)
-        if not cfg["token"]:
+        linked = db.staff_chat(user.id)
+        if not (cfg["token"] or mx["token"]):
             text.setText("Бот для клиентов ещё не подключён.<br>Администратор подключает его: "
                          "<b>Настройки → Клиенты</b>.")
-        elif db.staff_chat(user.id):
-            text.setText(f"<h3>✅ Ваш Telegram привязан</h3>Когда отметите букет собранным, бот "
+        elif linked:
+            where = "MAX" if is_max(linked) else "Telegram"
+            text.setText(f"<h3>✅ Ваш {where} привязан</h3>Когда отметите букет собранным, бот "
                          f"«{html.escape(cfg['shop'])}» попросит фото — просто ответьте ему фотографией.<br><br>"
                          "Фото увидят администраторы, а если заказ пришёл из бота — и сам клиент.")
             unlink = buttons.addButton("Отвязать", QDialogButtonBox.DestructiveRole)
             unlink.clicked.connect(self._unlink)
         else:
             code = db.link_code(user.id)
-            name = cfg["username"]
-            link = bot_link(name, code)
-            where = (f"найдите в поиске бота <b>@{html.escape(name)}</b><br>"
-                     f"(или откройте ссылку <a href='{link}'>{link}</a>)") if name \
-                else f"найдите бота «{html.escape(cfg['shop'])}»"
+            ways = []
+            if cfg["token"]:
+                name, link = cfg["username"], bot_link(cfg["username"], code)
+                ways.append(f"в <b>Telegram</b> — бот <b>@{html.escape(name)}</b> (<a href='{link}'>ссылка</a>)"
+                            if name else "в <b>Telegram</b> — наш бот")
+            if mx["token"]:
+                name, link = mx["username"], max_link(mx["username"], code)
+                ways.append(f"в <b>MAX</b> — бот <b>{html.escape(name)}</b> (<a href='{link}'>ссылка</a>)"
+                            if name else "в <b>MAX</b> — наш бот")
             text.setText(
                 "<h3>Фото букетов с телефона</h3>"
                 "Когда вы отметите букет собранным, бот попросит его фото. Фото увидят администраторы, "
                 "а если заказ из бота — и клиент.<br><br>"
-                f"1. На телефоне в Telegram {where}.<br>"
-                f"2. Отправьте боту сообщение:<br><span style='font-size:20px'><b>/start {code}</b></span><br><br>"
+                "1. На телефоне откройте бота, где вам удобнее:<br>&nbsp;&nbsp;• " + "<br>&nbsp;&nbsp;• ".join(ways)
+                + f"<br>2. Отправьте боту сообщение:<br><span style='font-size:20px'><b>/start {code}</b></span><br><br>"
                 f"<span style='color:{C.gray}'>Бот ответит «Готово». Код одноразовый и только ваш.</span>")
             copy = buttons.addButton("Скопировать команду", QDialogButtonBox.ActionRole)
             copy.clicked.connect(lambda: QApplication.clipboard().setText(f"/start {code}"))
@@ -699,5 +711,5 @@ class StaffLinkDialog(QDialog):
 
     def _unlink(self):
         self.db.unlink_staff(self.user.id)
-        self.db.log_action(self.user, "Telegram для фото отвязан", "")
+        self.db.log_action(self.user, "Телефон для фото отвязан", "")
         self.accept()

@@ -13,9 +13,9 @@ from PySide6.QtWidgets import (
     QPushButton, QSpinBox, QTabWidget, QTimeEdit, QVBoxLayout, QWidget,
 )
 
-from . import autostart, backup, telegram, theme
+from . import autostart, backup, max_bot, telegram, theme
 from .audit_dialog import AuditDialog
-from .client_bot import bot_link, client_settings
+from .client_bot import bot_link, client_settings, max_settings
 from .db import UserError
 from .duties_dialog import DutiesEditor
 from .salary import DEFAULT_PENALTY_KINDS, WRITEOFF_BASES, PenaltyKind, SalaryRules, Tier
@@ -609,7 +609,9 @@ class SettingsDialog(QDialog):
             "2. Вставьте присланный токен ниже, нажмите «Проверить» и «Сохранить».<br>"
             "3. Впишите реквизиты для оплаты — бот пришлёт их клиенту вместе с суммой.<br>"
             "4. Ссылку на бота дайте клиентам: в профиле Instagram, на визитке, в статусе WhatsApp.<br>"
-            "Фото и описание бота меняются там же, в BotFather: /setuserpic и /setdescription.")
+            "Фото и описание бота меняются там же, в BotFather: /setuserpic и /setdescription.<br>"
+            "<b>MAX</b> — по желанию, вместе с Telegram или вместо него: бот создаёт ИП на dev.max.ru "
+            "(верификация по ИНН, модерация до 2 суток), токен — в настройках бота там же.")
         steps.setWordWrap(True)
         layout.addWidget(steps)
         form = QFormLayout()
@@ -634,6 +636,28 @@ class SettingsDialog(QDialog):
             link = bot_link(cfg["username"])
             self.client_status.setText(f"Бот @{cfg['username']}, ссылка для клиентов: <a href='{link}'>{link}</a>")
         form.addRow("", self.client_status)
+        mx = max_settings()
+        self.max_token_edit = QLineEdit(mx["token"])
+        self.max_token_edit.setEchoMode(QLineEdit.Password)
+        self.max_token_edit.setPlaceholderText("токен бота в MAX (необязательно)")
+        max_show = QCheckBox("показать")
+        max_show.toggled.connect(
+            lambda on: self.max_token_edit.setEchoMode(QLineEdit.Normal if on else QLineEdit.Password))
+        max_check = QPushButton("Проверить")
+        max_check.clicked.connect(self._check_max_bot)
+        max_row = QHBoxLayout()
+        max_row.addWidget(self.max_token_edit, 1)
+        max_row.addWidget(max_show)
+        max_row.addWidget(max_check)
+        form.addRow("Токен бота MAX:", max_row)
+        self.max_status = QLabel()
+        self.max_status.setOpenExternalLinks(True)
+        self.max_status.setTextInteractionFlags(Qt.TextBrowserInteraction)
+        self._max_username = ""
+        if mx["token"] and mx["username"]:
+            link = f"https://max.ru/{mx['username']}"
+            self.max_status.setText(f"Бот в MAX: <a href='{link}'>{link}</a>")
+        form.addRow("", self.max_status)
         self.shop_edit = QLineEdit(cfg["shop"])
         form.addRow("Название в приветствии:", self.shop_edit)
         self.requisites_edit = QPlainTextEdit(cfg["requisites"])
@@ -646,11 +670,11 @@ class SettingsDialog(QDialog):
         form.addRow(_gray_label("Бот работает, пока компьютер включён и есть интернет. Что клиенты напишут,\n"
                                 "пока он выключен, бот получит позже (Telegram хранит сообщения сутки)."))
         layout.addLayout(form)
-        if self.main.client_bot.last_error:
-            error = QLabel(f"<span style='color:{C.red}'>Последняя ошибка бота: "
-                           f"{self.main.client_bot.last_error}</span>")
-            error.setWordWrap(True)
-            layout.addWidget(error)
+        for title, bot in (("Telegram", self.main.client_bot), ("MAX", self.main.max_bot)):
+            if bot.last_error:
+                error = QLabel(f"<span style='color:{C.red}'>Последняя ошибка бота {title}: {bot.last_error}</span>")
+                error.setWordWrap(True)
+                layout.addWidget(error)
         layout.addStretch(1)
         return page
 
@@ -672,6 +696,22 @@ class SettingsDialog(QDialog):
         link = bot_link(self._client_username)
         self.client_status.setText(f"<span style='color:{C.green}'>✅ Работает: @{self._client_username}</span> — "
                                    f"ссылка для клиентов: <a href='{link}'>{link}</a>. Не забудьте «Сохранить».")
+
+    def _check_max_bot(self):
+        token = self.max_token_edit.text().strip()
+        if not token:
+            QMessageBox.warning(self, "Бот MAX", "Сначала вставьте токен бота MAX.")
+            return
+        try:
+            me = max_bot.get_me(token)
+        except max_bot.MaxError as e:
+            self.max_status.setText(f"<span style='color:{C.red}'>Не работает: {e}</span>")
+            return
+        self._max_username = me.get("username") or ""
+        link = f"https://max.ru/{self._max_username}" if self._max_username else ""
+        self.max_status.setText(f"<span style='color:{C.green}'>✅ Работает: {me.get('first_name') or 'бот'}</span>"
+                                + (f" — ссылка для клиентов: <a href='{link}'>{link}</a>" if link else "")
+                                + ". Не забудьте «Сохранить».")
 
     def _backup_tab(self) -> QWidget:
         page = QWidget()
@@ -871,6 +911,7 @@ class SettingsDialog(QDialog):
             ("итоги при сдаче", old_tg["on_close"], self.tg_close.isChecked(), False),
             ("следить за связью", watch_enabled(), self.tg_watch.isChecked(), False),
             ("токен бота для клиентов", client_settings()["token"], self.client_token_edit.text().strip(), True),
+            ("токен бота MAX", max_settings()["token"], self.max_token_edit.text().strip(), True),
             ("название магазина в боте", client_settings()["shop"], self.shop_edit.text().strip(), False),
             ("реквизиты для оплаты", client_settings()["requisites"], self.requisites_edit.toPlainText().strip(), True),
             ("флешка / папка для копий", backup_dir(), self.backup_edit.text().strip(), False),
@@ -899,6 +940,14 @@ class SettingsDialog(QDialog):
         settings.setValue("client_token", client_token)
         settings.setValue("client_shop", self.shop_edit.text().strip())
         settings.setValue("client_requisites", self.requisites_edit.toPlainText().strip())
+        max_token = self.max_token_edit.text().strip()
+        if max_token != max_settings()["token"]:  # другой бот MAX — читать с начала
+            for key in ("max_marker", "max_bot_username", "max_api"):
+                settings.remove(key)
+        if self._max_username:
+            settings.setValue("max_bot_username", self._max_username)
+        settings.setValue("max_token", max_token)
+        QTimer.singleShot(0, self.main.max_bot.poll)
         QTimer.singleShot(0, self.main.client_bot.poll)  # новый бот — сразу начать слушать
         settings.setValue("lead_minutes", self.lead_box.value())
         settings.setValue("late_minutes", self.late_box.value())

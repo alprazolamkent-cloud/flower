@@ -643,7 +643,7 @@ class ClientStore:
         d = Delivery(day=order.day, time=order.time,
                      items=order.items + (f"\nОткрытка: {order.card}" if order.card else ""),
                      recipient=order.recipient, address=order.address, price=order.delivery_fee,
-                     created_by=user_id, source="Telegram-бот",
+                     created_by=user_id, source="MAX-бот" if order.chat_id.startswith("max:") else "Telegram-бот",
                      customer_contact=" ".join(x for x in (name, order.client_phone) if x),
                      client_chat=order.chat_id)
         self.add(d)
@@ -695,9 +695,12 @@ class ClientStore:
                            file_id, ref, _ts(now)))
         self.conn.commit()
 
-    def unsent_client(self, limit: int = 20) -> list[tuple[int, str, str, str, bytes | None, str, str]]:
+    def unsent_client(self, limit: int = 20, max_chats: bool | None = None
+                      ) -> list[tuple[int, str, str, str, bytes | None, str, str]]:
+        """max_chats: True — только клиентам из MAX, False — только из Telegram, None — всем."""
+        where = {None: "", True: " AND chat_id LIKE 'max:%'", False: " AND chat_id NOT LIKE 'max:%'"}[max_chats]
         return self.conn.execute("SELECT id, chat_id, text, markup, photo, file_id, ref FROM client_outbox"
-                                 " WHERE sent_at IS NULL ORDER BY id LIMIT ?", (limit,)).fetchall()
+                                 " WHERE sent_at IS NULL" + where + " ORDER BY id LIMIT ?", (limit,)).fetchall()
 
     def mark_client_sent(self, outbox_id: int, now: datetime):
         self.conn.execute("UPDATE client_outbox SET sent_at=?, photo=NULL WHERE id=?", (_ts(now), outbox_id))

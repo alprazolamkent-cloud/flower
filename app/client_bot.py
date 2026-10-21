@@ -39,8 +39,26 @@ def client_settings() -> dict:
     }
 
 
+MAX_PREFIX = "max:"  # клиенты из MAX хранятся как «max:номер», из Telegram — просто номер чата
+
+
+def is_max(chat_id: str) -> bool:
+    return str(chat_id).startswith(MAX_PREFIX)
+
+
+def max_settings() -> dict:
+    s = _settings()
+    return {"token": str(s.value("max_token", "")).strip(), "username": str(s.value("max_bot_username", ""))}
+
+
 def client_configured() -> bool:
-    return bool(client_settings()["token"])
+    """Подключён ли хоть один бот для клиентов (Telegram или MAX)."""
+    return bool(client_settings()["token"] or max_settings()["token"])
+
+
+def chat_configured(chat_id: str) -> bool:
+    """Можно ли написать этому клиенту: подключён бот его мессенджера."""
+    return bool((max_settings() if is_max(chat_id) else client_settings())["token"])
 
 
 def bot_link(username: str, start: str = "") -> str:
@@ -105,10 +123,17 @@ def parse_update(update: dict) -> Parsed:
 
 
 class ClientBot(QObject):
-    fetched = Signal(list, str)  # (разобранные обновления, ошибка) — из фонового потока
+    """Telegram. Бот MAX (max_bot.py) — наследник: тот же разговор и очередь, другая сеть."""
+
+    fetched = Signal(list, str, object)  # (разобранные обновления, ошибка, следующая отметка) — из фонового потока
     sent = Signal(list)  # итоги отправки — из фонового потока
     identified = Signal(str)  # логин бота — из фонового потока
     event = Signal(object)  # событие разговора для главного окна: ("order", id), ("message", id)…
+    queued = Signal()  # поставили сообщение в очередь — пусть и второй бот проверит свою часть
+
+    OFFSET_KEY = "client_offset"
+    USERNAME_KEY = "client_bot_username"
+    MAX_CHATS = False  # чьи сообщения из общей очереди отправляет этот бот
 
     def __init__(self, db, parent=None):
         super().__init__(parent)
@@ -120,7 +145,7 @@ class ClientBot(QObject):
         self.link_tries: dict[str, int] = {}  # подбор кода сотрудника — пока программа работает
         self.fetched.connect(self._on_fetched)
         self.sent.connect(self._on_sent)
-        self.identified.connect(lambda name: _settings().setValue("client_bot_username", name))
+        self.identified.connect(lambda name: _settings().setValue(self.USERNAME_KEY, name))
         self.poll_timer = QTimer(self)
         self.poll_timer.timeout.connect(self.poll)
         self.poll_timer.start(POLL_EVERY_MS)
@@ -131,13 +156,15 @@ class ClientBot(QObject):
 
     # ----- приём -----
 
-    @staticmethod
-    def _offset() -> int | None:
-        value = _settings().value("client_offset", "")
+    def token(self) -> str:
+        return client_settings()["token"]
+
+    def _offset(self) -> int | None:
+        value = _settings().value(self.OFFSET_KEY, "")
         return int(value) if str(value).lstrip("-").isdigit() else None
 
     def poll(self):
-        token = client_settings()["token"]
+        token = self.token()
         if self.polling or not token:
             return
         self.polling = True
@@ -163,11 +190,11 @@ class ClientBot(QObject):
                             raise  # нет связи — заберём все сообщения ещё раз, когда появится
                         p.message.text = p.message.text or "[фото не загрузилось — попросите прислать ещё раз]"
         except telegram.TelegramError as e:
-            self.fetched.emit([], str(e))
+            self.fetched.emit([], str(e), None)
             return
-        self.fetched.emit(parsed, "")
+        self.fetched.emit(parsed, "", max(p.update_id for p in parsed) + 1 if parsed else None)
 
-    def _on_fetched(self, parsed: list, error: str):
+    def _on_fetched(self, parsed: list, error: str, offset):
         self.polling = False
         if error:
             self.last_error = error
@@ -175,11 +202,12 @@ class ClientBot(QObject):
             return
         self.last_error = ""
         QTimer.singleShot(200, self.poll)  # сразу ждём следующие сообщения
-        if not parsed:
-            return
-        self.process(parsed, datetime.now())
-        _settings().setValue("client_offset", max(p.update_id for p in parsed) + 1)
-        self.flush()
+        if parsed:
+            self.process(parsed, datetime.now())
+        if offset is not None and offset != self._offset():
+            _settings().setValue(self.OFFSET_KEY, offset)
+        if parsed:
+            self.flush()
 
     def process(self, parsed: list[Parsed], now: datetime):
         flow = ClientFlow(self.db, client_settings()["shop"], self.link_tries)
@@ -207,12 +235,16 @@ class ClientBot(QObject):
         """Сообщение клиенту (или флористу) — уйдёт сразу, а без интернета — когда появится."""
         self.db.queue_client(chat_id, text, datetime.now(), markup, photo)
         QTimer.singleShot(0, self.flush)
+        self.queued.emit()
+
+    def _unsent(self, limit: int = 20) -> list:
+        return self.db.unsent_client(limit, max_chats=self.MAX_CHATS)
 
     def flush(self):
-        token = client_settings()["token"]
+        token = self.token()
         if self.sending or not token:
             return
-        items = self.db.unsent_client()
+        items = self._unsent()
         if not items:
             return
         self.sending = True
@@ -250,9 +282,9 @@ class ClientBot(QObject):
             if kind != "showcase" or not value.isdigit():
                 continue
             if r["file_id"]:
-                self.db.set_showcase_file_id(int(value), r["file_id"])  # дальше — без загрузки
+                self._remember_photo(int(value), r["file_id"])  # дальше — без загрузки
             elif r["error"] and r["by_file_id"]:  # номер фото устарел (например, сменили бота) — файлом
-                self.db.set_showcase_file_id(int(value), "")
+                self._remember_photo(int(value), "")
                 item = self.db.get_showcase_item(int(value))
                 if item is not None and item.photo:
                     self.db.queue_client(r["chat"], r["text"], now, json.loads(r["markup"]) if r["markup"] else None,
@@ -261,5 +293,8 @@ class ClientBot(QObject):
             self.last_error = ""
         if retry_ms:
             QTimer.singleShot(retry_ms, self.flush)
-        elif self.db.unsent_client(limit=1):
+        elif self._unsent(limit=1):
             QTimer.singleShot(300, self.flush)
+
+    def _remember_photo(self, item_id: int, file_id: str):
+        self.db.set_showcase_file_id(item_id, file_id)
