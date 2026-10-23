@@ -140,7 +140,7 @@ def test_staff_link_and_photo(db):
     assert db.staff_chat(anna.id) == CHAT_ID and db.staff_by_chat(CHAT_ID).id == anna.id
     photo = say(flow, photo=b"bouquet")
     assert photo.events == [("staff_photo", anna.id, b"bouquet", "")]
-    assert "сотрудник" in texts(say(flow, "привет"))
+    assert "кнопками внизу" in texts(say(flow, "привет"))
     assert db.client_chat(CHAT_ID) is None  # флориста не записываем в клиенты
     stranger = ClientFlow(db, "").handle(Incoming("777", "/start 000000"), NOW)
     assert "Здравствуйте" in texts(stranger)  # неверный код — обычное приветствие
@@ -151,6 +151,43 @@ def test_staff_link_and_photo(db):
         ClientFlow(db, "", tries).handle(Incoming("888", "/start 11111111"), NOW)
     assert ClientFlow(db, "", tries).handle(Incoming("888", f"/start {db.link_code(bob.id)}"), NOW).events == []
     assert db.staff_chat(bob.id) == ""
+
+
+def test_staff_menu_hidden_from_clients(db):
+    from app.client_flow import STAFF_MENU, STAFF_TODAY, STAFF_TOMORROW
+    from app.db import Delivery
+    anna = db.add_user("anna", "Анна", "1")
+    db.add(Delivery(day=NOW.date(), time="15:00", items="Розы\nкрафт", address="Ленина, 5"))
+    done = Delivery(day=NOW.date(), time="12:00", items="Пионы", address="Мира, 1", assembled=True)
+    db.add(done)
+    db.add(Delivery(day=NOW.date(), time="09:00", items="Старое", delivered=True))
+    db.add(Delivery(day=NOW.date() + timedelta(days=1), time="10:00", items="Завтра", address="Парковая, 3"))
+    flow = ClientFlow(db, "")
+    code = db.link_code(anna.id)
+    linked = say(flow, f"/start {code}")
+    assert linked.replies[0].markup == STAFF_MENU and "Собрал" in texts(linked)
+
+    today = say(flow, STAFF_TODAY)
+    cards = today.replies[1:]
+    assert "Доставки на сегодня: 2" in texts(today) and len(cards) == 2  # доставленное не показываем
+    by_time = {c.text.split(" ·")[0]: c for c in cards}
+    assert by_time["15:00"].markup["inline_keyboard"][0][0]["text"] == "💐 Собрал"
+    assert "Ленина, 5" in by_time["15:00"].text and "не собрано" in by_time["15:00"].text
+    assert by_time["12:00"].markup["inline_keyboard"][0][0]["text"] == "✓ Доставлено"
+    assert "Парковая" in texts(say(flow, STAFF_TOMORROW)) and "Ленина" not in texts(say(flow, STAFF_TOMORROW))
+
+    press = say(flow, callback="sa:7")
+    assert press.events == [("staff_assembled", anna.id, 7)] and not press.replies
+    assert say(flow, callback="sd:8").events == [("staff_delivered", anna.id, 8)]
+    assert say(flow, callback="sa:abc").events == []
+
+    # клиент ничего этого не видит и не может: те же слова — просто сообщение флористу
+    stranger = ClientFlow(db, "")
+    client = lambda text="", **kw: stranger.handle(Incoming("999", text, name="Иван", **kw), NOW)  # noqa: E731
+    assert client(callback="sa:7").events == [] and client(callback="sd:8").events == []
+    asked = client(STAFF_TODAY)
+    assert "Ленина" not in texts(asked) and asked.events[0][0] == "message"
+    assert STAFF_MENU not in [r.markup for r in client("/start").replies]
 
 
 def test_showcase_edit(db):

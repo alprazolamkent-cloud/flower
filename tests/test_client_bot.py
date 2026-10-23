@@ -434,3 +434,28 @@ def test_settings_qr_saved(window):
     assert w.db.get_file("payment_qr") is None
     dlg.deleteLater()
     dlg2.deleteLater()
+
+
+def test_florist_buttons_in_phone(window):
+    w, db = window, window.db
+    anna = w.user
+    db.link_staff(db.link_code(anna.id), "900")
+    d = Delivery(day=date.today(), time="23:59", items="Нежность", address="Ленина, 5", client_chat="555",
+                 source="Telegram-бот")
+    db.add(d)
+    w.client_bot.event.emit(("staff_assembled", anna.id, d.id))
+    stored = db.get_delivery(d.id)
+    assert stored.assembled and stored.assembled_by == anna.id
+    texts = [(chat, text) for chat, text, _, _ in outbox(db)]
+    assert ("900", "💐 Собрано: 23:59 — Нежность") in texts  # флорист видит подтверждение
+    assert any(chat == "900" and "Пришлите фото" in text for chat, text in texts)  # и просьбу о фото
+    assert any(chat == "555" and "собран" in text for chat, text in texts)  # клиенту из бота — весточка
+    w.client_bot.event.emit(("staff_assembled", anna.id, d.id))
+    assert outbox(db)[-1][:2] == ("900", "Уже отмечено: 23:59 — Нежность")
+    w.client_bot.event.emit(("staff_delivered", anna.id, d.id))
+    assert db.get_delivery(d.id).delivered
+    assert any(chat == "555" and "доставлен" in text for chat, text, _, _ in outbox(db))
+    logged = db.audit_entries(datetime.now() - timedelta(days=1))
+    assert sum("с телефона" in row[2] for row in logged) == 2 and all(row[1] == "Анна" for row in logged)
+    w.client_bot.event.emit(("staff_assembled", anna.id, 9999))
+    assert outbox(db)[-1][:2] == ("900", "Этой доставки уже нет в списке.")

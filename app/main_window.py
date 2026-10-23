@@ -1570,6 +1570,8 @@ class MainWindow(QMainWindow):
                 self.db.log_action(user, "Телефон для фото привязан", "")
                 self.tray.showMessage("Телефон привязан", f"{user.name or user.login} будет присылать фото букетов",
                                       QSystemTrayIcon.Information, 10_000)
+        elif kind in ("staff_assembled", "staff_delivered"):
+            self._staff_action(kind == "staff_assembled", ev[1], ev[2])
         elif kind == "staff_photo":
             self._staff_photo(ev[1], ev[2], ev[3] if len(ev) > 3 else "")
         self.update_clients_button()
@@ -1591,17 +1593,19 @@ class MainWindow(QMainWindow):
                                f"Заказ №{waiting[0].id}: {order_status_text(waiting[0])}. Откройте «🛍 Клиенты».")
         self.update_clients_button()
 
-    def _after_assembled(self, d: Delivery):
-        """Букет собран: клиенту из бота — весточка, флористу с привязанным Telegram — просьба прислать фото."""
+    def _after_assembled(self, d: Delivery, user: User | None = None):
+        """Букет собран: клиенту из бота — весточка, флористу с привязанным телефоном — просьба прислать фото.
+        user — кто собрал (с телефона это не тот, кто сидит за компьютером)."""
+        user = user or self.user
         d = self.db.get_delivery(d.id) or d
         if d.client_chat and not d.sent("assembled") and chat_configured(d.client_chat):
             pickup = d.address.strip().lower() == "самовывоз"
             self._to_client(d.client_chat, "🌸 Ваш букет готов — можно забирать!" if pickup
                             else "💐 Ваш букет собран и скоро поедет к получателю!")
             self.db.mark_message(d.id, "assembled")
-        chat = self.db.staff_chat(self.user.id) if self.user is not None else ""
+        chat = self.db.staff_chat(user.id) if user is not None else ""
         if chat and chat_configured(chat):
-            self._photo_wanted.setdefault(self.user.id, []).append(d.id)
+            self._photo_wanted.setdefault(user.id, []).append(d.id)
             what = (d.items.splitlines() or ["букет"])[0]
             self.client_bot.queue(chat, f"📷 Пришлите фото букета: {d.time or '—'} — {what}"
                                   + ("\nЗаказ из бота — фото увидит клиент." if d.client_chat else ""))
@@ -1636,6 +1640,34 @@ class MainWindow(QMainWindow):
                   if d.assembled_by == user_id and not d.photos and d.assembled_at
                   and now - d.assembled_at <= timedelta(hours=6)]
         return max(recent, key=lambda d: d.assembled_at, default=None)
+
+    def _staff_action(self, assembled: bool, user_id: int, delivery_id: int):
+        """Флорист нажал «Собрал» или «Доставлено» в телефоне: то же, что галочка в таблице."""
+        user = next((u for u in self.db.users() if u.id == user_id), None)
+        chat = self.db.staff_chat(user_id)
+        d = self.db.get_delivery(delivery_id)
+        if user is None or not chat:
+            return
+        if d is None or d.delete_requested_at is not None:
+            self.client_bot.queue(chat, "Этой доставки уже нет в списке.")
+            return
+        what = f"{d.time or '—'} — {(d.items.splitlines() or ['—'])[0]}"
+        now = datetime.now()
+        if d.delivered or (assembled and d.assembled):
+            self.client_bot.queue(chat, f"Уже отмечено: {what}")
+            return
+        if assembled:
+            self.db.set_assembled(d.id, True, user.id, now)
+            self.db.log_action(user, "Букет собран (с телефона)", describe_delivery(d))
+            self.client_bot.queue(chat, f"💐 Собрано: {what}")
+            self._after_assembled(d, user)
+        else:
+            self.db.set_delivered(d.id, True, user.id, now)
+            self.db.log_action(user, "Доставка отмечена доставленной (с телефона)", describe_delivery(d))
+            self.client_bot.queue(chat, f"✅ Доставлено: {what}")
+            self._after_delivered(d)
+        self.refresh_all()
+        self.update_clients_button()
 
     def _staff_photo(self, user_id: int, data: bytes, album: str = ""):
         """Флорист прислал фото букета в бот."""

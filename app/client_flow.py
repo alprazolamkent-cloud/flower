@@ -14,6 +14,9 @@ from .delivery_dialog import money
 SHOWCASE, CUSTOM, CHAT, ORDERS = "💐 Витрина", "✍️ Свой букет", "💬 Написать флористу", "📦 Мои заказы"
 TO_MENU, RESTART, SEND = "⬅ В меню", "↩ Начать заново", "✅ Отправить заказ"
 PICKUP, SELF, NO_CARD = "🏪 Заберу сам", "Себе", "Без открытки"
+STAFF_TODAY, STAFF_TOMORROW = "📋 Сегодня", "📅 Завтра"  # меню флориста: видно только в привязанном чате
+STAFF_MENU = {"keyboard": [[{"text": STAFF_TODAY}, {"text": STAFF_TOMORROW}]], "resize_keyboard": True}
+STAFF_LIST_MAX = 10
 
 MENU = {"keyboard": [[{"text": SHOWCASE}, {"text": CUSTOM}], [{"text": CHAT}, {"text": ORDERS}]],
         "resize_keyboard": True}
@@ -152,17 +155,15 @@ class ClientFlow:
             tries = self.link_tries.get(msg.chat_id, 0)
             user = self.db.link_staff(text.split()[1], msg.chat_id) if tries < MAX_LINK_TRIES else None
             if user is not None:
-                res.say(f"Готово, {user.name or user.login}! Теперь, когда букет собран, я попрошу у вас его фото.")
+                res.say(f"Готово, {user.name or user.login}! Внизу кнопки «Сегодня» и «Завтра»: доставки со "
+                        "кнопками «Собрал» и «Доставлено». Когда букет собран, я попрошу у вас его фото.",
+                        STAFF_MENU)
                 res.events.append(("staff", user.id))
                 return res
             self.link_tries[msg.chat_id] = tries + 1
         staff = self.db.staff_by_chat(msg.chat_id)
-        if staff is not None:
-            if msg.photo is not None:
-                res.events.append(("staff_photo", staff.id, msg.photo, msg.album))
-            else:
-                res.say("Вы привязаны как сотрудник. Когда отметите букет собранным, я попрошу фото — "
-                        "просто пришлите его сюда.")
+        if staff is not None:  # чат флориста: клиентского меню у него нет, а у клиентов нет этого
+            self._staff(msg, res, staff, now)
             return res
 
         chat = self.db.touch_client(msg.chat_id, msg.name, msg.username, now)
@@ -309,6 +310,37 @@ class ClientFlow:
             data["acked"] = True
             go("chat", data)
         return res
+
+    # ----- меню флориста -----
+
+    def _staff(self, msg: Incoming, res: Result, staff, now: datetime):
+        text = msg.text.strip()
+        if msg.callback:
+            kind, _, value = msg.callback.partition(":")
+            if kind in ("sa", "sd") and value.isdigit():  # собрал / доставлено — программа сама решит и ответит
+                res.events.append(("staff_assembled" if kind == "sa" else "staff_delivered", staff.id, int(value)))
+        elif msg.photo is not None:
+            res.events.append(("staff_photo", staff.id, msg.photo, msg.album))
+        elif text in (STAFF_TODAY, STAFF_TOMORROW):
+            self._staff_list(res, now.date() + timedelta(days=text == STAFF_TOMORROW), now.date())
+        else:
+            res.say("Доставки — кнопками внизу. Когда отметите букет собранным, я попрошу фото — "
+                    "просто пришлите его сюда.", STAFF_MENU)
+
+    def _staff_list(self, res: Result, day: date, today: date):
+        items = [d for d in self.db.for_day(day) if not d.delivered and d.delete_requested_at is None]
+        title = "сегодня" if day == today else f"{day:%d.%m}"
+        if not items:
+            res.say(f"На {title} доставок нет 🌿", STAFF_MENU)
+            return
+        res.say(f"Доставки на {title}: {len(items)}", STAFF_MENU)
+        for d in items[:STAFF_LIST_MAX]:
+            what = (d.items.splitlines() or ["—"])[0]
+            state = "💐 собрано" if d.assembled else "⏳ не собрано"
+            button = ("✓ Доставлено", f"sd:{d.id}") if d.assembled else ("💐 Собрал", f"sa:{d.id}")
+            res.say(f"{d.time or '—'} · {what}\n📍 {d.address or 'адрес не указан'}\n{state}", inline(button))
+        if len(items) > STAFF_LIST_MAX:
+            res.say(f"…и ещё {len(items) - STAFF_LIST_MAX}: остальные в программе.")
 
     # ----- части разговора -----
 
