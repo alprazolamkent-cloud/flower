@@ -687,6 +687,49 @@ def max_link(username: str, start: str = "") -> str:
     return f"https://max.ru/{username}" + (f"?start={start}" if start else "") if username else ""
 
 
+class WorkPhoneDialog(QDialog):
+    """Привязка общего рабочего телефона: все флористы отмечают букеты и шлют фото с одного аппарата."""
+
+    def __init__(self, parent, db):
+        super().__init__(parent)
+        self.setWindowTitle("Рабочий телефон флористов")
+        self.setMinimumWidth(540)
+        layout = QVBoxLayout(self)
+        cfg, mx = client_settings(), max_settings()
+        code = db.work_phone_code()
+        ways = []
+        if mx["token"]:
+            link = max_link(mx["username"], code)
+            ways.append(f"в <b>MAX</b> — бот <b>{html.escape(mx['username'] or 'магазина')}</b>"
+                        + (f" (<a href='{link}'>ссылка</a>)" if link else ""))
+        if cfg["token"]:
+            link = bot_link(cfg["username"], code)
+            ways.append(f"в <b>Telegram</b> — бот <b>@{html.escape(cfg['username'] or 'магазина')}</b>"
+                        + (f" (<a href='{link}'>ссылка</a>)" if link else ""))
+        if not ways:
+            text = "Сначала подключите бота для клиентов: Настройки → Клиенты."
+        else:
+            text = ("<h3>Рабочий телефон для всех флористов</h3>"
+                    "На нём флористы отмечают «Собрал» и «Доставлено» и присылают фото букетов. Кто именно "
+                    "нажал, программа определяет по тому, кто сейчас на смене (если на смене двое — бот спросит).<br><br>"
+                    "1. На рабочем телефоне откройте бота:<br>&nbsp;&nbsp;• " + "<br>&nbsp;&nbsp;• ".join(ways)
+                    + f"<br>2. Отправьте боту сообщение:<br><span style='font-size:20px'><b>/start {code}</b></span><br><br>"
+                    f"<span style='color:{C.gray}'>Бот ответит «Готово» и покажет кнопки. Код одноразовый. "
+                    "Никому его не показывайте: по нему чат становится рабочим телефоном.</span>")
+        label = QLabel(text)
+        label.setWordWrap(True)
+        label.setOpenExternalLinks(True)
+        label.setTextInteractionFlags(Qt.TextBrowserInteraction)
+        layout.addWidget(label)
+        buttons = QDialogButtonBox(QDialogButtonBox.Close)
+        buttons.button(QDialogButtonBox.Close).setText("Закрыть")
+        buttons.rejected.connect(self.reject)
+        if ways:
+            copy = buttons.addButton("Скопировать команду", QDialogButtonBox.ActionRole)
+            copy.clicked.connect(lambda: QApplication.clipboard().setText(f"/start {code}"))
+        layout.addWidget(buttons)
+
+
 class StaffLinkDialog(QDialog):
     """Флорист привязывает свой Telegram или MAX к боту клиентов, чтобы присылать фото собранных букетов."""
 

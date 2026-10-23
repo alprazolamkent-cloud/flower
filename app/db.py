@@ -204,6 +204,10 @@ CREATE TABLE IF NOT EXISTS announcement_reads (
     read_at         TEXT    NOT NULL,
     PRIMARY KEY (announcement_id, user_id)
 );
+CREATE TABLE IF NOT EXISTS work_phones (
+    chat_id   TEXT PRIMARY KEY,
+    linked_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS app_files (
     name TEXT PRIMARY KEY,
     data BLOB NOT NULL
@@ -789,6 +793,39 @@ class ClientStore:
     def staff_by_chat(self, chat_id: str) -> "User | None":
         r = self.conn.execute("SELECT id FROM users WHERE tg_chat=? AND tg_chat<>''", (str(chat_id),)).fetchone()
         return next((u for u in self.users() if u.id == r[0]), None) if r else None
+
+    # --- общий рабочий телефон: все флористы с одного чата, кто собрал — по тому, кто на смене ---
+
+    def work_phone_code(self) -> str:
+        """Одноразовый код для привязки рабочего телефона (виден только админу в настройках)."""
+        raw = self.get_file("work_phone_code")
+        if raw:
+            return raw.decode()
+        import secrets
+        code = f"{secrets.randbelow(90_000_000) + 10_000_000}"
+        self.set_file("work_phone_code", code.encode())
+        return code
+
+    def link_work_phone(self, code: str, chat_id: str, now: datetime) -> bool:
+        raw = self.get_file("work_phone_code")
+        if not raw or code.strip() != raw.decode():
+            return False
+        self.conn.execute("UPDATE users SET tg_chat='' WHERE tg_chat=?", (str(chat_id),))  # личная привязка не нужна
+        self.conn.execute("INSERT OR REPLACE INTO work_phones (chat_id, linked_at) VALUES (?, ?)",
+                          (str(chat_id), _ts(now)))
+        self.conn.commit()
+        self.set_file("work_phone_code", None)  # код одноразовый
+        return True
+
+    def is_work_phone(self, chat_id: str) -> bool:
+        return self.conn.execute("SELECT 1 FROM work_phones WHERE chat_id=?", (str(chat_id),)).fetchone() is not None
+
+    def work_phones(self) -> list[str]:
+        return [r[0] for r in self.conn.execute("SELECT chat_id FROM work_phones ORDER BY linked_at").fetchall()]
+
+    def unlink_work_phones(self):
+        self.conn.execute("DELETE FROM work_phones")
+        self.conn.commit()
 
     def unlink_staff(self, user_id: int):
         self.conn.execute("UPDATE users SET tg_chat='' WHERE id=?", (user_id,))

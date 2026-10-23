@@ -44,7 +44,7 @@ from .assembly_dialog import SNOOZE, AssemblyReminder
 from .client_bot import ClientBot, chat_configured
 from .max_bot import MaxBot
 from .client_center import NEEDS_ACTION, ClientCenter, StaffLinkDialog, needs_action
-from .client_flow import order_summary
+from .client_flow import inline, order_summary
 from .photos import PhotoViewer
 from .heartbeat import Heartbeat
 from .reminders import assembly_due, assembly_escalations, due_reminders, overdue_deliveries, reminder_key
@@ -212,8 +212,8 @@ class MainWindow(QMainWindow):
         self.max_bot.event.connect(self._on_client_event)
         self.client_bot.queued.connect(self.max_bot.flush)  # сообщение клиенту из MAX уходит через бота MAX
         self.client_center: ClientCenter | None = None
-        self._photo_wanted: dict[int, list[int]] = {}  # сотрудник → доставки, к которым бот просил фото
-        self._last_photo: dict[int, tuple[str, int, datetime]] = {}  # сотрудник → (альбом, доставка, когда)
+        self._photo_wanted: dict[str, list[int]] = {}  # чат флориста → доставки, к которым бот просил фото
+        self._last_photo: dict[str, tuple[str, int, datetime]] = {}  # чат → (альбом, доставка, когда)
         self._client_nag_at: datetime | None = None
         self._photos_pruned: date | None = None
         self.bot = BotHandler()
@@ -1572,6 +1572,14 @@ class MainWindow(QMainWindow):
                                       QSystemTrayIcon.Information, 10_000)
         elif kind in ("staff_assembled", "staff_delivered"):
             self._staff_action(kind == "staff_assembled", ev[1], ev[2])
+        elif kind in ("work_assembled", "work_delivered"):
+            self._work_action(kind == "work_assembled", ev[1], ev[2], ev[3])
+        elif kind == "work_photo":
+            self._work_photo(ev[1], ev[2], ev[3])
+        elif kind == "work_phone":
+            self.db.log_action(None, "Рабочий телефон привязан", "", who="Telegram / MAX")
+            self.tray.showMessage("Рабочий телефон привязан", "Флористы смогут отмечать букеты и присылать фото",
+                                  QSystemTrayIcon.Information, 10_000)
         elif kind == "staff_photo":
             self._staff_photo(ev[1], ev[2], ev[3] if len(ev) > 3 else "")
         self.update_clients_button()
@@ -1593,19 +1601,19 @@ class MainWindow(QMainWindow):
                                f"Заказ №{waiting[0].id}: {order_status_text(waiting[0])}. Откройте «🛍 Клиенты».")
         self.update_clients_button()
 
-    def _after_assembled(self, d: Delivery, user: User | None = None):
+    def _after_assembled(self, d: Delivery, user: User | None = None, chat: str = ""):
         """Букет собран: клиенту из бота — весточка, флористу с привязанным телефоном — просьба прислать фото.
         user — кто собрал (с телефона это не тот, кто сидит за компьютером)."""
-        user = user or self.user
+        user = user or (self.user if not chat else None)
         d = self.db.get_delivery(d.id) or d
         if d.client_chat and not d.sent("assembled") and chat_configured(d.client_chat):
             pickup = d.address.strip().lower() == "самовывоз"
             self._to_client(d.client_chat, "🌸 Ваш букет готов — можно забирать!" if pickup
                             else "💐 Ваш букет собран и скоро поедет к получателю!")
             self.db.mark_message(d.id, "assembled")
-        chat = self.db.staff_chat(user.id) if user is not None else ""
+        chat = chat or (self.db.staff_chat(user.id) if user is not None else "")
         if chat and chat_configured(chat):
-            self._photo_wanted.setdefault(user.id, []).append(d.id)
+            self._photo_wanted.setdefault(chat, []).append(d.id)
             what = (d.items.splitlines() or ["букет"])[0]
             self.client_bot.queue(chat, f"📷 Пришлите фото букета: {d.time or '—'} — {what}"
                                   + ("\nЗаказ из бота — фото увидит клиент." if d.client_chat else ""))
@@ -1622,13 +1630,13 @@ class MainWindow(QMainWindow):
         self._to_client(d.client_chat, text)
         self.db.mark_message(d.id, "delivered")
 
-    def _photo_target(self, user_id: int, album: str, now: datetime) -> Delivery | None:
+    def _photo_target(self, chat: str, user_id: int | None, album: str, now: datetime) -> Delivery | None:
         """К какой доставке фото: тот же альбом → та же; потом — о которой бот просил; ещё фото следом —
-        к тому же букету; иначе — последний собранный этим сотрудником без фото."""
-        last = self._last_photo.get(user_id)
+        к тому же букету; иначе — последний собранный этим сотрудником (на общем телефоне — кем угодно) без фото."""
+        last = self._last_photo.get(chat)
         if last and album and last[0] == album:
             return self.db.get_delivery(last[1])
-        wanted = self._photo_wanted.get(user_id, [])
+        wanted = self._photo_wanted.get(chat, [])
         while wanted:
             d = self.db.get_delivery(wanted.pop(0))
             if d is not None:
@@ -1637,17 +1645,40 @@ class MainWindow(QMainWindow):
             return self.db.get_delivery(last[1])
         today = now.date()
         recent = [d for k in (-1, 0, 1) for d in self.db.for_day(today + timedelta(days=k))
-                  if d.assembled_by == user_id and not d.photos and d.assembled_at
+                  if (user_id is None or d.assembled_by == user_id) and not d.photos and d.assembled_at
                   and now - d.assembled_at <= timedelta(hours=6)]
         return max(recent, key=lambda d: d.assembled_at, default=None)
 
+    def _people_on_shift(self) -> list[User]:
+        """Кто сейчас на смене — по ним определяем, чьи отметки с общего рабочего телефона."""
+        ids = {s.user_id for s in self.active_shifts()}
+        return [u for u in self.db.users() if u.id in ids]
+
     def _staff_action(self, assembled: bool, user_id: int, delivery_id: int):
-        """Флорист нажал «Собрал» или «Доставлено» в телефоне: то же, что галочка в таблице."""
+        """Флорист нажал «Собрал» или «Доставлено» в своём телефоне: то же, что галочка в таблице."""
         user = next((u for u in self.db.users() if u.id == user_id), None)
         chat = self.db.staff_chat(user_id)
+        if user is not None and chat:
+            self._phone_action(assembled, user, chat, delivery_id)
+
+    def _work_action(self, assembled: bool, chat: str, delivery_id: int, user_id: int | None):
+        """То же с общего рабочего телефона: кто нажал, определяем по смене. На смене несколько человек —
+        бот спрашивает, кто именно."""
+        user = next((u for u in self.db.users() if u.id == user_id), None) if user_id is not None else None
+        if user is None:
+            people = self._people_on_shift()
+            d = self.db.get_delivery(delivery_id)
+            if len(people) > 1 and d is not None and not d.delivered:
+                what = f"{d.time or '—'} — {(d.items.splitlines() or ['—'])[0]}"
+                verb = "собрал" if assembled else "довёз"
+                self.client_bot.queue(chat, f"Кто {verb}? {what}", markup=inline(
+                    *[(u.name or u.login, f"sw:{'a' if assembled else 'd'}:{delivery_id}:{u.id}") for u in people]))
+                return
+            user = people[0] if people else None
+        self._phone_action(assembled, user, chat, delivery_id)
+
+    def _phone_action(self, assembled: bool, user: User | None, chat: str, delivery_id: int):
         d = self.db.get_delivery(delivery_id)
-        if user is None or not chat:
-            return
         if d is None or d.delete_requested_at is not None:
             self.client_bot.queue(chat, "Этой доставки уже нет в списке.")
             return
@@ -1656,34 +1687,48 @@ class MainWindow(QMainWindow):
         if d.delivered or (assembled and d.assembled):
             self.client_bot.queue(chat, f"Уже отмечено: {what}")
             return
+        who = {"who": "рабочий телефон"} if user is None else {}
+        by = self._by(user) if self.db.is_work_phone(chat) else ""  # на общем телефоне — чьё это, на своём — и так ясно
         if assembled:
-            self.db.set_assembled(d.id, True, user.id, now)
-            self.db.log_action(user, "Букет собран (с телефона)", describe_delivery(d))
-            self.client_bot.queue(chat, f"💐 Собрано: {what}")
-            self._after_assembled(d, user)
+            self.db.set_assembled(d.id, True, user.id if user else None, now)
+            self.db.log_action(user, "Букет собран (с телефона)", describe_delivery(d), **who)
+            self.client_bot.queue(chat, f"💐 Собрано{by}: {what}")
+            self._after_assembled(d, user, chat)
         else:
-            self.db.set_delivered(d.id, True, user.id, now)
-            self.db.log_action(user, "Доставка отмечена доставленной (с телефона)", describe_delivery(d))
-            self.client_bot.queue(chat, f"✅ Доставлено: {what}")
+            self.db.set_delivered(d.id, True, user.id if user else None, now)
+            self.db.log_action(user, "Доставка отмечена доставленной (с телефона)", describe_delivery(d), **who)
+            self.client_bot.queue(chat, f"✅ Доставлено{by}: {what}")
             self._after_delivered(d)
         self.refresh_all()
         self.update_clients_button()
 
+    @staticmethod
+    def _by(user: User | None) -> str:
+        return f" ({user.name or user.login})" if user else ""
+
     def _staff_photo(self, user_id: int, data: bytes, album: str = ""):
-        """Флорист прислал фото букета в бот."""
-        now = datetime.now()
+        """Флорист прислал фото букета в бот со своего телефона."""
         user = next((u for u in self.db.users() if u.id == user_id), None)
-        name = (user.name or user.login) if user else ""
         chat = self.db.staff_chat(user_id)
-        d = self._photo_target(user_id, album, now)
+        if chat:
+            self._phone_photo(chat, user, data, album)
+
+    def _work_photo(self, chat: str, data: bytes, album: str = ""):
+        people = self._people_on_shift()
+        self._phone_photo(chat, people[0] if len(people) == 1 else None, data, album)
+
+    def _phone_photo(self, chat: str, user: User | None, data: bytes, album: str):
+        now = datetime.now()
+        name = (user.name or user.login) if user else "рабочий телефон"
+        d = self._photo_target(chat, user.id if user else None, album, now)
         if d is None:
-            self.client_bot.queue(chat, "Не понял, к какому букету это фото 🙈 Сначала отметьте букет собранным "
-                                        "в программе — тогда я попрошу фото.")
+            self.client_bot.queue(chat, "Не понял, к какому букету это фото 🙈 Сначала нажмите «Собрал» у этого "
+                                        "букета — тогда я попрошу фото.")
             return
-        same = self._last_photo.get(user_id, ("", 0, now))[1] == d.id
-        self._last_photo[user_id] = (album, d.id, now)
+        same = self._last_photo.get(chat, ("", 0, now))[1] == d.id
+        self._last_photo[chat] = (album, d.id, now)
         self.db.add_delivery_photo(d.id, data, name, now)
-        self.db.log_action(user, "Фото букета", describe_delivery(d))
+        self.db.log_action(user, "Фото букета", describe_delivery(d), **({"who": name} if user is None else {}))
         if not same:
             self.client_bot.queue(chat, f"📷 Фото добавлено: {d.time or '—'} — {(d.items.splitlines() or [''])[0]}"
                                   + ("\nКлиенту отправил." if d.client_chat else ""))

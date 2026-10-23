@@ -153,6 +153,12 @@ class ClientFlow:
         text = msg.text.strip()
         if text.startswith("/start") and len(text.split()) > 1:  # флорист привязывает Telegram кодом из программы
             tries = self.link_tries.get(msg.chat_id, 0)
+            if tries < MAX_LINK_TRIES and self.db.link_work_phone(text.split()[1], msg.chat_id, now):
+                res.say("Готово, это рабочий телефон магазина 📱 Внизу кнопки «Сегодня» и «Завтра»: доставки со "
+                        "кнопками «Собрал» и «Доставлено». Когда букет собран, я попрошу его фото. "
+                        "Кто собрал — я определю по тому, кто сейчас на смене.", STAFF_MENU)
+                res.events.append(("work_phone", msg.chat_id))
+                return res
             user = self.db.link_staff(text.split()[1], msg.chat_id) if tries < MAX_LINK_TRIES else None
             if user is not None:
                 res.say(f"Готово, {user.name or user.login}! Внизу кнопки «Сегодня» и «Завтра»: доставки со "
@@ -161,6 +167,9 @@ class ClientFlow:
                 res.events.append(("staff", user.id))
                 return res
             self.link_tries[msg.chat_id] = tries + 1
+        if self.db.is_work_phone(msg.chat_id):  # общий рабочий телефон: меню флориста, а не клиента
+            self._work_phone(msg, res, now)
+            return res
         staff = self.db.staff_by_chat(msg.chat_id)
         if staff is not None:  # чат флориста: клиентского меню у него нет, а у клиентов нет этого
             self._staff(msg, res, staff, now)
@@ -321,6 +330,27 @@ class ClientFlow:
                 res.events.append(("staff_assembled" if kind == "sa" else "staff_delivered", staff.id, int(value)))
         elif msg.photo is not None:
             res.events.append(("staff_photo", staff.id, msg.photo, msg.album))
+        elif text in (STAFF_TODAY, STAFF_TOMORROW):
+            self._staff_list(res, now.date() + timedelta(days=text == STAFF_TOMORROW), now.date())
+        else:
+            res.say("Доставки — кнопками внизу. Когда отметите букет собранным, я попрошу фото — "
+                    "просто пришлите его сюда.", STAFF_MENU)
+
+    def _work_phone(self, msg: Incoming, res: Result, now: datetime):
+        """Рабочий телефон: те же кнопки, но человек не известен — его определит программа по смене."""
+        text, chat = msg.text.strip(), msg.chat_id
+        if msg.callback:
+            kind, _, value = msg.callback.partition(":")
+            if kind in ("sa", "sd") and value.isdigit():
+                res.events.append(("work_assembled" if kind == "sa" else "work_delivered", chat, int(value), None))
+            elif kind == "sw":  # «Кто собрал?» — выбрали человека: sw:a:12:3
+                what, _, rest = value.partition(":")
+                delivery, _, user = rest.partition(":")
+                if what in ("a", "d") and delivery.isdigit() and user.isdigit():
+                    res.events.append(("work_assembled" if what == "a" else "work_delivered", chat,
+                                       int(delivery), int(user)))
+        elif msg.photo is not None:
+            res.events.append(("work_photo", chat, msg.photo, msg.album))
         elif text in (STAFF_TODAY, STAFF_TOMORROW):
             self._staff_list(res, now.date() + timedelta(days=text == STAFF_TOMORROW), now.date())
         else:

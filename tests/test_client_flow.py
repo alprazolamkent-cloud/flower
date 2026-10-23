@@ -244,3 +244,41 @@ def test_address_by_location(db):
     say(flow, SELF)
     say(flow, NO_CARD)
     assert db.get_client_order(say(flow, SEND).events[0][1]).address == point
+
+
+def test_work_phone_link_and_menu(db):
+    from app.client_flow import STAFF_MENU, STAFF_TODAY
+    from app.db import Delivery
+    d = Delivery(day=NOW.date(), time="15:00", items="Розы", address="Ленина, 5")
+    db.add(d)
+    flow = ClientFlow(db, "")
+    assert not db.is_work_phone(CHAT_ID)
+    code = db.work_phone_code()
+    assert len(code) == 8 and db.work_phone_code() == code  # код не меняется, пока им не привязали
+    wrong = say(flow, "/start 11111111")
+    assert "Здравствуйте" in texts(wrong) and not db.is_work_phone(CHAT_ID)
+    linked = say(flow, f"/start {code}")
+    assert linked.events == [("work_phone", CHAT_ID)] and linked.replies[0].markup == STAFF_MENU
+    assert db.is_work_phone(CHAT_ID) and db.work_phones() == [CHAT_ID]
+    assert db.get_file("work_phone_code") is None  # код одноразовый
+    assert not ClientFlow(db, "").handle(Incoming("777", f"/start {code}"), NOW).events  # повторно уже нельзя
+
+    today = say(flow, STAFF_TODAY)
+    assert "Доставки на сегодня: 1" in texts(today)
+    assert say(flow, callback=f"sa:{d.id}").events == [("work_assembled", CHAT_ID, d.id, None)]
+    assert say(flow, callback=f"sd:{d.id}").events == [("work_delivered", CHAT_ID, d.id, None)]
+    assert say(flow, callback=f"sw:a:{d.id}:3").events == [("work_assembled", CHAT_ID, d.id, 3)]
+    assert say(flow, callback=f"sw:x:{d.id}:3").events == []
+    assert say(flow, photo=b"jpg", ).events == [("work_photo", CHAT_ID, b"jpg", "")]
+    say(flow, "привет")
+    assert db.client_messages(CHAT_ID) == [] and db.client_unread() == 0  # рабочий телефон — не клиент
+    db.unlink_work_phones()
+    assert not db.is_work_phone(CHAT_ID) and "Здравствуйте" in texts(say(flow, "/start"))
+
+
+def test_work_phone_replaces_personal_link(db):
+    anna = db.add_user("anna", "Анна", "1")
+    db.link_staff(db.link_code(anna.id), CHAT_ID)
+    assert db.staff_by_chat(CHAT_ID) is not None
+    assert db.link_work_phone(db.work_phone_code(), CHAT_ID, NOW)
+    assert db.staff_by_chat(CHAT_ID) is None and db.is_work_phone(CHAT_ID)

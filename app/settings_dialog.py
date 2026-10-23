@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
 from . import autostart, backup, max_bot, telegram, theme
 from .audit_dialog import AuditDialog
 from .client_bot import QR_FILE, bot_link, client_settings, max_settings
+from .client_center import WorkPhoneDialog
 from .db import UserError
 from .duties_dialog import DutiesEditor
 from .salary import DEFAULT_PENALTY_KINDS, WRITEOFF_BASES, PenaltyKind, SalaryRules, Tier
@@ -659,6 +660,17 @@ class SettingsDialog(QDialog):
             link = f"https://max.ru/{mx['username']}"
             self.max_status.setText(f"Бот в MAX: <a href='{link}'>{link}</a>")
         form.addRow("", self.max_status)
+        self.phone_label = QLabel()
+        phone_link = QPushButton("Привязать…")
+        phone_link.clicked.connect(self._link_work_phone)
+        phone_unlink = QPushButton("Отвязать")
+        phone_unlink.clicked.connect(self._unlink_work_phones)
+        phone_row = QHBoxLayout()
+        phone_row.addWidget(self.phone_label, 1)
+        phone_row.addWidget(phone_link)
+        phone_row.addWidget(phone_unlink)
+        form.addRow("Рабочий телефон:", phone_row)
+        self._show_work_phones()
         self.shop_edit = QLineEdit(cfg["shop"])
         form.addRow("Название в приветствии:", self.shop_edit)
         self._qr = self.db.get_file(QR_FILE)
@@ -732,6 +744,24 @@ class SettingsDialog(QDialog):
         data = pick_photo(self, "QR-код для оплаты", max_side=1600, quality=95)
         if data is not None:
             self._set_qr(data)
+
+    def _show_work_phones(self):
+        phones = self.db.work_phones()
+        kinds = sorted({"MAX" if p.startswith("max:") else "Telegram" for p in phones})
+        self.phone_label.setText(f"привязан ({', '.join(kinds)})" if phones else
+                                 "не привязан — один общий телефон для всех флористов")
+
+    def _link_work_phone(self):
+        WorkPhoneDialog(self, self.db).exec()
+        self._show_work_phones()
+
+    def _unlink_work_phones(self):
+        if self.db.work_phones() and QMessageBox.question(
+                self, "Рабочий телефон", "Отвязать рабочий телефон? Кнопки «Собрал» и «Доставлено» там пропадут.",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No) == QMessageBox.Yes:
+            self.db.unlink_work_phones()
+            self.db.log_action(self.main.user, "Рабочий телефон отвязан", "")
+            self._show_work_phones()
 
     def _check_max_bot(self):
         token = self.max_token_edit.text().strip()

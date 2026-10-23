@@ -2,7 +2,7 @@
 
 import json
 import sys
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta
 
 import pytest
 from PySide6.QtCore import QSettings, Qt
@@ -301,7 +301,7 @@ def test_assembled_photo_delivered(window):
     assert sum(text.startswith("💐 Ваш букет собран") for _, text, _, _ in outbox(db)) == 1
 
     # флорист прислал два фото альбомом — оба к этому букету, клиенту первое с подписью
-    w._photo_wanted[w.user.id] = [d.id]
+    w._photo_wanted[staff_chat] = [d.id]
     photo = jpeg()
     w.client_bot.event.emit(("staff_photo", w.user.id, photo, "album1"))
     w.client_bot.event.emit(("staff_photo", w.user.id, photo, "album1"))
@@ -459,3 +459,47 @@ def test_florist_buttons_in_phone(window):
     assert sum("с телефона" in row[2] for row in logged) == 2 and all(row[1] == "Анна" for row in logged)
     w.client_bot.event.emit(("staff_assembled", anna.id, 9999))
     assert outbox(db)[-1][:2] == ("900", "Этой доставки уже нет в списке.")
+
+
+def test_work_phone_attribution(window, store):
+    w, db = window, window.db
+    store["max_token"] = "mx"  # бот MAX подключён — иначе ему не напишешь
+    olga = db.add_user("olga", "Ольга", "1")
+    chat = "max:900"
+    assert db.link_work_phone(db.work_phone_code(), chat, datetime.now())
+    d = Delivery(day=date.today(), time="23:59", items="Нежность", address="Ленина, 5", client_chat="555")
+    db.add(d)
+
+    # на смене никого нет — отметка всё равно проходит, в журнале «рабочий телефон»
+    w.client_bot.event.emit(("work_assembled", chat, d.id, None))
+    assert db.get_delivery(d.id).assembled and db.get_delivery(d.id).assembled_by is None
+    sent = [(c, t) for c, t, _, _ in outbox(db)]
+    assert (chat, "💐 Собрано: 23:59 — Нежность") in sent
+    assert any(c == chat and "Пришлите фото" in t for c, t in sent) and any(c == "555" for c, t in sent)
+    assert any(row[1] == "рабочий телефон" and "с телефона" in row[2] for row in db.audit_entries(NOW - timedelta(days=400)))
+
+    # фото с общего телефона уходит к тому букету, о котором просили
+    w.client_bot.event.emit(("work_photo", chat, jpeg(), ""))
+    assert db.get_delivery(d.id).photos == 1 and w.admin_photos
+
+    # одна на смене — отметка записывается на неё и видна в подтверждении
+    e = Delivery(day=date.today(), time="23:58", items="Розы", address="Мира, 1")
+    db.add(e)
+    db.open_shift(w.user.id, 5000, datetime.now(), time(8, 0))
+    w.client_bot.event.emit(("work_assembled", chat, e.id, None))
+    assert db.get_delivery(e.id).assembled_by == w.user.id
+    assert outbox(db)[-3][:2] == (chat, "💐 Собрано (Анна): 23:58 — Розы") or \
+        (chat, "💐 Собрано (Анна): 23:58 — Розы") in [(c, t) for c, t, _, _ in outbox(db)]
+
+    # двое на смене — бот спрашивает, кто
+    db.open_shift(olga.id, 5000, datetime.now(), time(8, 0))
+    f = Delivery(day=date.today(), time="23:57", items="Тюльпаны", address="Парковая, 3")
+    db.add(f)
+    w.client_bot.event.emit(("work_assembled", chat, f.id, None))
+    assert not db.get_delivery(f.id).assembled
+    ask = [(c, t, m) for c, t, m, _ in outbox(db) if t.startswith("Кто собрал?")]
+    [(_, _, markup)] = ask
+    names = {b[0]["text"]: b[0]["callback_data"] for b in markup["inline_keyboard"]}
+    assert set(names) == {"Анна", "Ольга"} and names["Ольга"] == f"sw:a:{f.id}:{olga.id}"
+    w.client_bot.event.emit(("work_assembled", chat, f.id, olga.id))  # выбрали
+    assert db.get_delivery(f.id).assembled_by == olga.id
