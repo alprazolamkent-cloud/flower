@@ -282,3 +282,79 @@ def test_work_phone_replaces_personal_link(db):
     assert db.staff_by_chat(CHAT_ID) is not None
     assert db.link_work_phone(db.work_phone_code(), CHAT_ID, NOW)
     assert db.staff_by_chat(CHAT_ID) is None and db.is_work_phone(CHAT_ID)
+
+
+def test_parse_bouquet():
+    from app.client_flow import parse_bouquet
+    assert parse_bouquet("Нежность 3500") == ("Нежность", 3500, "")
+    assert parse_bouquet("Красные розы 25 шт. — 4 900 ₽\nв крафте с лентой") == \
+        ("Красные розы 25 шт.", 4900, "в крафте с лентой")
+    assert parse_bouquet("15 пионов 3500р") == ("15 пионов", 3500, "")
+    assert parse_bouquet("Букет «Утро»: 3 200") == ("Букет «Утро»", 3200, "")
+    assert parse_bouquet("Нежность") is None and parse_bouquet("3500") is None and parse_bouquet("") is None
+    assert parse_bouquet("Нежность 0") is None
+
+
+def test_showcase_from_phone(db):
+    from app.client_flow import STAFF_ADD, STAFF_CANCEL, STAFF_SHOWCASE, STAFF_TODAY
+    db.link_work_phone(db.work_phone_code(), CHAT_ID, NOW)
+    flow = ClientFlow(db, "", None, {})  # одно состояние на весь разговор, как у бота
+    add = say(flow, STAFF_ADD)
+    assert "Пришлите фото" in texts(add) and add.replies[0].markup["keyboard"][0][0]["text"] == STAFF_CANCEL
+
+    # фото с подписью — сразу на витрину
+    done = say(flow, "Нежность 3500\nпионы и эвкалипт", photo=b"jpg1")
+    assert done.events == [("showcase", None, "добавлен «Нежность» — 3 500 ₽")] and "На витрине" in texts(done)
+    [item] = db.showcase()
+    assert (item.title, item.price, item.description, item.photo, item.active) == \
+        ("Нежность", 3500, "пионы и эвкалипт", b"jpg1", True)
+
+    # фото без подписи — спросили название и цену; с непонятной ценой переспросили
+    say(flow, STAFF_ADD)
+    assert "Название и цена" in texts(say(flow, photo=b"jpg2"))
+    assert "Не понял цену" in texts(say(flow, "Розы"))
+    assert say(flow, "Красные розы 4900").events[0][2] == "добавлен «Красные розы» — 4 900 ₽"
+    assert [i.title for i in db.showcase()] == ["Нежность", "Красные розы"]
+
+    # без фото не добавляем; отмена выходит
+    say(flow, STAFF_ADD)
+    assert "Жду фото" in texts(say(flow, "Тюльпаны 1000")) and len(db.showcase()) == 2
+    assert "Отменил" in texts(say(flow, STAFF_CANCEL)) and "Жду фото" not in texts(say(flow, "привет"))
+
+    # список, наличие, цена, удаление — и клиенты видят изменения сразу
+    listing = say(flow, STAFF_SHOWCASE)
+    assert "На витрине: 2" in texts(listing) and len(listing.replies) == 3
+    first = db.showcase()[0]
+    buttons = [b["callback_data"] for b in listing.replies[1].markup["inline_keyboard"][0]]
+    assert buttons == [f"vt:{first.id}", f"vp:{first.id}", f"vd:{first.id}"]
+    assert say(flow, callback=f"vt:{first.id}").events[0][2] == "«Нежность»: нет в наличии"
+    assert [i.title for i in db.showcase(only_active=True)] == ["Красные розы"]
+    say(flow, callback=f"vt:{first.id}")
+    assert len(db.showcase(only_active=True)) == 2
+    assert "Новая цена" in texts(say(flow, callback=f"vp:{first.id}"))
+    assert "цифрами" in texts(say(flow, "дорого"))
+    assert say(flow, "3 900 ₽").events[0][2] == "цена «Нежность»: 3 900 ₽" and db.get_showcase_item(first.id).price == 3900
+    assert "Удалить" in texts(say(flow, callback=f"vd:{first.id}")) and len(db.showcase()) == 2
+    assert say(flow, callback=f"vn:{first.id}").events == [] and len(db.showcase()) == 2
+    assert say(flow, callback=f"vy:{first.id}").events[0][2] == "удалён «Нежность»" and len(db.showcase()) == 1
+    assert "уже нет" in texts(say(flow, callback=f"vt:{first.id}"))
+    # доставки в процессе добавления не мешают
+    say(flow, STAFF_ADD)
+    assert "Доставки на сегодня" in texts(say(flow, STAFF_TODAY)) or "доставок нет" in texts(say(flow, STAFF_TODAY))
+    assert "Жду фото" not in texts(say(flow, "привет"))
+
+
+def test_showcase_hidden_from_clients_and_personal_phone(db):
+    from app.client_flow import STAFF_ADD
+    anna = db.add_user("anna", "Анна", "1")
+    db.link_staff(db.link_code(anna.id), CHAT_ID)
+    flow = ClientFlow(db, "", None, {})
+    say(flow, STAFF_ADD)
+    done = say(flow, "Нежность 3500", photo=b"jpg")
+    assert done.events == [("showcase", anna.id, "добавлен «Нежность» — 3 500 ₽")]
+    # клиент теми же словами и кнопками ничего не меняет
+    client = lambda text="", **kw: flow.handle(Incoming("999", text, name="Иван", **kw), NOW)  # noqa: E731
+    item = db.showcase()[0]
+    assert "Пришлите фото" not in texts(client(STAFF_ADD))
+    assert client(callback=f"vy:{item.id}").events == [] and len(db.showcase()) == 1
+    assert client("Тюльпаны 1000", photo=b"x").events[0][0] == "message" and len(db.showcase()) == 1

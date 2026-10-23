@@ -1576,6 +1576,14 @@ class MainWindow(QMainWindow):
             self._work_action(kind == "work_assembled", ev[1], ev[2], ev[3])
         elif kind == "work_photo":
             self._work_photo(ev[1], ev[2], ev[3])
+        elif kind == "showcase":
+            who = next((u for u in self.db.users() if u.id == ev[1]), None) if ev[1] is not None else None
+            if who is None:
+                people = self._people_on_shift()
+                who = people[0] if len(people) == 1 else None
+            self.db.log_action(who, "Витрина (с телефона)", ev[2], **({"who": "рабочий телефон"} if who is None else {}))
+            if self.client_center is not None and self.client_center.isVisible():
+                self.client_center.refresh_showcase()
         elif kind == "work_phone":
             self.db.log_action(None, "Рабочий телефон привязан", "", who="Telegram / MAX")
             self.tray.showMessage("Рабочий телефон привязан", "Флористы смогут отмечать букеты и присылать фото",

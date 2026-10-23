@@ -503,3 +503,27 @@ def test_work_phone_attribution(window, store):
     assert set(names) == {"Анна", "Ольга"} and names["Ольга"] == f"sw:a:{f.id}:{olga.id}"
     w.client_bot.event.emit(("work_assembled", chat, f.id, olga.id))  # выбрали
     assert db.get_delivery(f.id).assembled_by == olga.id
+
+
+def test_showcase_from_phone_in_program(window):
+    w, db = window, window.db
+    db.link_work_phone(db.work_phone_code(), "900", datetime.now())
+    w.open_clients()
+    c = w.client_center
+    from app.client_bot import Parsed
+    from app.client_flow import STAFF_ADD
+    from app.client_flow import Incoming as In
+    photo = jpeg("pink", 800, 800)
+    w.client_bot.process([Parsed(1, In("900", STAFF_ADD)), Parsed(2, In("900", "Нежность 3500\nпионы", photo=photo))],
+                         datetime.now())
+    [item] = db.showcase()
+    assert (item.title, item.price) == ("Нежность", 3500)
+    assert any("Витрина (с телефона)" in row[2] and "Нежность" in row[3] for row in
+               db.audit_entries(datetime.now() - timedelta(days=1)))
+    c.refresh_showcase()
+    assert c.show_list.count() == 1 and "Нежность" in c.show_list.item(0).text()
+    # правка на компьютере не затирается чужим обновлением
+    c.title_edit.setText("Новое имя")
+    c.title_edit.setModified(True)
+    c.refresh_showcase()
+    assert c.title_edit.text() == "Новое имя"

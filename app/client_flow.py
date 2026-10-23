@@ -8,14 +8,16 @@ import re
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 
-from .db import ORDER_STATUS, ClientOrder, Database
+from .db import ORDER_STATUS, ClientOrder, Database, ShowcaseItem
 from .delivery_dialog import money
 
 SHOWCASE, CUSTOM, CHAT, ORDERS = "💐 Витрина", "✍️ Свой букет", "💬 Написать флористу", "📦 Мои заказы"
 TO_MENU, RESTART, SEND = "⬅ В меню", "↩ Начать заново", "✅ Отправить заказ"
 PICKUP, SELF, NO_CARD = "🏪 Заберу сам", "Себе", "Без открытки"
 STAFF_TODAY, STAFF_TOMORROW = "📋 Сегодня", "📅 Завтра"  # меню флориста: видно только в привязанном чате
-STAFF_MENU = {"keyboard": [[{"text": STAFF_TODAY}, {"text": STAFF_TOMORROW}]], "resize_keyboard": True}
+STAFF_SHOWCASE, STAFF_ADD, STAFF_CANCEL = "💐 Витрина", "➕ Новый букет", "✖ Отмена"
+STAFF_MENU = {"keyboard": [[{"text": STAFF_TODAY}, {"text": STAFF_TOMORROW}],
+                           [{"text": STAFF_SHOWCASE}, {"text": STAFF_ADD}]], "resize_keyboard": True}
 STAFF_LIST_MAX = 10
 
 MENU = {"keyboard": [[{"text": SHOWCASE}, {"text": CUSTOM}], [{"text": CHAT}, {"text": ORDERS}]],
@@ -105,6 +107,22 @@ def parse_when(text: str, today: date) -> tuple[date | None, str]:
     return day, rest
 
 
+def parse_bouquet(text: str) -> tuple[str, int, str] | None:
+    """«Нежность 3500» → («Нежность», 3500, ""); описание — со второй строки. Нет названия или цены — None."""
+    lines = text.strip().splitlines()
+    if not lines:
+        return None
+    m = re.search(r"(\d[\d \u00a0]{0,9}\d|\d)\s*(?:₽|р\b\.?|руб\w*)?\s*$", lines[0].strip(), re.IGNORECASE)
+    if m is None:
+        return None
+    first = lines[0].strip()
+    title = first[:m.start()].strip(" —–-:,")
+    price = int(re.sub(r"\D", "", m.group(1)))
+    if not title or price <= 0:
+        return None
+    return title[:80], price, "\n".join(lines[1:]).strip()
+
+
 def _phone(text: str) -> str | None:
     digits = re.sub(r"\D", "", text)
     return text.strip() if 10 <= len(digits) <= 15 else None
@@ -144,9 +162,11 @@ MAX_LINK_TRIES = 5  # неверных кодов сотрудника с одн
 
 
 class ClientFlow:
-    def __init__(self, db: Database, shop_name: str, link_tries: dict | None = None):
+    def __init__(self, db: Database, shop_name: str, link_tries: dict | None = None,
+                 staff_state: dict | None = None):
         self.db, self.shop = db, shop_name or "наш цветочный"
         self.link_tries = link_tries if link_tries is not None else {}  # чат → неверных кодов
+        self.staff_state = staff_state if staff_state is not None else {}  # чат флориста → шаг «новый букет»
 
     def handle(self, msg: Incoming, now: datetime) -> Result:
         res = Result()
@@ -324,6 +344,8 @@ class ClientFlow:
 
     def _staff(self, msg: Incoming, res: Result, staff, now: datetime):
         text = msg.text.strip()
+        if self._showcase_part(msg, res, staff.id):
+            return
         if msg.callback:
             kind, _, value = msg.callback.partition(":")
             if kind in ("sa", "sd") and value.isdigit():  # собрал / доставлено — программа сама решит и ответит
@@ -339,6 +361,8 @@ class ClientFlow:
     def _work_phone(self, msg: Incoming, res: Result, now: datetime):
         """Рабочий телефон: те же кнопки, но человек не известен — его определит программа по смене."""
         text, chat = msg.text.strip(), msg.chat_id
+        if self._showcase_part(msg, res, None):
+            return
         if msg.callback:
             kind, _, value = msg.callback.partition(":")
             if kind in ("sa", "sd") and value.isdigit():
@@ -356,6 +380,113 @@ class ClientFlow:
         else:
             res.say("Доставки — кнопками внизу. Когда отметите букет собранным, я попрошу фото — "
                     "просто пришлите его сюда.", STAFF_MENU)
+
+    def _showcase_part(self, msg: Incoming, res: Result, who: int | None) -> bool:
+        """Витрина с телефона: «➕ Новый букет» (фото → название и цена), список с «в наличии», ценой и удалением.
+        True — сообщение разобрано здесь. who — флорист (None — общий рабочий телефон)."""
+        text, chat = msg.text.strip(), msg.chat_id
+        state = self.staff_state.get(chat)
+        kind, _, value = msg.callback.partition(":") if msg.callback else ("", "", "")
+        if text in (STAFF_TODAY, STAFF_TOMORROW):
+            self.staff_state.pop(chat, None)  # пошёл в доставки — незаконченный букет бросаем
+            return False
+        if text in (STAFF_CANCEL, "/cancel") and state:
+            self.staff_state.pop(chat, None)
+            res.say("Отменил.", STAFF_MENU)
+            return True
+        if text == STAFF_ADD:
+            self.staff_state[chat] = {"step": "photo"}
+            res.say("Пришлите фото букета 📷 Можно сразу с подписью: «Нежность 3500» (название и цена). "
+                    "Описание — второй строкой, по желанию.", keyboard([STAFF_CANCEL]))
+            return True
+        if text == STAFF_SHOWCASE:
+            self.staff_state.pop(chat, None)
+            self._showcase_list(res)
+            return True
+        if kind in ("vt", "vd", "vy", "vn", "vp") and value.isdigit():
+            self._showcase_button(kind, int(value), res, chat, who)
+            return True
+        if state is None:
+            return False
+        if state["step"] == "price":
+            if re.fullmatch(r"\d[\d \u00a0]*\s*(₽|р\.?)?", text) and int(re.sub(r"\D", "", text)) > 0:
+                item = self.db.get_showcase_item(state["id"])
+                self.staff_state.pop(chat, None)
+                if item is not None:
+                    item.price = int(re.sub(r"\D", "", text))
+                    self.db.save_showcase_item(item)
+                    res.events.append(("showcase", who, f"цена «{item.title}»: {money(item.price)}"))
+                    res.say(f"Готово: {item.title} — {money(item.price)}", STAFF_MENU)
+                return True
+            res.say("Напишите цену цифрами, например 3500.", keyboard([STAFF_CANCEL]))
+            return True
+        if msg.photo is not None and state["step"] == "photo":
+            parsed = parse_bouquet(text) if text else None
+            if parsed is None:
+                self.staff_state[chat] = {"step": "title", "photo": msg.photo}
+                res.say("Название и цена, например: Нежность 3500\nОписание (состав, размер) — второй строкой, "
+                        "по желанию.", keyboard([STAFF_CANCEL]))
+            else:
+                self._add_bouquet(res, chat, who, msg.photo, *parsed)
+            return True
+        if state["step"] == "title" and text:
+            parsed = parse_bouquet(text)
+            if parsed is None:
+                res.say("Не понял цену 🙈 Напишите название и цену, например: Нежность 3500", keyboard([STAFF_CANCEL]))
+            else:
+                self._add_bouquet(res, chat, who, state["photo"], *parsed)
+            return True
+        if state["step"] == "photo":
+            res.say("Жду фото букета 📷 Или нажмите «✖ Отмена».", keyboard([STAFF_CANCEL]))
+            return True
+        return False
+
+    def _add_bouquet(self, res: Result, chat: str, who: int | None, photo: bytes, title: str, price: int,
+                     description: str):
+        self.staff_state.pop(chat, None)
+        item = ShowcaseItem(0, title, description, price, photo)
+        self.db.save_showcase_item(item)
+        res.events.append(("showcase", who, f"добавлен «{title}» — {money(price)}"))
+        res.say(f"✅ На витрине: {title} — {money(price)}\nКлиенты увидят его в «💐 Витрина».", STAFF_MENU)
+
+    def _showcase_list(self, res: Result):
+        items = self.db.showcase()
+        if not items:
+            res.say("Витрина пока пустая. Нажмите «➕ Новый букет».", STAFF_MENU)
+            return
+        res.say(f"На витрине: {len(items)}. Кнопки под букетом — наличие, цена, удалить.", STAFF_MENU)
+        for item in items[:STAFF_LIST_MAX]:
+            state = "✅ в наличии" if item.active else "🚫 нет в наличии (скрыт)"
+            toggle = ("🚫 Нет в наличии", f"vt:{item.id}") if item.active else ("✅ Вернуть", f"vt:{item.id}")
+            res.say(f"{item.title} — {money(item.price)}\n{state}", {"inline_keyboard": [[
+                {"text": toggle[0], "callback_data": toggle[1]},
+                {"text": "✏️ Цена", "callback_data": f"vp:{item.id}"},
+                {"text": "🗑", "callback_data": f"vd:{item.id}"}]]})
+        if len(items) > STAFF_LIST_MAX:
+            res.say(f"…и ещё {len(items) - STAFF_LIST_MAX}: остальные в программе.")
+
+    def _showcase_button(self, kind: str, item_id: int, res: Result, chat: str, who: int | None):
+        item = self.db.get_showcase_item(item_id)
+        if item is None:
+            res.say("Этого букета уже нет на витрине.", STAFF_MENU)
+        elif kind == "vt":
+            item.active = not item.active
+            self.db.save_showcase_item(item)
+            res.events.append(("showcase", who, f"«{item.title}»: " + ("в наличии" if item.active else "нет в наличии")))
+            res.say(f"{item.title}: " + ("✅ вернул на витрину" if item.active else "🚫 скрыл — клиенты не увидят"))
+        elif kind == "vp":
+            self.staff_state[chat] = {"step": "price", "id": item_id}
+            res.say(f"Новая цена для «{item.title}» (сейчас {money(item.price)}):", keyboard([STAFF_CANCEL]))
+        elif kind == "vd":
+            res.say(f"Удалить «{item.title}» с витрины насовсем?", {"inline_keyboard": [[
+                {"text": "🗑 Да, удалить", "callback_data": f"vy:{item_id}"},
+                {"text": "Нет", "callback_data": f"vn:{item_id}"}]]})
+        elif kind == "vy":
+            self.db.delete_showcase_item(item_id)
+            res.events.append(("showcase", who, f"удалён «{item.title}»"))
+            res.say(f"Удалил «{item.title}» 🗑")
+        else:
+            res.say("Оставил.")
 
     def _staff_list(self, res: Result, day: date, today: date):
         items = [d for d in self.db.for_day(day) if not d.delivered and d.delete_requested_at is None]

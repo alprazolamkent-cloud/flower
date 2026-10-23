@@ -103,6 +103,11 @@ class ClientCenter(QDialog):
         if showcase:
             self._refresh_showcase()
 
+    def refresh_showcase(self):
+        """Витрину поменяли с телефона — показать (правки, не сохранённые на этом экране, не теряем)."""
+        if not (self.title_edit.isModified() or self.desc_edit.document().isModified()):
+            self._refresh_showcase(self._item.id)
+
     def _author(self) -> str:
         user = self.main.user
         return (user.name or user.login) if user else ""

@@ -144,6 +144,7 @@ class ClientBot(QObject):
         self.last_error = ""
         self._known_token = ""
         self.link_tries: dict[str, int] = {}  # подбор кода сотрудника — пока программа работает
+        self.staff_state: dict[str, dict] = {}  # флорист добавляет букет на витрину: на каком он шаге
         self.fetched.connect(self._on_fetched)
         self.sent.connect(self._on_sent)
         self.identified.connect(lambda name: _settings().setValue(self.USERNAME_KEY, name))
@@ -211,7 +212,7 @@ class ClientBot(QObject):
             self.flush()
 
     def process(self, parsed: list[Parsed], now: datetime):
-        flow = ClientFlow(self.db, client_settings()["shop"], self.link_tries)
+        flow = ClientFlow(self.db, client_settings()["shop"], self.link_tries, self.staff_state)
         for p in parsed:
             if p.message is None:
                 continue
