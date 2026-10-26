@@ -274,6 +274,9 @@ def test_showcase_editor(window):
     [item] = db.showcase()
     assert (item.title, item.price, item.active, item.photo is not None) == ("Нежность", 3500, True, True)
     assert c.show_list.count() == 1 and c.show_list.currentItem().data(Qt.UserRole) == item.id
+    c.single_check.setChecked(True)
+    c._save_item()
+    assert db.get_showcase_item(item.id).single and "1️⃣" in c.show_list.item(0).text()
     c.active_check.setChecked(False)
     c._save_item()
     assert not db.get_showcase_item(item.id).active and "скрыт" in c.show_list.item(0).text()

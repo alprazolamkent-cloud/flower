@@ -19,6 +19,13 @@ STAFF_SHOWCASE, STAFF_ADD, STAFF_CANCEL = "💐 Витрина", "➕ Новый
 STAFF_MENU = {"keyboard": [[{"text": STAFF_TODAY}, {"text": STAFF_TOMORROW}],
                            [{"text": STAFF_SHOWCASE}, {"text": STAFF_ADD}]], "resize_keyboard": True}
 STAFF_LIST_MAX = 10
+SHOWCASE_PAGE = 5  # столько букетов витрины клиент видит за раз
+
+
+def bouquets_word(n: int) -> str:
+    if n % 10 == 1 and n % 100 != 11:
+        return "букет"
+    return "букета" if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14 else "букетов"
 
 MENU = {"keyboard": [[{"text": SHOWCASE}, {"text": CUSTOM}], [{"text": CHAT}, {"text": ORDERS}]],
         "resize_keyboard": True}
@@ -316,6 +323,12 @@ class ClientFlow:
             if text != SEND:
                 res.say("Нажмите «✅ Отправить заказ» или «↩ Начать заново».")
                 return res
+            item = self.db.get_showcase_item(data["showcase_id"]) if data.get("showcase_id") else None
+            if item is not None and item.single and not item.active:  # пока оформляли, его заказал другой
+                go("", {})
+                res.say("Ох, этот букет только что заказали 😔 Он был в одном экземпляре. Посмотрите другие "
+                        "на витрине или опишите свой — соберём похожий.", MENU)
+                return res
             order = self.db.add_client_order(
                 msg.chat_id, now, date.fromisoformat(data["day"]), data.get("time", ""), data["items"],
                 data["address"], data["recipient"], data.get("phone", ""), data.get("card", ""),
@@ -403,11 +416,33 @@ class ClientFlow:
             self.staff_state.pop(chat, None)
             self._showcase_list(res)
             return True
-        if kind in ("vt", "vd", "vy", "vn", "vp") and value.isdigit():
+        if kind in ("vt", "vd", "vy", "vn", "vp", "ve", "vf", "vh", "vo", "v1") and value.isdigit():
             self._showcase_button(kind, int(value), res, chat, who)
             return True
         if state is None:
             return False
+        if state["step"] in ("edit_photo", "edit_title", "edit_desc"):
+            item = self.db.get_showcase_item(state["id"])
+            if item is None:
+                self.staff_state.pop(chat, None)
+                res.say("Этого букета уже нет на витрине.", STAFF_MENU)
+                return True
+            if state["step"] == "edit_photo":
+                if msg.photo is None:
+                    res.say("Жду новое фото 📷 Или «✖ Отмена».", keyboard([STAFF_CANCEL]))
+                    return True
+                item.photo, what = msg.photo, "новое фото"
+            elif not text:
+                return True
+            elif state["step"] == "edit_title":
+                item.title, what = text.splitlines()[0][:80], "название"
+            else:
+                item.description, what = ("" if text in ("—", "-") else text), "описание"
+            self.staff_state.pop(chat, None)
+            self.db.save_showcase_item(item)
+            res.events.append(("showcase", who, f"«{item.title}»: {what}"))
+            res.say(f"Готово, {what} сохранено: {item.title} — {money(item.price)}", STAFF_MENU)
+            return True
         if state["step"] == "price":
             if re.fullmatch(r"\d[\d \u00a0]*\s*(₽|р\.?)?", text) and int(re.sub(r"\D", "", text)) > 0:
                 item = self.db.get_showcase_item(state["id"])
@@ -445,22 +480,30 @@ class ClientFlow:
                      description: str):
         self.staff_state.pop(chat, None)
         item = ShowcaseItem(0, title, description, price, photo)
-        self.db.save_showcase_item(item)
+        item_id = self.db.save_showcase_item(item)
         res.events.append(("showcase", who, f"добавлен «{title}» — {money(price)}"))
         res.say(f"✅ На витрине: {title} — {money(price)}\nКлиенты увидят его в «💐 Витрина».", STAFF_MENU)
+        res.say("Это готовый букет, который стоит в магазине? Тогда отметьте — после первого заказа он сам "
+                "пропадёт с витрины, и второй клиент его не закажет.",
+                {"inline_keyboard": [[{"text": "1️⃣ Да, один экземпляр", "callback_data": f"v1:{item_id}"}],
+                                     [{"text": "✏️ Изменить", "callback_data": f"ve:{item_id}"}]]})
 
     def _showcase_list(self, res: Result):
         items = self.db.showcase()
         if not items:
             res.say("Витрина пока пустая. Нажмите «➕ Новый букет».", STAFF_MENU)
             return
-        res.say(f"На витрине: {len(items)}. Кнопки под букетом — наличие, цена, удалить.", STAFF_MENU)
+        res.say(f"На витрине: {len(items)}. Кнопки под букетом — наличие, изменить, удалить.", STAFF_MENU)
         for item in items[:STAFF_LIST_MAX]:
-            state = "✅ в наличии" if item.active else "🚫 нет в наличии (скрыт)"
-            toggle = ("🚫 Нет в наличии", f"vt:{item.id}") if item.active else ("✅ Вернуть", f"vt:{item.id}")
+            if item.single:
+                state = "1️⃣ один экземпляр, " + ("✅ на витрине" if item.active else "🔒 продан / заказан (скрыт)")
+                toggle = "🔒 Продан" if item.active else "✅ Вернуть"
+            else:
+                state = "✅ в наличии" if item.active else "🚫 нет в наличии (скрыт)"
+                toggle = "🚫 Нет в наличии" if item.active else "✅ Вернуть"
             res.say(f"{item.title} — {money(item.price)}\n{state}", {"inline_keyboard": [[
-                {"text": toggle[0], "callback_data": toggle[1]},
-                {"text": "✏️ Цена", "callback_data": f"vp:{item.id}"},
+                {"text": toggle, "callback_data": f"vt:{item.id}"},
+                {"text": "✏️ Изменить", "callback_data": f"ve:{item.id}"},
                 {"text": "🗑", "callback_data": f"vd:{item.id}"}]]})
         if len(items) > STAFF_LIST_MAX:
             res.say(f"…и ещё {len(items) - STAFF_LIST_MAX}: остальные в программе.")
@@ -472,8 +515,30 @@ class ClientFlow:
         elif kind == "vt":
             item.active = not item.active
             self.db.save_showcase_item(item)
-            res.events.append(("showcase", who, f"«{item.title}»: " + ("в наличии" if item.active else "нет в наличии")))
-            res.say(f"{item.title}: " + ("✅ вернул на витрину" if item.active else "🚫 скрыл — клиенты не увидят"))
+            hidden = "продан" if item.single else "нет в наличии"
+            res.events.append(("showcase", who, f"«{item.title}»: " + ("в наличии" if item.active else hidden)))
+            res.say(f"{item.title}: " + ("✅ вернул на витрину" if item.active else "🔒 скрыл — клиенты не увидят"))
+        elif kind == "ve":
+            res.say(f"{item.title} — {money(item.price)}\nЧто поменять?", {"inline_keyboard": [
+                [{"text": "📷 Фото", "callback_data": f"vf:{item_id}"},
+                 {"text": "✏️ Название", "callback_data": f"vh:{item_id}"}],
+                [{"text": "📝 Описание", "callback_data": f"vo:{item_id}"},
+                 {"text": "💰 Цена", "callback_data": f"vp:{item_id}"}],
+                [{"text": "1️⃣ Один экземпляр: " + ("да — сделать обычным" if item.single else "нет — включить"),
+                  "callback_data": f"v1:{item_id}"}]]})
+        elif kind in ("vf", "vh", "vo"):
+            step, ask = {"vf": ("edit_photo", "Пришлите новое фото букета 📷"),
+                         "vh": ("edit_title", f"Новое название (сейчас «{item.title}»):"),
+                         "vo": ("edit_desc", "Новое описание: состав, размер. «—» — убрать описание.")}[kind]
+            self.staff_state[chat] = {"step": step, "id": item_id}
+            res.say(ask, keyboard([STAFF_CANCEL]))
+        elif kind == "v1":
+            item.single = not item.single
+            self.db.save_showcase_item(item)
+            res.events.append(("showcase", who, f"«{item.title}»: " + ("один экземпляр" if item.single
+                                                                         else "можно заказывать много раз")))
+            res.say(f"{item.title}: " + ("1️⃣ один экземпляр — после первого заказа сам пропадёт с витрины"
+                                         if item.single else "можно заказывать сколько угодно раз"))
         elif kind == "vp":
             self.staff_state[chat] = {"step": "price", "id": item_id}
             res.say(f"Новая цена для «{item.title}» (сейчас {money(item.price)}):", keyboard([STAFF_CANCEL]))
@@ -515,6 +580,8 @@ class ClientFlow:
             go("when", {"items": f"{item.title} — {money(item.price)}", "showcase_id": item.id})
             res.say(f"Отличный выбор: {item.title} 💐")
             self._ask_when(res)
+        elif kind == "more" and value.isdigit():
+            self._showcase(res, int(value))
         elif kind == "paid" and value.isdigit():
             order = self.db.get_client_order(int(value))
             if order is None or order.chat_id != str(msg.chat_id):
@@ -529,20 +596,31 @@ class ClientFlow:
             elif order.status == "confirmed":
                 res.say("Оплата уже подтверждена, заказ принят ✅")
 
-    def _showcase(self, res: Result):
+    def _showcase(self, res: Result, offset: int = 0):
+        """Витрина порциями: по SHOWCASE_PAGE букетов и «Показать ещё» — чат не заваливается фотографиями."""
         items = self.db.showcase(only_active=True)
         if not items:
             res.say("Витрина сейчас обновляется 🌷 Опишите свой букет («✍️ Свой букет») или напишите флористу.", MENU)
             return
-        res.say("Вот что есть сейчас. Нажмите «Заказать» под понравившимся:", MENU)
-        for item in items[:15]:
-            caption = f"{item.title} — {money(item.price)}" + (f"\n{item.description}" if item.description else "")
+        if offset >= len(items):
+            res.say("Это все букеты на витрине 🌷 Не нашли подходящий — «✍️ Свой букет».", MENU)
+            return
+        if offset == 0:
+            res.say(f"Сейчас на витрине {len(items)} {bouquets_word(len(items))}. Нажмите «Заказать» "
+                    "под понравившимся:", MENU)
+        page = items[offset:offset + SHOWCASE_PAGE]
+        for item in page:
+            caption = (f"{item.title} — {money(item.price)}" + (f"\n{item.description}" if item.description else "")
+                       + ("\n✨ В одном экземпляре — готов прямо сейчас" if item.single else ""))
             button = inline(("🛒 Заказать", f"pick:{item.id}"))
             if item.photo or item.file_id:
                 res.say(caption, button, photo=None if item.file_id else item.photo, file_id=item.file_id,
                         ref=f"showcase:{item.id}")
             else:
                 res.say(caption, button)
+        shown = offset + len(page)
+        if shown < len(items):
+            res.say(f"Показано {shown} из {len(items)}", inline(("⬇ Показать ещё", f"more:{shown}")))
 
     def _orders(self, chat_id: str, res: Result):
         orders = self.db.client_orders(chat_id, limit=5)

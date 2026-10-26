@@ -586,6 +586,8 @@ class ClientCenter(QDialog):
         form.addRow("Цена:", self.item_price)
         self.active_check = QCheckBox("Есть в наличии — показывать клиентам")
         form.addRow(self.active_check)
+        self.single_check = QCheckBox("Готовый букет в одном экземпляре — после заказа сам пропадёт с витрины")
+        form.addRow(self.single_check)
         right.addLayout(form)
         item_buttons = QHBoxLayout()
         self.save_item_btn = QPushButton("💾 Сохранить")
@@ -597,8 +599,9 @@ class ClientCenter(QDialog):
         item_buttons.addWidget(self.delete_item_btn)
         item_buttons.addStretch(1)
         right.addLayout(item_buttons)
-        hint = QLabel("Клиент видит витрину по кнопке «💐 Витрина» — первые 15 букетов в наличии, по порядку "
-                      "списка. Закончились цветы — снимите галочку «Есть в наличии», букет спрячется.")
+        hint = QLabel("Клиент видит витрину по кнопке «💐 Витрина» — букеты в наличии по порядку списка, по 5 за раз "
+                      "(дальше «Показать ещё»). Закончились цветы — снимите «Есть в наличии». Готовый букет "
+                      "в одном экземпляре после заказа прячется сам, а при отказе возвращается.")
         hint.setWordWrap(True)
         hint.setStyleSheet(f"color: {C.gray}")
         right.addWidget(hint)
@@ -613,7 +616,8 @@ class ClientCenter(QDialog):
         self.show_list.blockSignals(True)
         self.show_list.clear()
         for x in self.db.showcase():
-            text = f"{x.title} — {money(x.price)}" + ("" if x.active else "\nнет в наличии (скрыт)")
+            text = (f"{x.title} — {money(x.price)}" + (" · 1️⃣" if x.single else "")
+                    + ("" if x.active else ("\nпродан / заказан (скрыт)" if x.single else "\nнет в наличии (скрыт)")))
             item = QListWidgetItem(QIcon(pixmap(x.photo, 112)) if x.photo else QIcon(), text)
             item.setData(Qt.UserRole, x.id)
             if not x.active:
@@ -635,6 +639,7 @@ class ClientCenter(QDialog):
         self.desc_edit.setPlainText(self._item.description)
         self.item_price.setValue(self._item.price)
         self.active_check.setChecked(self._item.active)
+        self.single_check.setChecked(self._item.single)
         self._set_item_photo(self._item.photo)
         self.delete_item_btn.setEnabled(bool(self._item.id))
         self.save_item_btn.setText("💾 Сохранить" if self._item.id else "💾 Добавить на витрину")
@@ -661,7 +666,8 @@ class ClientCenter(QDialog):
 
     def _save_item(self):
         x = ShowcaseItem(self._item.id, self.title_edit.text(), self.desc_edit.toPlainText(), self.item_price.value(),
-                         self._photo, self._item.file_id, self.active_check.isChecked())
+                         self._photo, self._item.file_id, self.active_check.isChecked(),
+                         single=self.single_check.isChecked())
         try:
             item_id = self.db.save_showcase_item(x)
         except UserError as e:

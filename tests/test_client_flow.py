@@ -326,7 +326,7 @@ def test_showcase_from_phone(db):
     assert "На витрине: 2" in texts(listing) and len(listing.replies) == 3
     first = db.showcase()[0]
     buttons = [b["callback_data"] for b in listing.replies[1].markup["inline_keyboard"][0]]
-    assert buttons == [f"vt:{first.id}", f"vp:{first.id}", f"vd:{first.id}"]
+    assert buttons == [f"vt:{first.id}", f"ve:{first.id}", f"vd:{first.id}"]
     assert say(flow, callback=f"vt:{first.id}").events[0][2] == "«Нежность»: нет в наличии"
     assert [i.title for i in db.showcase(only_active=True)] == ["Красные розы"]
     say(flow, callback=f"vt:{first.id}")
@@ -358,3 +358,103 @@ def test_showcase_hidden_from_clients_and_personal_phone(db):
     assert "Пришлите фото" not in texts(client(STAFF_ADD))
     assert client(callback=f"vy:{item.id}").events == [] and len(db.showcase()) == 1
     assert client("Тюльпаны 1000", photo=b"x").events[0][0] == "message" and len(db.showcase()) == 1
+
+
+def test_showcase_pages_for_client(db):
+    for i in range(12):
+        db.save_showcase_item(ShowcaseItem(0, f"Букет {i + 1}", price=1000 + i))
+    flow = ClientFlow(db, "")
+    first = say(flow, SHOWCASE)
+    cards = [r for r in first.replies if r.text.startswith("Букет")]
+    assert "на витрине 12 букетов" in texts(first) and len(cards) == 5
+    more = first.replies[-1]
+    assert more.text == "Показано 5 из 12" and more.markup["inline_keyboard"][0][0]["callback_data"] == "more:5"
+    second = say(flow, callback="more:5")
+    assert [r.text.split(" —")[0] for r in second.replies[:5]] == [f"Букет {i}" for i in range(6, 11)]
+    assert second.replies[-1].markup["inline_keyboard"][0][0]["callback_data"] == "more:10"
+    last = say(flow, callback="more:10")
+    assert len([r for r in last.replies if r.text.startswith("Букет")]) == 2 and "Показано" not in texts(last)
+    assert "все букеты" in texts(say(flow, callback="more:40"))
+
+
+def test_single_bouquet_hides_after_order(db):
+    item_id = db.save_showcase_item(ShowcaseItem(0, "Готовый с пионами", price=4500, single=True))
+    assert "В одном экземпляре" in texts(say(ClientFlow(db, ""), SHOWCASE))
+
+    def order_from(chat):
+        flow = ClientFlow(db, "")
+        talk = lambda text="", **kw: flow.handle(Incoming(chat, text, name="К", **kw), NOW)  # noqa: E731
+        db.touch_client(chat, "К", "", NOW)
+        db.save_client_state(chat, "", {}, phone="+79001112233")
+        talk(callback=f"pick:{item_id}")
+        talk("завтра к 15:00")
+        talk(PICKUP)
+        talk(SELF)
+        talk(NO_CARD)
+        return talk
+
+    first, second = order_from("1"), order_from("2")  # оба дошли до «Отправить заказ»
+    order_id = first(SEND).events[0][1]
+    assert not db.get_showcase_item(item_id).active  # заказан — с витрины пропал
+    late = second(SEND)
+    assert late.events == [] and "только что заказали" in texts(late)  # второй не закажет тот же букет
+    assert "уже нет" in texts(ClientFlow(db, "").handle(Incoming("3", callback=f"pick:{item_id}"), NOW))
+    db.set_client_order_status(order_id, "rejected", NOW, "")
+    assert db.get_showcase_item(item_id).active  # отказ — снова на витрине
+    # обычный букет после заказа остаётся
+    usual = db.save_showcase_item(ShowcaseItem(0, "Нежность", price=3500))
+    db.add_client_order("4", NOW, NOW.date(), "", "Нежность", "Самовывоз", "себе", "", "", usual)
+    assert db.get_showcase_item(usual).active
+
+
+def test_edit_showcase_from_phone(db):
+    from app.client_flow import STAFF_ADD
+    db.link_work_phone(db.work_phone_code(), CHAT_ID, NOW)
+    flow = ClientFlow(db, "", None, {})
+    say(flow, STAFF_ADD)
+    added = say(flow, "Готовый 4500", photo=b"old")
+    [item] = db.showcase()
+    assert added.replies[-1].markup["inline_keyboard"][0][0]["callback_data"] == f"v1:{item.id}"
+    assert "один экземпляр" in texts(say(flow, callback=f"v1:{item.id}")) and db.get_showcase_item(item.id).single
+
+    menu = say(flow, callback=f"ve:{item.id}")
+    codes = [b["callback_data"] for row in menu.replies[0].markup["inline_keyboard"] for b in row]
+    assert codes == [f"vf:{item.id}", f"vh:{item.id}", f"vo:{item.id}", f"vp:{item.id}", f"v1:{item.id}"]
+    say(flow, callback=f"vf:{item.id}")
+    assert "Жду новое фото" in texts(say(flow, "вот"))
+    assert say(flow, photo=b"new").events[0][2] == "«Готовый»: новое фото" and db.get_showcase_item(item.id).photo == b"new"
+    say(flow, callback=f"vh:{item.id}")
+    say(flow, "Пионы и розы")
+    assert db.get_showcase_item(item.id).title == "Пионы и розы"
+    say(flow, callback=f"vo:{item.id}")
+    say(flow, "7 пионов, 5 роз, 45 см")
+    assert db.get_showcase_item(item.id).description == "7 пионов, 5 роз, 45 см"
+    say(flow, callback=f"vo:{item.id}")
+    say(flow, "—")
+    assert db.get_showcase_item(item.id).description == ""
+    say(flow, callback=f"vp:{item.id}")
+    say(flow, "4900")
+    assert db.get_showcase_item(item.id).price == 4900
+    # «Продан» у букета в одном экземпляре
+    from app.client_flow import STAFF_SHOWCASE
+    card = say(flow, STAFF_SHOWCASE).replies[1]
+    assert card.markup["inline_keyboard"][0][0]["text"] == "🔒 Продан" and "один экземпляр" in card.text
+    say(flow, callback=f"vt:{item.id}")
+    assert not db.get_showcase_item(item.id).active
+    assert say(flow, STAFF_SHOWCASE).replies[1].markup["inline_keyboard"][0][0]["text"] == "✅ Вернуть"
+
+
+def test_old_showcase_gets_single_column(tmp_path):
+    import sqlite3
+    path = str(tmp_path / "old.db")
+    Database(path).close()
+    conn = sqlite3.connect(path)  # как в прошлой версии: витрина без «одного экземпляра»
+    conn.executescript("DROP TABLE showcase; CREATE TABLE showcase (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                       "title TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', price INTEGER NOT NULL DEFAULT 0, "
+                       "photo BLOB, file_id TEXT NOT NULL DEFAULT '', active INTEGER NOT NULL DEFAULT 1, "
+                       "position INTEGER NOT NULL DEFAULT 0); INSERT INTO showcase (title, price) VALUES ('Старый', 100);")
+    conn.close()
+    db = Database(path)
+    [item] = db.showcase()
+    assert item.title == "Старый" and item.single is False
+    db.close()

@@ -220,7 +220,8 @@ CREATE TABLE IF NOT EXISTS showcase (
     photo       BLOB,
     file_id     TEXT    NOT NULL DEFAULT '',
     active      INTEGER NOT NULL DEFAULT 1,
-    position    INTEGER NOT NULL DEFAULT 0
+    position    INTEGER NOT NULL DEFAULT 0,
+    single      INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS client_chats (
     chat_id   TEXT PRIMARY KEY,
@@ -294,6 +295,10 @@ CREATE TABLE IF NOT EXISTS shift_duties (
 SHIFT_MIGRATIONS = {
     column: f"ALTER TABLE shifts ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0"
     for column in ("revenue", "flowers", "terminal", "qr", "deliveries", "writeoff")
+}
+
+SHOWCASE_MIGRATIONS = {
+    "single": "ALTER TABLE showcase ADD COLUMN single INTEGER NOT NULL DEFAULT 0",
 }
 
 PENALTY_MIGRATIONS = {
@@ -422,6 +427,7 @@ class ShowcaseItem:
     file_id: str = ""
     active: bool = True
     position: int = 0
+    single: bool = False  # готовый букет в одном экземпляре: заказали — прячется с витрины сам
 
 
 @dataclass
@@ -493,11 +499,11 @@ class ClientStore:
     # --- витрина ---
 
     def showcase(self, only_active: bool = False) -> list[ShowcaseItem]:
-        sql = "SELECT id, title, description, price, photo, file_id, active, position FROM showcase"
+        sql = "SELECT id, title, description, price, photo, file_id, active, position, single FROM showcase"
         if only_active:
             sql += " WHERE active = 1"
         rows = self.conn.execute(sql + " ORDER BY position, id").fetchall()
-        return [ShowcaseItem(r[0], r[1], r[2], r[3], r[4], r[5], bool(r[6]), r[7]) for r in rows]
+        return [ShowcaseItem(r[0], r[1], r[2], r[3], r[4], r[5], bool(r[6]), r[7], bool(r[8])) for r in rows]
 
     def get_showcase_item(self, item_id: int) -> ShowcaseItem | None:
         return next((i for i in self.showcase() if i.id == item_id), None)
@@ -510,14 +516,17 @@ class ClientStore:
         if item.id:
             old = self.get_showcase_item(item.id)
             file_id = item.file_id if old is None or old.photo == item.photo else ""  # новое фото — новый file_id
-            self.conn.execute("UPDATE showcase SET title=?, description=?, price=?, photo=?, file_id=?, active=?"
-                              " WHERE id=?", (item.title.strip(), item.description.strip(), item.price, item.photo,
-                                              file_id, int(item.active), item.id))
+            self.conn.execute("UPDATE showcase SET title=?, description=?, price=?, photo=?, file_id=?, active=?,"
+                              " single=? WHERE id=?", (item.title.strip(), item.description.strip(), item.price,
+                                                       item.photo, file_id, int(item.active), int(item.single),
+                                                       item.id))
         else:
             position = self.conn.execute("SELECT COALESCE(MAX(position), 0) + 1 FROM showcase").fetchone()[0]
             cur = self.conn.execute(
-                "INSERT INTO showcase (title, description, price, photo, active, position) VALUES (?, ?, ?, ?, ?, ?)",
-                (item.title.strip(), item.description.strip(), item.price, item.photo, int(item.active), position))
+                "INSERT INTO showcase (title, description, price, photo, active, position, single)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (item.title.strip(), item.description.strip(), item.price, item.photo, int(item.active), position,
+                 int(item.single)))
             item.id = cur.lastrowid
         self.conn.commit()
         return item.id
@@ -607,6 +616,8 @@ class ClientStore:
             " recipient, client_phone, card) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (str(chat_id), _ts(now), _ts(now), showcase_id, items, day.isoformat(), time, address, recipient,
              client_phone, card))
+        if showcase_id:  # готовый букет в одном экземпляре — заказали, больше никому не показываем
+            self.conn.execute("UPDATE showcase SET active=0 WHERE id=? AND single=1", (showcase_id,))
         self.conn.commit()
         return self.get_client_order(cur.lastrowid)
 
@@ -639,6 +650,11 @@ class ClientStore:
         self.conn.execute("UPDATE client_orders SET status=?, updated_at=? WHERE id=?", (status, _ts(now), order_id))
         if note is not None:
             self.conn.execute("UPDATE client_orders SET note=? WHERE id=?", (note, order_id))
+        if status == "rejected":  # отказ — готовый букет снова на витрине, если его никто больше не заказал
+            self.conn.execute(
+                "UPDATE showcase SET active=1 WHERE single=1 AND id=(SELECT showcase_id FROM client_orders WHERE id=?)"
+                " AND NOT EXISTS (SELECT 1 FROM client_orders WHERE showcase_id=showcase.id AND id<>?"
+                " AND status IN ('new', 'priced', 'paid_claimed', 'confirmed'))", (order_id, order_id))
         self.conn.commit()
 
     def set_paid_photo(self, order_id: int, photo: bytes, now: datetime):
@@ -849,6 +865,10 @@ class Database(ClientStore):
                 self.conn.execute(sql)
         existing = {r[1] for r in self.conn.execute("PRAGMA table_info(shifts)")}
         for column, sql in SHIFT_MIGRATIONS.items():
+            if column not in existing:
+                self.conn.execute(sql)
+        existing = {r[1] for r in self.conn.execute("PRAGMA table_info(showcase)")}
+        for column, sql in SHOWCASE_MIGRATIONS.items():
             if column not in existing:
                 self.conn.execute(sql)
         existing = {r[1] for r in self.conn.execute("PRAGMA table_info(penalties)")}
