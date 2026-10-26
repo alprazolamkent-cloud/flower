@@ -10,6 +10,7 @@ from datetime import date, datetime, timedelta
 
 from .db import ORDER_STATUS, ClientOrder, Database, ShowcaseItem
 from .delivery_dialog import money
+from .reminders import parse_deadline_time
 
 SHOWCASE, CUSTOM, CHAT, ORDERS = "💐 Витрина", "✍️ Свой букет", "💬 Написать флористу", "📦 Мои заказы"
 TO_MENU, RESTART, SEND = "⬅ В меню", "↩ Начать заново", "✅ Отправить заказ"
@@ -20,12 +21,15 @@ STAFF_MENU = {"keyboard": [[{"text": STAFF_TODAY}, {"text": STAFF_TOMORROW}],
                            [{"text": STAFF_SHOWCASE}, {"text": STAFF_ADD}]], "resize_keyboard": True}
 STAFF_LIST_MAX = 10
 SHOWCASE_PAGE = 5  # столько букетов витрины клиент видит за раз
+STAFF_HELP = ("Кнопки внизу: «Сегодня» и «Завтра» — доставки («Собрал», «Доставлено»), «Витрина» — что видят "
+              "клиенты, «Новый букет» — добавить на витрину фото с подписью «Название цена».")
 
 
 def bouquets_word(n: int) -> str:
     if n % 10 == 1 and n % 100 != 11:
         return "букет"
     return "букета" if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14 else "букетов"
+
 
 MENU = {"keyboard": [[{"text": SHOWCASE}, {"text": CUSTOM}], [{"text": CHAT}, {"text": ORDERS}]],
         "resize_keyboard": True}
@@ -50,6 +54,9 @@ CLIENT_STATUS = {
 assert set(CLIENT_STATUS) == set(ORDER_STATUS)
 
 WEEKDAYS = {"понедельник": 0, "вторник": 1, "сред": 2, "четверг": 3, "пятниц": 4, "суббот": 5, "воскресень": 6}
+MONTHS = ("январ", "феврал", "март", "апрел", "ма", "июн", "июл", "август", "сентябр", "октябр", "ноябр", "декабр")
+MONTH_RE = re.compile(r"\b(\d{1,2})\s+(январ|феврал|март|апрел|ма[яй]|июн|июл|август|сентябр|октябр|ноябр|декабр)\w*")
+ORDER_STEPS = ("when", "when_time", "address", "address_detail", "recipient", "phone", "card", "confirm")
 
 
 @dataclass
@@ -92,7 +99,17 @@ def parse_when(text: str, today: date) -> tuple[date | None, str]:
         rest = low[:m.start()] + low[m.end():]
     else:
         m = re.search(r"\b(\d{1,2})[./](\d{1,2})(?:[./](\d{2,4}))?\b", low)
-        if m:
+        words = MONTH_RE.search(low) if m is None else None
+        if words:  # «8 марта», «1 ноября»
+            month = next(i for i, prefix in enumerate(MONTHS, 1) if words.group(2).startswith(prefix))
+            try:
+                day = date(today.year, month, int(words.group(1)))
+            except ValueError:
+                return None, text
+            if day < today:
+                day = day.replace(year=day.year + 1)
+            rest = low[:words.start()] + low[words.end():]
+        elif m:
             year = int(m.group(3)) if m.group(3) else today.year
             year += 2000 if year < 100 else 0
             try:
@@ -181,16 +198,14 @@ class ClientFlow:
         if text.startswith("/start") and len(text.split()) > 1:  # флорист привязывает Telegram кодом из программы
             tries = self.link_tries.get(msg.chat_id, 0)
             if tries < MAX_LINK_TRIES and self.db.link_work_phone(text.split()[1], msg.chat_id, now):
-                res.say("Готово, это рабочий телефон магазина 📱 Внизу кнопки «Сегодня» и «Завтра»: доставки со "
-                        "кнопками «Собрал» и «Доставлено». Когда букет собран, я попрошу его фото. "
-                        "Кто собрал — я определю по тому, кто сейчас на смене.", STAFF_MENU)
+                res.say("Готово, это рабочий телефон магазина 📱\n" + STAFF_HELP + "\nКогда букет собран, я попрошу "
+                        "его фото. Кто собрал — определю по тому, кто сейчас на смене.", STAFF_MENU)
                 res.events.append(("work_phone", msg.chat_id))
                 return res
             user = self.db.link_staff(text.split()[1], msg.chat_id) if tries < MAX_LINK_TRIES else None
             if user is not None:
-                res.say(f"Готово, {user.name or user.login}! Внизу кнопки «Сегодня» и «Завтра»: доставки со "
-                        "кнопками «Собрал» и «Доставлено». Когда букет собран, я попрошу у вас его фото.",
-                        STAFF_MENU)
+                res.say(f"Готово, {user.name or user.login}!\n" + STAFF_HELP + "\nКогда букет собран, я попрошу "
+                        "у вас его фото.", STAFF_MENU)
                 res.events.append(("staff", user.id))
                 return res
             self.link_tries[msg.chat_id] = tries + 1
@@ -230,6 +245,7 @@ class ClientFlow:
             res.say("Напишите сообщение — флорист ответит прямо здесь.", keyboard([TO_MENU]))
             return res
         if text == ORDERS:
+            go("", {})
             self._orders(msg.chat_id, res)
             return res
         if text == RESTART:
@@ -237,6 +253,12 @@ class ClientFlow:
             res.say("Начнём заново.", MENU)
             return res
 
+        if state in ORDER_STEPS and msg.photo is not None:  # фото посреди заказа — флористу, а не в пустоту
+            self._to_florist(msg, res, now, "фото к заказу" + (f": {text}" if text else ""), quiet=True)
+            res.say("Фото передал флористу 👌 Продолжим оформление — ответьте, пожалуйста, на вопрос выше.")
+            return res
+        if state in ORDER_STEPS and not text and msg.contact_phone and state != "phone":
+            text = msg.contact_phone  # прислали контакт (например, получателя) — как будто написали номер
         if state == "custom":
             if msg.photo is not None:
                 self._to_florist(msg, res, now, "фото-пример к заказу" + (f": {text}" if text else ""), quiet=True)
@@ -254,6 +276,9 @@ class ClientFlow:
             if day is None or day < now.date() or day > now.date() + timedelta(days=365):
                 res.say("Не понял дату 🙈 Напишите, например: «завтра к 15:00» или «25.10 с 12 до 14».")
                 return res
+            if day == now.date() and self._time_passed(rest, now):
+                res.say("Это время сегодня уже прошло 🙈 Напишите другое время или дату.")
+                return res
             data["day"] = day.isoformat()
             if not rest:
                 go("when_time", data)
@@ -265,6 +290,9 @@ class ClientFlow:
             return res
         if state == "when_time":
             if not text:
+                return res
+            if data.get("day") == now.date().isoformat() and self._time_passed(text, now):
+                res.say("Это время сегодня уже прошло 🙈 Напишите другое время.")
                 return res
             data["time"] = text
             go("address", data)
@@ -348,9 +376,8 @@ class ClientFlow:
             res.say(f"Спасибо! Флорист проверит оплату заказа №{waiting.id} и подтвердит.", MENU)
             return res
         self._to_florist(msg, res, now, text, quiet=state == "chat" and data.get("acked"))
-        if state == "chat":
-            data["acked"] = True
-            go("chat", data)
+        if msg.photo is not None or text:
+            go("chat", {"acked": True})  # «Передал флористу» — один раз, следующие сообщения уходят молча
         return res
 
     # ----- меню флориста -----
@@ -368,8 +395,7 @@ class ClientFlow:
         elif text in (STAFF_TODAY, STAFF_TOMORROW):
             self._staff_list(res, now.date() + timedelta(days=text == STAFF_TOMORROW), now.date())
         else:
-            res.say("Доставки — кнопками внизу. Когда отметите букет собранным, я попрошу фото — "
-                    "просто пришлите его сюда.", STAFF_MENU)
+            res.say(STAFF_HELP, STAFF_MENU)
 
     def _work_phone(self, msg: Incoming, res: Result, now: datetime):
         """Рабочий телефон: те же кнопки, но человек не известен — его определит программа по смене."""
@@ -391,8 +417,7 @@ class ClientFlow:
         elif text in (STAFF_TODAY, STAFF_TOMORROW):
             self._staff_list(res, now.date() + timedelta(days=text == STAFF_TOMORROW), now.date())
         else:
-            res.say("Доставки — кнопками внизу. Когда отметите букет собранным, я попрошу фото — "
-                    "просто пришлите его сюда.", STAFF_MENU)
+            res.say(STAFF_HELP, STAFF_MENU)
 
     def _showcase_part(self, msg: Incoming, res: Result, who: int | None) -> bool:
         """Витрина с телефона: «➕ Новый букет» (фото → название и цена), список с «в наличии», ценой и удалением.
@@ -415,6 +440,9 @@ class ClientFlow:
         if text == STAFF_SHOWCASE:
             self.staff_state.pop(chat, None)
             self._showcase_list(res)
+            return True
+        if kind == "vl" and value.isdigit():  # «Показать ещё» в списке витрины
+            self._showcase_list(res, int(value))
             return True
         if kind in ("vt", "vd", "vy", "vn", "vp", "ve", "vf", "vh", "vo", "v1") and value.isdigit():
             self._showcase_button(kind, int(value), res, chat, who)
@@ -464,7 +492,13 @@ class ClientFlow:
             else:
                 self._add_bouquet(res, chat, who, msg.photo, *parsed)
             return True
+        if state["step"] == "title" and msg.photo is not None and not text:
+            state["photo"] = msg.photo
+            res.say("Фото заменил 👌 Теперь название и цена, например: Нежность 3500", keyboard([STAFF_CANCEL]))
+            return True
         if state["step"] == "title" and text:
+            if msg.photo is not None:
+                state["photo"] = msg.photo
             parsed = parse_bouquet(text)
             if parsed is None:
                 res.say("Не понял цену 🙈 Напишите название и цену, например: Нежность 3500", keyboard([STAFF_CANCEL]))
@@ -488,13 +522,14 @@ class ClientFlow:
                 {"inline_keyboard": [[{"text": "1️⃣ Да, один экземпляр", "callback_data": f"v1:{item_id}"}],
                                      [{"text": "✏️ Изменить", "callback_data": f"ve:{item_id}"}]]})
 
-    def _showcase_list(self, res: Result):
+    def _showcase_list(self, res: Result, offset: int = 0):
         items = self.db.showcase()
         if not items:
             res.say("Витрина пока пустая. Нажмите «➕ Новый букет».", STAFF_MENU)
             return
-        res.say(f"На витрине: {len(items)}. Кнопки под букетом — наличие, изменить, удалить.", STAFF_MENU)
-        for item in items[:STAFF_LIST_MAX]:
+        if offset == 0:
+            res.say(f"На витрине: {len(items)}. Кнопки под букетом — наличие, изменить, удалить.", STAFF_MENU)
+        for item in items[offset:offset + STAFF_LIST_MAX]:
             if item.single:
                 state = "1️⃣ один экземпляр, " + ("✅ на витрине" if item.active else "🔒 продан / заказан (скрыт)")
                 toggle = "🔒 Продан" if item.active else "✅ Вернуть"
@@ -505,8 +540,9 @@ class ClientFlow:
                 {"text": toggle, "callback_data": f"vt:{item.id}"},
                 {"text": "✏️ Изменить", "callback_data": f"ve:{item.id}"},
                 {"text": "🗑", "callback_data": f"vd:{item.id}"}]]})
-        if len(items) > STAFF_LIST_MAX:
-            res.say(f"…и ещё {len(items) - STAFF_LIST_MAX}: остальные в программе.")
+        shown = offset + STAFF_LIST_MAX
+        if shown < len(items):
+            res.say(f"Показано {shown} из {len(items)}", inline(("⬇ Показать ещё", f"vl:{shown}")))
 
     def _showcase_button(self, kind: str, item_id: int, res: Result, chat: str, who: int | None):
         item = self.db.get_showcase_item(item_id)
@@ -568,6 +604,12 @@ class ClientFlow:
         if len(items) > STAFF_LIST_MAX:
             res.say(f"…и ещё {len(items) - STAFF_LIST_MAX}: остальные в программе.")
 
+    @staticmethod
+    def _time_passed(when: str, now: datetime) -> bool:
+        """Сегодняшнее время уже прошло (с запасом 10 минут): «к 10:00» в полдень. Окно «с 12 до 14» в 13:00 — нет."""
+        deadline = parse_deadline_time(when)
+        return deadline is not None and datetime.combine(now.date(), deadline) < now - timedelta(minutes=10)
+
     # ----- части разговора -----
 
     def _callback(self, msg: Incoming, res: Result, now: datetime, go, data: dict):
@@ -595,6 +637,9 @@ class ClientFlow:
                 res.say("Уже передал флористу — он проверит оплату и подтвердит.")
             elif order.status == "confirmed":
                 res.say("Оплата уже подтверждена, заказ принят ✅")
+            elif order.status == "rejected":
+                res.say(f"Заказ №{order.id} отменён — оплачивать его не нужно. Если есть вопросы, напишите флористу.",
+                        MENU)
 
     def _showcase(self, res: Result, offset: int = 0):
         """Витрина порциями: по SHOWCASE_PAGE букетов и «Показать ещё» — чат не заваливается фотографиями."""

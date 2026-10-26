@@ -11,7 +11,9 @@ from PySide6.QtWidgets import (
     QTabWidget, QTextBrowser, QVBoxLayout, QWidget,
 )
 
-from .client_bot import QR_FILE, bot_link, client_configured, client_settings, is_max, max_settings
+from .client_bot import (
+    QR_FILE, bot_link, chat_configured, client_configured, client_settings, is_max, max_settings,
+)
 from .client_flow import MENU, inline, payment_text
 from .db import ORDER_STATUS, ClientOrder, ShowcaseItem, UserError
 from .delivery_dialog import money, money_box
@@ -40,8 +42,9 @@ def needs_action(db) -> int:
 
 def order_html(o: ClientOrder, username: str = "") -> str:
     color = getattr(C, STATUS_COLORS.get(o.status, "gray"))
-    who = " ".join(x for x in (o.client_name, f"@{username}" if username else "") if x)
-    rows = [("Клиент", who or "—"), ("Телефон", o.client_phone or "—"), ("Когда", f"{o.day:%d.%m.%Y} {o.time}"),
+    who = " ".join(x for x in (o.client_name, f"@{username}" if username else "") if x) or "—"
+    who += " · MAX" if is_max(o.chat_id) else " · Telegram"
+    rows = [("Клиент", who), ("Телефон", o.client_phone or "—"), ("Когда", f"{o.day:%d.%m.%Y} {o.time}"),
             ("Что", o.items), ("Куда", o.address), ("Кому", o.recipient)]
     if o.card:
         rows.append(("Открытка", o.card))
@@ -114,6 +117,10 @@ class ClientCenter(QDialog):
 
     def _to_client(self, chat_id: str, text: str, photo: bytes | None = None, markup: dict | None = None):
         """Сообщение клиенту: уходит через бота и остаётся в переписке."""
+        if not chat_configured(chat_id):  # токен бота убрали — сообщение не уйдёт, пока его не вернут
+            QMessageBox.warning(self, "Бот не подключён",
+                                f"Бот {'MAX' if is_max(chat_id) else 'Telegram'} для клиентов сейчас не подключён "
+                                "(Настройки → Клиенты). Сообщение уйдёт, когда его подключат.")
         self.db.add_client_message(chat_id, False, text, datetime.now(), photo, author=self._author())
         self.main.client_bot.queue(chat_id, text, photo, markup)
 
@@ -231,7 +238,7 @@ class ClientCenter(QDialog):
                 "<h3>Заказов, ждущих ответа, нет</h3>"
                 f"<span style='color:{C.gray}'>Заказы приходят из бота «{html.escape(client_settings()['shop'])}»: "
                 "клиент выбирает букет на витрине или описывает свой, пишет дату, адрес и получателя. "
-                "Флорист назначает сумму, клиент оплачивает переводом, флорист подтверждает — "
+                "Флорист назначает сумму, клиент оплачивает по QR-коду или переводом, флорист подтверждает — "
                 "и заказ попадает в доставки.</span>")
             self.order_hint.setText("")
             return
@@ -342,7 +349,13 @@ class ClientCenter(QDialog):
         if not ok:
             return
         reason = reason.strip()
-        self.db.set_client_order_status(o.id, "rejected", datetime.now(), reason)
+        item = self.db.get_showcase_item(o.showcase_id) if o.showcase_id else None
+        restore = True
+        if item is not None and item.single and not item.active:  # готовый букет — вдруг его уже продали
+            restore = QMessageBox.question(
+                self, "Букет с витрины", f"Вернуть «{item.title}» на витрину? Он был в одном экземпляре.\n\n"
+                "«Нет» — если его уже продали.", QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes) == QMessageBox.Yes
+        self.db.set_client_order_status(o.id, "rejected", datetime.now(), reason, restore_single=restore)
         self._to_client(o.chat_id, f"К сожалению, заказ №{o.id} не можем принять" + (f": {reason}" if reason else ".")
                         + "\nНапишите нам — подберём другой вариант 🌷", markup=MENU)
         self.main.audit("Заказ из бота отклонён", f"№{o.id}" + (f": {reason}" if reason else ""))
@@ -560,7 +573,7 @@ class ClientCenter(QDialog):
         self.photo_label = QLabel()
         self.photo_label.setFixedSize(220, 220)
         self.photo_label.setAlignment(Qt.AlignCenter)
-        self.photo_label.setStyleSheet(f"border: 1px dashed {C.card_border}; color: {C.gray};")
+        self.photo_label.setStyleSheet(f"border: 1px dashed {C.gray}; color: {C.gray};")
         photo_row.addWidget(self.photo_label)
         photo_buttons = QVBoxLayout()
         pick_btn = QPushButton("🖼 Выбрать фото…")

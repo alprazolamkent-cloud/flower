@@ -140,7 +140,7 @@ def test_staff_link_and_photo(db):
     assert db.staff_chat(anna.id) == CHAT_ID and db.staff_by_chat(CHAT_ID).id == anna.id
     photo = say(flow, photo=b"bouquet")
     assert photo.events == [("staff_photo", anna.id, b"bouquet", "")]
-    assert "кнопками внизу" in texts(say(flow, "привет"))
+    assert "Кнопки внизу" in texts(say(flow, "привет"))
     assert db.client_chat(CHAT_ID) is None  # флориста не записываем в клиенты
     stranger = ClientFlow(db, "").handle(Incoming("777", "/start 000000"), NOW)
     assert "Здравствуйте" in texts(stranger)  # неверный код — обычное приветствие
@@ -458,3 +458,56 @@ def test_old_showcase_gets_single_column(tmp_path):
     [item] = db.showcase()
     assert item.title == "Старый" and item.single is False
     db.close()
+
+
+def test_logic_fixes_in_conversation(db):
+    today = date(2026, 10, 20)
+    assert parse_when("8 марта к 12", today) == (date(2027, 3, 8), "к 12")  # месяц словами, уже прошёл — следующий год
+    assert parse_when("на 1 ноября с 10 до 12", today) == (date(2026, 11, 1), "с 10 до 12")
+    assert parse_when("31 февраля", today)[0] is None
+
+    flow = ClientFlow(db, "")
+    say(flow, CUSTOM)
+    say(flow, "Розы")
+    assert "уже прошло" in texts(say(flow, "сегодня к 10:00"))  # NOW — 12:00
+    assert "Куда доставить" in texts(say(flow, "сегодня с 11 до 14"))  # окно ещё идёт — можно
+    # фото посреди заказа уходит флористу, шаг не теряется
+    mid = say(flow, photo=b"house")
+    assert mid.events[0][0] == "message" and "Продолжим" in texts(mid)
+    assert db.client_chat(CHAT_ID).state == "address"
+    say(flow, "Мира, 1")
+    assert "номер телефона" in texts(say(flow, contact_phone="+79005554433"))  # контакт получателя — как ответ
+    order_state = db.client_chat(CHAT_ID)
+    assert order_state.data.get("recipient") == "+79005554433"
+
+    # «Мои заказы» посреди заказа — выходим в меню
+    say(flow, ORDERS)
+    assert db.client_chat(CHAT_ID).state == ""
+
+    # «Передал флористу» — один раз, дальше молча
+    first, second = say(flow, "Здравствуйте"), say(flow, "Есть розы?")
+    assert "Передал" in texts(first) and not second.replies and second.events[0][0] == "message"
+
+    # «Я оплатил» по отменённому заказу
+    order = db.add_client_order(CHAT_ID, NOW, NOW.date(), "18:00", "Розы", "Мира, 1", "Маша", "", "")
+    db.price_client_order(order.id, 3000, 0, NOW)
+    db.set_client_order_status(order.id, "rejected", NOW, "нет роз")
+    assert "отменён" in texts(say(flow, callback=f"paid:{order.id}"))
+
+
+def test_staff_showcase_paging_and_photo_replace(db):
+    from app.client_flow import STAFF_ADD, STAFF_SHOWCASE
+    for i in range(13):
+        db.save_showcase_item(ShowcaseItem(0, f"Б{i}", price=100 + i))
+    db.link_work_phone(db.work_phone_code(), CHAT_ID, NOW)
+    flow = ClientFlow(db, "", None, {})
+    page = say(flow, STAFF_SHOWCASE)
+    assert len(page.replies) == 12 and page.replies[-1].markup["inline_keyboard"][0][0]["callback_data"] == "vl:10"
+    rest = say(flow, callback="vl:10")
+    assert [r.text.split(" —")[0] for r in rest.replies] == ["Б10", "Б11", "Б12"]
+
+    say(flow, STAFF_ADD)
+    say(flow, photo=b"first")
+    assert "Фото заменил" in texts(say(flow, photo=b"second"))
+    say(flow, "Нежность 3500")
+    assert db.showcase()[-1].photo == b"second"

@@ -329,7 +329,7 @@ def test_assembled_photo_delivered(window):
     delivered = [text for chat, text, _, _ in outbox(db) if chat == "555" and "доставлен" in text]
     assert len(delivered) == 1 and "Ленина, 5" in delivered[0]
     assert db.get_delivery(d.id).sent("delivered")
-    assert w.table.item(row, mw.COL_ASSEMBLED).text() == "📷"
+    assert w.table.item(row, mw.COL_ITEMS).text().startswith("📷 ")
 
     # «Написать заказчику» для заказа из бота — прямо в бот
     w.table.selectRow(row)
@@ -530,3 +530,45 @@ def test_showcase_from_phone_in_program(window):
     c.title_edit.setModified(True)
     c.refresh_showcase()
     assert c.title_edit.text() == "Новое имя"
+
+
+def test_photo_request_goes_to_work_phone(window, store):
+    w, db = window, window.db
+    store["max_token"] = "mx"
+    db.link_work_phone(db.work_phone_code(), "max:900", datetime.now())
+    d = Delivery(day=date.today(), time="23:59", items="Розы", address="Мира, 1")
+    db.add(d)
+    w._set_assembled(d, True)  # отметили на компьютере, своего телефона у флориста нет
+    assert any(c == "max:900" and "Пришлите фото" in t for c, t, _, _ in outbox(db))
+    w.client_bot.event.emit(("work_photo", "max:900", jpeg(), ""))
+    assert db.get_delivery(d.id).photos == 1 and all(d.id not in v for v in w._photo_wanted.values())
+
+
+def test_reject_single_bouquet_asks_to_return(window, monkeypatch):
+    w, db = window, window.db
+    item = db.save_showcase_item(ShowcaseItem(0, "Готовый", price=4000, single=True))
+    o = client_order(w, showcase_id=item)
+    assert not db.get_showcase_item(item).active
+    w.open_clients()
+    monkeypatch.setattr(QInputDialog, "getText", staticmethod(lambda *a, **k: ("продан в магазине", True)))
+    monkeypatch.setattr(QMessageBox, "question", lambda *a, **k: QMessageBox.No)  # «уже продали»
+    w.client_center.reject_btn.click()
+    assert db.get_client_order(o.id).status == "rejected" and not db.get_showcase_item(item).active
+
+
+def test_delivered_text_with_map_point():
+    from app.messaging import readable_address, render
+    point = "📍 55.750000, 37.610000 — https://yandex.ru/maps/?pt=37.61,55.75&z=17\nподъезд 2, кв. 40"
+    assert readable_address(point) == "точке на карте (подъезд 2, кв. 40)"
+    assert readable_address("ул. Ленина, 5") == "ул. Ленина, 5"
+    text = render("Ваш букет доставлен по адресу: {адрес}.", Delivery(day=date.today(), address=point))
+    assert "yandex" not in text and "подъезд 2" in text
+
+
+def test_max_photo_without_caption(monkeypatch):
+    from app import max_bot
+    sent = {}
+    monkeypatch.setattr(max_bot, "_call", lambda token, method, path, query=None, body=None, **k:
+                        sent.update(body=body) or {"message": {"body": {}}})
+    max_bot.send("mx", "42", "", None, {"token": "IMG"})
+    assert "text" not in sent["body"] and sent["body"]["attachments"][0]["type"] == "image"

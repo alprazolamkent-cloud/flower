@@ -44,9 +44,17 @@ class Action:
     note: str  # что сказать пользователю ("" — ничего)
 
 
+def readable_address(address: str) -> str:
+    """Адрес для текста клиенту. Точку на карте из бота («📍 55.75, 37.61 — ссылка» + подъезд) — по-человечески."""
+    if not address.startswith("📍"):
+        return address
+    details = ", ".join(line.strip() for line in address.splitlines()[1:] if line.strip())
+    return "точке на карте" + (f" ({details})" if details else "")
+
+
 def render(template: str, d: Delivery) -> str:
     values = {
-        "{адрес}": d.address,
+        "{адрес}": readable_address(d.address),
         "{время}": d.time,
         "{получатель}": d.recipient,
         "{что}": d.items.splitlines()[0] if d.items else "",

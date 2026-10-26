@@ -384,7 +384,7 @@ class SettingsDialog(QDialog):
         self.rate_box.setGroupSeparatorShown(True)
         self.rate_box.setSuffix(" ₽")
         self.rate_box.setValue(rules.shift_rate)
-        base_form.addRow("За каждую сданную смену:", self.rate_box)
+        base_form.addRow("За каждую смену:", self.rate_box)
         self.holiday_box = QSpinBox()
         self.holiday_box.setRange(0, 100_000)
         self.holiday_box.setSingleStep(100)
@@ -427,8 +427,9 @@ class SettingsDialog(QDialog):
         own.clicked.connect(self._employee_tiers)
         bonus_layout.addWidget(own)
         layout.addWidget(bonus)
-        layout.addWidget(_gray_label("Зарплата = смены × ставка + премия − недостачи ± аванс, премия, штраф.\n"
-                                     "Аванс, премию или штраф добавляйте в личном кабинете, выбрав сотрудника."))
+        layout.addWidget(_gray_label("Зарплата = смены × ставка + премия − недостачи − санкции ± аванс, премия, доплата.\n"
+                                     "Ставка — за каждую смену, даже несданную; премия — только по сданным.\n"
+                                     "Аванс, премию, доплату — в личном кабинете (выбрав сотрудника) или в Telegram."))
         layout.addStretch(1)
         return page
 
@@ -612,7 +613,7 @@ class SettingsDialog(QDialog):
             "3. Загрузите QR-код для оплаты (картинкой) и/или впишите реквизиты — бот пришлёт их клиенту вместе с суммой.<br>"
             "4. Ссылку на бота дайте клиентам: в профиле Instagram, на визитке, в статусе WhatsApp.<br>"
             "Фото и описание бота меняются там же, в BotFather: /setuserpic и /setdescription.<br>"
-            "<b>MAX</b> — по желанию, вместе с Telegram или вместо него: бот создаёт ИП на dev.max.ru "
+            "<b>MAX</b> — по желанию, вместе с Telegram или вместо него: бота создаёт ИП на dev.max.ru "
             "(верификация по ИНН, модерация до 2 суток), токен — в настройках бота там же.")
         steps.setWordWrap(True)
         layout.addWidget(steps)
@@ -678,7 +679,7 @@ class SettingsDialog(QDialog):
         self.qr_label = QLabel()
         self.qr_label.setFixedSize(120, 120)
         self.qr_label.setAlignment(Qt.AlignCenter)
-        self.qr_label.setStyleSheet(f"border: 1px dashed {C.card_border}; color: {C.gray};")
+        self.qr_label.setStyleSheet(f"border: 1px dashed {C.gray}; color: {C.gray};")
         qr_pick = QPushButton("Выбрать картинку…")
         qr_pick.clicked.connect(self._pick_qr)
         qr_clear = QPushButton("Убрать")
@@ -698,7 +699,7 @@ class SettingsDialog(QDialog):
         self.requisites_edit.setFixedHeight(60)
         form.addRow("Текст к оплате:", self.requisites_edit)
         form.addRow(_gray_label("Сумму флорист вписывает каждый раз сам (букет + доставка). Бот присылает клиенту\n"
-                                "QR-код, сумму текстом (в статическом QR её нет — клиент вводит сама) и кнопку\n"
+                                "QR-код, сумму текстом (в статическом QR её нет — клиент вводит её сам) и кнопку\n"
                                 "«Я оплатил(а)». Заказ попадает в доставки, когда флорист подтвердит оплату."))
         form.addRow(_gray_label("Бот работает, пока компьютер включён и есть интернет. Что клиенты напишут,\n"
                                 "пока он выключен, бот получит позже (Telegram хранит сообщения сутки)."))

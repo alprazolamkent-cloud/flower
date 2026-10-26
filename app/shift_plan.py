@@ -3,6 +3,7 @@
 import html
 from datetime import datetime, time, timedelta
 
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QDialog, QDialogButtonBox, QLabel, QScrollArea, QVBoxLayout
 
 from .db import Database, Delivery
@@ -89,6 +90,7 @@ class ShiftPlanDialog(QDialog):
         layout = QVBoxLayout(self)
         label = QLabel(plan_html(db, shift, change, water, lead_minutes))
         label.setWordWrap(True)
+        label.setAlignment(Qt.AlignTop | Qt.AlignLeft)  # план сверху окна, а не посередине
         label.setContentsMargins(8, 4, 8, 4)
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)

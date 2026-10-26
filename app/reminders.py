@@ -9,33 +9,28 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from .db import Delivery
 
-TIME_RE = re.compile(r"(\d{1,2})\s*[:.\-]\s*(\d{2})")
-HOUR_RE = re.compile(r"\b(\d{1,2})\b")
+# «14:00», «14.30» или просто час «14». Дефис — это промежуток («14-16»), а не минуты.
+TIME_RE = re.compile(r"(?<!\d)(\d{1,2})(?:\s*[:.]\s*(\d{2}))?(?!\d)")
+
+
+def _times(text: str) -> list[time | None]:
+    found = []
+    for m in TIME_RE.finditer(text or ""):
+        h, mi = int(m.group(1)), int(m.group(2) or 0)
+        found.append(time(h, mi) if h <= 23 and mi <= 59 else None)
+    return found
 
 
 def parse_start_time(text: str) -> time | None:
-    """Время начала доставки из строки: «14:00», «14.30», «14:00–16:00», «к 9»."""
-    m = TIME_RE.search(text)
-    if m:
-        h, mi = int(m.group(1)), int(m.group(2))
-    else:
-        m = HOUR_RE.search(text)
-        if not m:
-            return None
-        h, mi = int(m.group(1)), 0
-    if h > 23 or mi > 59:
-        return None
-    return time(h, mi)
+    """Время начала доставки из строки: «14:00», «14.30», «14:00–16:00», «14-16», «к 9»."""
+    found = _times(text)
+    return found[0] if found else None
 
 
 def parse_deadline_time(text: str) -> time | None:
-    """Крайнее время доставки: для «14:00–16:00» это 16:00, для «14:00» — 14:00."""
-    last = None
-    for m in TIME_RE.finditer(text):
-        h, mi = int(m.group(1)), int(m.group(2))
-        if h <= 23 and mi <= 59:
-            last = time(h, mi)
-    return last or parse_start_time(text)
+    """Крайнее время доставки: для «14:00–16:00», «14-16» и «с 14 до 16» это 16:00, для «14:00» — 14:00."""
+    valid = [t for t in _times(text) if t is not None]
+    return valid[-1] if valid and parse_start_time(text) is not None else None
 
 
 def reminder_key(d: Delivery) -> tuple:

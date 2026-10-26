@@ -236,3 +236,12 @@ def test_overdue_alert_goes_to_staff_and_owners(window):
     w._check_overdue(now)  # второй раз о той же доставке не напоминаем
     assert shown == ["Доставка не отмечена"] and len(w.queued) == 1
     assert "не отмечена вовремя" in w.queued[0][0] and "Телефон: +7 900 1" in w.queued[0][0]
+
+
+def test_time_ranges_without_minutes():
+    from app.reminders import parse_start_time
+    assert parse_start_time("14-16") == time(14, 0) and parse_deadline_time("14-16") == time(16, 0)  # не 14:16
+    assert parse_deadline_time("с 12 до 14") == time(14, 0)  # окно до 14 — не тревожить в 12:20
+    assert parse_deadline_time("с 10:15 до 12") == time(12, 0)
+    assert parse_start_time("к 15:00") == time(15, 0) and parse_deadline_time("к 15:00") == time(15, 0)
+    assert parse_deadline_time("25:00") is None and parse_start_time("25:00") is None

@@ -646,11 +646,13 @@ class ClientStore:
         self.conn.commit()
         return self.get_client_order(order_id)
 
-    def set_client_order_status(self, order_id: int, status: str, now: datetime, note: str | None = None):
+    def set_client_order_status(self, order_id: int, status: str, now: datetime, note: str | None = None,
+                                restore_single: bool = True):
+        """restore_single — при отказе вернуть готовый букет «в одном экземпляре» на витрину (если не продан)."""
         self.conn.execute("UPDATE client_orders SET status=?, updated_at=? WHERE id=?", (status, _ts(now), order_id))
         if note is not None:
             self.conn.execute("UPDATE client_orders SET note=? WHERE id=?", (note, order_id))
-        if status == "rejected":  # отказ — готовый букет снова на витрине, если его никто больше не заказал
+        if status == "rejected" and restore_single:  # отказ — готовый букет снова на витрине, если его никто больше не заказал
             self.conn.execute(
                 "UPDATE showcase SET active=1 WHERE single=1 AND id=(SELECT showcase_id FROM client_orders WHERE id=?)"
                 " AND NOT EXISTS (SELECT 1 FROM client_orders WHERE showcase_id=showcase.id AND id<>?"

@@ -171,7 +171,7 @@ def send(token: str, user_id: str, text: str, markup: dict | None = None, image:
     buttons = keyboard(markup, max_requisites())
     if buttons:
         attachments.append(buttons)
-    body = {"text": pretty(text[:MAX_TEXT]), "format": "html"}
+    body = {"text": pretty(text[:MAX_TEXT]), "format": "html"} if text.strip() else {}  # фото без подписи
     if attachments:
         body["attachments"] = attachments
     for attempt in range(NOT_READY_RETRIES + 1):

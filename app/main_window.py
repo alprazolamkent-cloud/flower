@@ -395,7 +395,8 @@ class MainWindow(QMainWindow):
         self.day_totals = QLabel()
         right.addWidget(self.day_totals)
 
-        self.hint = QLabel("💐 — букет собран (📷 — есть фото), ✓ — доставлено. Двойной щелчок — изменить.")
+        self.hint = QLabel("💐 — букет собран, ✓ — доставлено, 📷 — есть фото букета (двойной щелчок по 💐 — "
+                           "посмотреть). Двойной щелчок по строке — изменить.")
         self.hint.setStyleSheet(f"color: {C.gray}")
         right.addWidget(self.hint)
 
@@ -1060,13 +1061,13 @@ class MainWindow(QMainWindow):
             assembled.setToolTip(f"Собрано{' — ' + d.assembled_by_name if d.assembled_by_name else ''}"
                                  if d.assembled else "Не собрано")
             if d.photos:
-                assembled.setText("📷")
                 assembled.setToolTip(assembled.toolTip() + ". Есть фото — двойной щелчок, чтобы посмотреть")
             cells = {
                 COL_ASSEMBLED: assembled,
                 COL_DONE: done,
                 COL_TIME: QTableWidgetItem(d.time),
-                COL_ITEMS: QTableWidgetItem(("🗑 ждёт удаления · " if d.delete_requested_at else "") + d.items),
+                COL_ITEMS: QTableWidgetItem(("🗑 ждёт удаления · " if d.delete_requested_at else "")
+                                            + ("📷 " if d.photos else "") + d.items),
                 COL_RECIPIENT: QTableWidgetItem("\n".join(x for x in (d.recipient, d.phone) if x)),
                 COL_ADDRESS: QTableWidgetItem(d.address),
                 COL_PRICE: QTableWidgetItem(money(d.price)),
@@ -1619,12 +1620,15 @@ class MainWindow(QMainWindow):
             self._to_client(d.client_chat, "🌸 Ваш букет готов — можно забирать!" if pickup
                             else "💐 Ваш букет собран и скоро поедет к получателю!")
             self.db.mark_message(d.id, "assembled")
-        chat = chat or (self.db.staff_chat(user.id) if user is not None else "")
-        if chat and chat_configured(chat):
-            self._photo_wanted.setdefault(chat, []).append(d.id)
-            what = (d.items.splitlines() or ["букет"])[0]
-            self.client_bot.queue(chat, f"📷 Пришлите фото букета: {d.time or '—'} — {what}"
-                                  + ("\nЗаказ из бота — фото увидит клиент." if d.client_chat else ""))
+        # кого попросить фото: телефон, с которого нажали; свой телефон флориста; иначе общий рабочий
+        personal = self.db.staff_chat(user.id) if user is not None else ""
+        targets = [chat] if chat else [personal] if personal else self.db.work_phones()
+        what = (d.items.splitlines() or ["букет"])[0]
+        for target in targets:
+            if target and chat_configured(target):
+                self._photo_wanted.setdefault(target, []).append(d.id)
+                self.client_bot.queue(target, f"📷 Пришлите фото букета: {d.time or '—'} — {what}"
+                                      + ("\nЗаказ из бота — фото увидит клиент." if d.client_chat else ""))
 
     def _after_delivered(self, d: Delivery):
         """Доставлено: клиенту из бота сообщение уходит само (шаблон «Букет доставлен»)."""
@@ -1709,6 +1713,7 @@ class MainWindow(QMainWindow):
             self._after_delivered(d)
         self.refresh_all()
         self.update_clients_button()
+        self._check_assembly(now)  # собрали с телефона — окно «Не собрано!» на компьютере закрывается сразу
 
     @staticmethod
     def _by(user: User | None) -> str:
@@ -1730,11 +1735,15 @@ class MainWindow(QMainWindow):
         name = (user.name or user.login) if user else "рабочий телефон"
         d = self._photo_target(chat, user.id if user else None, album, now)
         if d is None:
-            self.client_bot.queue(chat, "Не понял, к какому букету это фото 🙈 Сначала нажмите «Собрал» у этого "
-                                        "букета — тогда я попрошу фото.")
+            self.client_bot.queue(chat, "Не понял, к какому букету это фото 🙈 Если это собранный заказ — сначала "
+                                        "нажмите «Собрал» у него (кнопка «Сегодня»). Если для витрины — "
+                                        "«➕ Новый букет», потом фото.")
             return
         same = self._last_photo.get(chat, ("", 0, now))[1] == d.id
         self._last_photo[chat] = (album, d.id, now)
+        for wanted in self._photo_wanted.values():  # фото пришло — второй телефон (Telegram / MAX) больше не ждёт
+            while d.id in wanted:
+                wanted.remove(d.id)
         self.db.add_delivery_photo(d.id, data, name, now)
         self.db.log_action(user, "Фото букета", describe_delivery(d), **({"who": name} if user is None else {}))
         if not same:
