@@ -359,8 +359,11 @@ class StockStore:
         return r[0] if r else None
 
     def set_photo(self, kind: str, ident: int, photo: bytes | None):
+        """Фото букета по техкарте — и в его пункте витрины ботов (новое фото — Telegram загрузит заново)."""
         table = {"product": "products", "recipe": "recipes"}[kind]
         self.conn.execute(f"UPDATE {table} SET photo=? WHERE id=?", (photo, ident))
+        if kind == "recipe" and photo:
+            self.conn.execute("UPDATE showcase SET photo=?, file_id='' WHERE recipe_id=?", (photo, ident))
         self.conn.commit()
 
     def popular(self, since: datetime, limit: int = 12) -> list[tuple[str, int]]:
@@ -502,7 +505,7 @@ class StockStore:
                           " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                           (recipe_id, _ts(now), qty, kind, cost, ref, reason, shift_id, user_id))
 
-    def _ready_cost(self, recipe_id: int) -> float:
+    def ready_cost(self, recipe_id: int) -> float:
         r = self.conn.execute("SELECT ready_cost FROM recipes WHERE id=?", (recipe_id,)).fetchone()
         return r[0] if r else 0
 
@@ -519,7 +522,7 @@ class StockStore:
             self._move(pid, -q * qty, "assembly", self._avg_cost(pid), now, ref=recipe_id, shift_id=shift_id,
                        user_id=user_id)
         have = max(self.ready_of(recipe_id), 0)
-        avg = (have * self._ready_cost(recipe_id) + qty * unit) / (have + qty)
+        avg = (have * self.ready_cost(recipe_id) + qty * unit) / (have + qty)
         self.conn.execute("UPDATE recipes SET ready_cost=? WHERE id=?", (avg, recipe_id))
         self._ready_move(recipe_id, qty, "assemble", unit, now, shift_id=shift_id, user_id=user_id)
         self._publish(recipe)
@@ -559,7 +562,7 @@ class StockStore:
                         now: datetime):
         """Готовый букет завял / сломался на витрине — списать целиком (по себестоимости сборки)."""
         self._check_ready(recipe_id, qty)
-        self._ready_move(recipe_id, -qty, "writeoff", self._ready_cost(recipe_id), now, reason=reason or "Другое",
+        self._ready_move(recipe_id, -qty, "writeoff", self.ready_cost(recipe_id), now, reason=reason or "Другое",
                          shift_id=shift_id, user_id=user_id)
         self.conn.commit()
 
@@ -569,7 +572,7 @@ class StockStore:
         сколько), сразу списывается с причиной. Пересобрать — после этого просто собрать другой букет."""
         self._check_ready(recipe_id, qty)
         recipe = self.get_recipe(recipe_id)
-        self._ready_move(recipe_id, -qty, "disassemble", self._ready_cost(recipe_id), now, shift_id=shift_id,
+        self._ready_move(recipe_id, -qty, "disassemble", self.ready_cost(recipe_id), now, shift_id=shift_id,
                          user_id=user_id)
         for pid, q in recipe.items:
             self._move(pid, q * qty, "disassembly", self._avg_cost(pid), now, ref=recipe_id, shift_id=shift_id,
@@ -654,7 +657,7 @@ class StockStore:
                 title = title or (recipe.title if recipe else "")
                 ready = min(max(self.ready_of(line.recipe_id), 0), line.qty)  # сначала — собранные с витрины
                 if ready:
-                    unit = self._ready_cost(line.recipe_id)
+                    unit = self.ready_cost(line.recipe_id)
                     cost += ready * unit
                     self._ready_move(line.recipe_id, -ready, "sale", unit, now, ref=sale_id, shift_id=shift_id,
                                      user_id=user_id)
@@ -775,7 +778,7 @@ class StockStore:
     def stock_value(self) -> int:
         """Сколько стоит всё, что лежит на складе и на витрине (по себестоимости)."""
         goods = sum(p.stock * p.avg_cost for p in self.products() if p.stock > 0)
-        return round(goods + sum(r.ready * self._ready_cost(r.id) for r in self.recipes() if r.ready > 0))
+        return round(goods + sum(r.ready * self.ready_cost(r.id) for r in self.recipes() if r.ready > 0))
 
     # ----- что заказать, инвентаризация списком, когда продают, что залёживается -----
 

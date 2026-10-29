@@ -16,7 +16,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout, QWidget,
 )
 
-from .db import ORDER_STATUS, Database, Delivery, Totals, User
+from .db import ORDER_STATUS, Database, Delivery, Totals, User, UserError
 from .delivery_dialog import DeliveryDialog, money
 from .icon import flower_icon
 from .messaging import KINDS, SHORT, build_action, render
@@ -48,6 +48,7 @@ from .client_center import NEEDS_ACTION, ClientCenter, StaffLinkDialog, needs_ac
 from .client_flow import inline, order_summary
 from .photos import PhotoViewer
 from .future_orders import FutureOrdersDialog
+from .stock import CartLine, qty_text
 from .stock_window import StockWindow
 from .holidays import holiday_name
 from .heartbeat import Heartbeat
@@ -1682,6 +1683,8 @@ class MainWindow(QMainWindow):
                                   QSystemTrayIcon.Information, 10_000)
         elif kind == "staff_photo":
             self._staff_photo(ev[1], ev[2], ev[3] if len(ev) > 3 else "")
+        elif kind in ("stock_assemble", "stock_writeoff"):
+            self._phone_stock(ev)
         self.update_clients_button()
         if self.client_center is not None and self.client_center.isVisible():
             self.client_center.refresh(showcase=False)  # витрину не трогаем: там могут быть несохранённые правки
@@ -1805,6 +1808,53 @@ class MainWindow(QMainWindow):
         self.refresh_all()
         self.update_clients_button()
         self._check_assembly(now)  # собрали с телефона — окно «Не собрано!» на компьютере закрывается сразу
+
+    def _phone_stock(self, ev: tuple):
+        """С телефона флориста: собрал букет по техкарте или списал. Кто — свой телефон или тот, кто на смене."""
+        kind, user_id, chat = ev[0], ev[1], ev[2]
+        user = next((u for u in self.db.users() if u.id == user_id), None) if user_id is not None else None
+        if user is None:
+            people = self._people_on_shift()
+            user = people[0] if len(people) == 1 else None
+        own = self.db.current_shift(user.id) if user else None
+        shift_id = own.id if own is not None else self.sale_shift_id()
+        who = {"who": "рабочий телефон"} if user is None else {}
+        now = datetime.now()
+        try:
+            if kind == "stock_assemble":
+                _, _, _, recipe_id, qty, photo = ev
+                recipe = self.db.get_recipe(recipe_id)
+                if photo:
+                    self.db.set_photo("recipe", recipe_id, photo)
+                short = self.db.shortages([CartLine(recipe.title, qty, 0, recipe_id=recipe_id)]) \
+                    if not self.db.ready_of(recipe_id) else []
+                self.db.assemble(recipe_id, qty, user.id if user else None, shift_id, now)
+                self.db.log_action(user, "Букет собран на витрину (с телефона)", f"{recipe.title} × {qty}", **who)
+                shown = recipe.in_bot
+                self.client_bot.queue(chat, f"💐 Собрано{self._by(user)}: {recipe.title} × {qty}. Цветы списаны со склада"
+                                      + (", букет на витрине в боте." if shown else ".")
+                                      + ("\n⚠ По программе не хватало: " + "; ".join(short)
+                                         + " — проверьте, внесена ли поставка." if short else ""))
+            else:
+                _, _, _, what, ident, qty, reason = ev
+                if what == "product":
+                    p = self.db.get_product(ident)
+                    self.db.write_off(ident, qty, reason, user.id if user else None, shift_id, now)
+                    title, amount = f"{p.name} × {qty_text(qty)} {p.unit}", round(qty * p.avg_cost)
+                else:
+                    recipe = self.db.get_recipe(ident)
+                    self.db.write_off_ready(ident, qty, reason, user.id if user else None, shift_id, now)
+                    title, amount = f"💐 {recipe.title} × {qty_text(qty)}", round(qty * self.db.ready_cost(ident))
+                self.db.log_action(user, "Списание (с телефона)", f"{title} — {reason}, {money(amount)}", **who)
+                self.client_bot.queue(chat, f"🗑 Списано{self._by(user)}: {title} — {reason}"
+                                      + (f" ({money(amount)})" if amount else ""))
+        except UserError as e:
+            self.client_bot.queue(chat, f"Не получилось: {e}")
+            return
+        if self.stock_window is not None and self.stock_window.isVisible():
+            self.stock_window.refresh()
+        if self.client_center is not None and self.client_center.isVisible():
+            self.client_center.refresh_showcase()
 
     @staticmethod
     def _by(user: User | None) -> str:

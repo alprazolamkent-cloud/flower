@@ -572,3 +572,26 @@ def test_max_photo_without_caption(monkeypatch):
                         sent.update(body=body) or {"message": {"body": {}}})
     max_bot.send("mx", "42", "", None, {"token": "IMG"})
     assert "text" not in sent["body"] and sent["body"]["attachments"][0]["type"] == "image"
+
+
+def test_phone_assemble_and_writeoff_in_program(window, store):
+    from app.stock import Product, Recipe
+    w, db = window, window.db
+    chat = "900"
+    db.link_work_phone(db.work_phone_code(), chat, datetime.now())
+    rose = db.save_product(Product(0, "Кения", "Цветы", price=250))
+    db.add_supply("База", [(rose, 10, 80)], None, datetime.now())
+    recipe = db.save_recipe(Recipe(0, "Классика", 3500, items=[(rose, 15)]))
+    db.open_shift(w.user.id, 5000, datetime.now(), time(8, 0))  # одна на смене — на неё и запишется
+    w.client_bot.event.emit(("stock_assemble", None, chat, recipe, 1, jpeg()))
+    assert db.ready_of(recipe) == 1 and db.stock_of(rose) == -5
+    item = db.showcase(only_active=True)[0]
+    assert item.recipe_id == recipe and item.photo  # с фото с телефона — сразу в боте
+    sent = [t for c, t, _, _ in outbox(db) if c == chat]
+    assert any(t.startswith("💐 Собрано (Анна): Классика × 1") and "не хватало: Кения" in t for t in sent)
+    w.client_bot.event.emit(("stock_writeoff", None, chat, "recipe", recipe, 1, "Завяло"))
+    assert db.ready_of(recipe) == 0 and db.showcase(only_active=True) == []
+    w.client_bot.event.emit(("stock_writeoff", None, chat, "product", rose, 2, "Разбито"))
+    sent = [t for c, t, _, _ in outbox(db) if c == chat]
+    assert "🗑 Списано (Анна): Кения × 2 шт — Разбито (160 ₽)" in sent
+    assert db.shift_sales(db.current_shift(w.user.id).id).writeoffs == {"Завяло": 1200, "Разбито": 160}

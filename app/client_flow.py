@@ -17,12 +17,16 @@ TO_MENU, RESTART, SEND = "⬅ В меню", "↩ Начать заново", "�
 PICKUP, SELF, NO_CARD = "🏪 Заберу сам", "Себе", "Без открытки"
 STAFF_TODAY, STAFF_TOMORROW = "📋 Сегодня", "📅 Завтра"  # меню флориста: видно только в привязанном чате
 STAFF_SHOWCASE, STAFF_ADD, STAFF_CANCEL = "💐 Витрина", "➕ Новый букет", "✖ Отмена"
+STAFF_ASSEMBLE, STAFF_STOCK, NO_PHOTO = "💐 Собрал букет", "📦 Склад", "Без фото"
 STAFF_MENU = {"keyboard": [[{"text": STAFF_TODAY}, {"text": STAFF_TOMORROW}],
-                           [{"text": STAFF_SHOWCASE}, {"text": STAFF_ADD}]], "resize_keyboard": True}
+                           [{"text": STAFF_SHOWCASE}, {"text": STAFF_ADD}],
+                           [{"text": STAFF_ASSEMBLE}, {"text": STAFF_STOCK}]], "resize_keyboard": True}
 STAFF_LIST_MAX = 10
 SHOWCASE_PAGE = 5  # столько букетов витрины клиент видит за раз
 STAFF_HELP = ("Кнопки внизу: «Сегодня» и «Завтра» — доставки («Собрал», «Доставлено»), «Витрина» — что видят "
-              "клиенты, «Новый букет» — добавить на витрину фото с подписью «Название цена».")
+              "клиенты, «Новый букет» — добавить на витрину фото с подписью «Название цена», «Собрал букет» — "
+              "по техкарте: цветы спишутся со склада, букет встанет на витрину; «Склад» — списать, сколько "
+              "осталось, что заканчивается.")
 
 
 def bouquets_word(n: int) -> str:
@@ -410,7 +414,7 @@ class ClientFlow:
 
     def _staff(self, msg: Incoming, res: Result, staff, now: datetime):
         text = msg.text.strip()
-        if self._showcase_part(msg, res, staff.id):
+        if self._showcase_part(msg, res, staff.id) or self._stock_part(msg, res, staff.id):
             return
         if msg.callback:
             kind, _, value = msg.callback.partition(":")
@@ -426,7 +430,7 @@ class ClientFlow:
     def _work_phone(self, msg: Incoming, res: Result, now: datetime):
         """Рабочий телефон: те же кнопки, но человек не известен — его определит программа по смене."""
         text, chat = msg.text.strip(), msg.chat_id
-        if self._showcase_part(msg, res, None):
+        if self._showcase_part(msg, res, None) or self._stock_part(msg, res, None):
             return
         if msg.callback:
             kind, _, value = msg.callback.partition(":")
@@ -444,6 +448,109 @@ class ClientFlow:
             self._staff_list(res, now.date() + timedelta(days=text == STAFF_TOMORROW), now.date())
         else:
             res.say(STAFF_HELP, STAFF_MENU)
+
+    def _stock_part(self, msg: Incoming, res: Result, who: int | None) -> bool:
+        """Склад с телефона: «💐 Собрал букет» по техкарте (с фото — на витрину), «📦 Склад» — списать,
+        сколько осталось, что заканчивается. Списывает и собирает программа (событие) — она знает смену."""
+        from .shifts import WRITEOFF_REASONS
+        from .stock import qty_text
+        text, chat = msg.text.strip(), msg.chat_id
+        state = self.staff_state.get(chat) or {}
+        step = state.get("step", "")
+        kind, _, value = msg.callback.partition(":") if msg.callback else ("", "", "")
+        if text == STAFF_ASSEMBLE:
+            self.staff_state.pop(chat, None)
+            recipes = self.db.recipes()
+            if not recipes:
+                res.say("Техкарт пока нет — их заводит администратор в программе («📦 Склад» → «📋 Техкарты»). "
+                        "Букет без техкарты — «➕ Новый букет».", STAFF_MENU)
+                return True
+            res.say("Какой букет собрали?", {"inline_keyboard": [
+                [{"text": r.title + (f" (готово {qty_text(r.ready)})" if r.ready else ""), "callback_data": f"ra:{r.id}"}]
+                for r in recipes[:30]]})
+            return True
+        if kind == "ra" and value.isdigit():
+            recipe = self.db.get_recipe(int(value))
+            if recipe is None:
+                res.say("Этой техкарты уже нет.", STAFF_MENU)
+                return True
+            parts = "; ".join(f"{g.lower()}: {', '.join(items)}" for g, items in self.db.composition(recipe))
+            res.say(f"{recipe.title}\n{parts}\n\nСколько штук собрали?", {"inline_keyboard": [
+                [{"text": str(n), "callback_data": f"rq:{recipe.id}:{n}"} for n in (1, 2, 3, 5)]]})
+            return True
+        if kind == "rq":
+            rid, _, qty = value.partition(":")
+            if rid.isdigit() and qty.isdigit() and self.db.get_recipe(int(rid)) is not None:
+                self.staff_state[chat] = {"step": "assemble_photo", "rid": int(rid), "qty": int(qty)}
+                res.say("Пришлите фото букета 📷 — оно встанет на витрину в боте. Или «Без фото».",
+                        keyboard([NO_PHOTO], [STAFF_CANCEL]))
+            return True
+        if step == "assemble_photo":
+            if msg.photo is None and text != NO_PHOTO:
+                res.say("Жду фото букета 📷 или «Без фото».", keyboard([NO_PHOTO], [STAFF_CANCEL]))
+                return True
+            self.staff_state.pop(chat, None)
+            res.events.append(("stock_assemble", who, chat, state["rid"], state["qty"], msg.photo))
+            return True
+
+        if text == STAFF_STOCK:
+            self.staff_state.pop(chat, None)
+            res.say("Склад:", {"inline_keyboard": [[{"text": "🗑 Списать", "callback_data": "kw:"}],
+                                                   [{"text": "🔍 Сколько осталось", "callback_data": "kf:"}],
+                                                   [{"text": "⚠ Что заканчивается", "callback_data": "kl:"}]]})
+            return True
+        if kind == "kl":
+            low = [p for p in self.db.products() if p.low]
+            res.say("Заканчивается:\n" + "\n".join(f"• {p.name} — {qty_text(p.stock)} {p.unit}" for p in low[:30])
+                    if low else "Всего хватает 🌷", STAFF_MENU)
+            return True
+        if kind in ("kw", "kf"):
+            self.staff_state[chat] = {"step": "writeoff_find" if kind == "kw" else "stock_find"}
+            res.say("Напишите часть названия, например «кения»" + (" или «букет»" if kind == "kw" else "") + ".",
+                    keyboard([STAFF_CANCEL]))
+            return True
+        if step == "stock_find" and text:
+            self.staff_state.pop(chat, None)
+            found = [p for p in self.db.products() if text.casefold() in p.name.casefold()][:15]
+            ready = [r for r in self.db.recipes() if r.ready > 0 and text.casefold() in r.title.casefold()]
+            lines = [f"{'❗ ' if p.low else ''}{p.name} — {qty_text(p.stock)} {p.unit}" for p in found]
+            lines += [f"💐 {r.title} — собрано {qty_text(r.ready)}" for r in ready]
+            res.say("\n".join(lines) if lines else f"Не нашёл «{text}» 🙈", STAFF_MENU)
+            return True
+        if step == "writeoff_find" and text:
+            found = [p for p in self.db.products() if text.casefold() in p.name.casefold()][:10]
+            ready = [r for r in self.db.recipes() if r.ready > 0 and text.casefold() in r.title.casefold()][:5]
+            if not found and not ready:
+                res.say(f"Не нашёл «{text}» 🙈 Напишите иначе или «✖ Отмена».", keyboard([STAFF_CANCEL]))
+                return True
+            res.say("Что списать?", {"inline_keyboard":
+                [[{"text": f"{p.name} ({qty_text(p.stock)} {p.unit})", "callback_data": f"wp:p{p.id}"}] for p in found]
+                + [[{"text": f"💐 {r.title} — весь букет (готово {qty_text(r.ready)})", "callback_data": f"wp:r{r.id}"}]
+                   for r in ready]})
+            return True
+        if kind == "wp" and value[1:].isdigit():
+            self.staff_state[chat] = {"step": "writeoff_qty", "what": value}
+            res.say("Сколько списать? Напишите число, например 5 (или 1,5 для ленты).", keyboard([STAFF_CANCEL]))
+            return True
+        if step == "writeoff_qty" and text:
+            try:
+                qty = float(text.replace(",", ".").split()[0])
+            except ValueError:
+                qty = 0
+            if qty <= 0 or qty > 10_000:
+                res.say("Напишите количество числом, например 5.", keyboard([STAFF_CANCEL]))
+                return True
+            self.staff_state[chat] = {"step": "writeoff_reason", "what": state["what"], "qty": qty}
+            res.say("Почему?", {"inline_keyboard": [[{"text": r, "callback_data": f"wr:{i}"}]
+                                                    for i, r in enumerate(WRITEOFF_REASONS)]})
+            return True
+        if kind == "wr" and step == "writeoff_reason" and value.isdigit() and int(value) < len(WRITEOFF_REASONS):
+            self.staff_state.pop(chat, None)
+            what = state["what"]
+            res.events.append(("stock_writeoff", who, chat, "product" if what[0] == "p" else "recipe", int(what[1:]),
+                               state["qty"], WRITEOFF_REASONS[int(value)]))
+            return True
+        return False
 
     def _showcase_part(self, msg: Incoming, res: Result, who: int | None) -> bool:
         """Витрина с телефона: «➕ Новый букет» (фото → название и цена), список с «в наличии», ценой и удалением.

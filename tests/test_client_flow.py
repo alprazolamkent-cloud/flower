@@ -554,3 +554,37 @@ def test_showcase_from_assembled_bouquets(db):
     item = db.showcase()[0]
     db.write_off_ready(recipe, 2, "Завяло", None, None, NOW)  # завяли — с витрины бота пропал
     assert "Этого букета уже нет" in texts(say(flow, callback=f"pick:{item.id}"))
+
+
+def test_work_phone_assemble_and_stock(db):
+    from app.client_flow import NO_PHOTO, STAFF_ASSEMBLE, STAFF_STOCK
+    from app.stock import Product, Recipe
+    db.link_work_phone(db.work_phone_code(), CHAT_ID, NOW)
+    flow = ClientFlow(db, "Страна Чудес")
+    assert "Техкарт пока нет" in texts(say(flow, STAFF_ASSEMBLE))
+    rose = db.save_product(Product(0, "Кения", "Цветы", price=250, min_stock=10))
+    db.add_supply("База", [(rose, 30, 80)], None, NOW)
+    recipe = db.save_recipe(Recipe(0, "Классика", 3500, items=[(rose, 15)]))
+
+    pick = say(flow, STAFF_ASSEMBLE)
+    assert pick.replies[0].markup["inline_keyboard"][0][0]["callback_data"] == f"ra:{recipe}"
+    how_many = say(flow, callback=f"ra:{recipe}")
+    assert "цветы: Кения × 15" in texts(how_many)
+    ask_photo = say(flow, callback=f"rq:{recipe}:2")
+    assert "фото" in texts(ask_photo)
+    done = say(flow, NO_PHOTO)
+    assert done.events == [("stock_assemble", None, CHAT_ID, recipe, 2, None)]
+
+    shown = say(flow, STAFF_STOCK).replies[0].markup["inline_keyboard"]
+    assert [row[0]["callback_data"] for row in shown] == ["kw:", "kf:", "kl:"]
+    assert "Всего хватает" in texts(say(flow, callback="kl:"))  # 30 при минимуме 10
+    say(flow, callback="kf:")
+    assert "Кения — 30 шт" in texts(say(flow, "кен"))
+    say(flow, callback="kw:")
+    options = say(flow, "кен").replies[0].markup["inline_keyboard"]
+    assert options[0][0]["callback_data"] == f"wp:p{rose}"
+    say(flow, callback=f"wp:p{rose}")
+    assert "числом" in texts(say(flow, "много"))
+    reasons = say(flow, "5").replies[0].markup["inline_keyboard"]
+    assert reasons[0][0] == {"text": "Завяло", "callback_data": "wr:0"}
+    assert say(flow, callback="wr:0").events == [("stock_writeoff", None, CHAT_ID, "product", rose, 5.0, "Завяло")]
