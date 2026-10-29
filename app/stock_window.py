@@ -1105,7 +1105,7 @@ class StockWindow(QDialog):
             chip.setProperty("chip", key)
             chip.setCursor(Qt.PointingHandCursor)
             chip.setStyleSheet(
-                f"QPushButton {{ border: 1px solid {C.card_border}; border-radius: 14px; padding: 4px 14px; }}"
+                f"QPushButton {{ border: 1px solid {C.pink_line}; border-radius: 11px; padding: 4px 14px; }}"
                 f"QPushButton:checked {{ background: {C.accent}; color: {C.on_accent}; border-color: {C.accent}; }}")
             self.chips.addButton(chip)
             self.chips_row.addWidget(chip)

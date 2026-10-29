@@ -21,11 +21,12 @@ LIGHT = {
     "note_bg": "#fff8e1", "note_border": "#ffe082", "info_bg": "#e3f2fd", "info_border": "#90caf9",
     "note_fg": "#212121",
     "card_bg": "#ffffff", "card_border": "#e1e5e0", "bar": "#a5d6a7",
+    # скругление кнопок не больше половины их высоты — иначе Qt рисует прямые углы
     # фирменные: зелёный — главный (кнопки, вкладки, выбранный день), розовый — второй (выделение, «новое»)
     "accent": "#2e7d5b", "accent_hover": "#246649", "accent_soft": "#e6f2ec", "on_accent": "#ffffff",
-    "pink": "#d6336c", "pink_soft": "#fce4ec",
-    "window": "#f5f6f3", "base": "#ffffff", "text": "#1f2421", "muted": "#6b706c", "border": "#dfe3de",
-    "header": "#f0f2ee", "scroll": "#c9cec8",
+    "pink": "#d6336c", "pink_soft": "#fce4ec", "pink_line": "#f1c3d3", "pink_hover": "#b8285a",
+    "window": "#faf6f7", "base": "#ffffff", "text": "#1f2421", "muted": "#6e6a6c", "border": "#ecdfe4",
+    "header": "#fdf0f4", "scroll": "#e8c9d5",
 }
 DARK = {
     "red": "#ff6b6b", "green": "#66bb6a", "orange": "#ffa726", "blue": "#64b5f6", "gray": "#9aa0a6",
@@ -36,9 +37,9 @@ DARK = {
     "note_fg": "#f1f1f1",
     "card_bg": "#262928", "card_border": "#3a3f3c", "bar": "#2f6a36",
     "accent": "#4caf85", "accent_hover": "#5cc196", "accent_soft": "#22362c", "on_accent": "#0f1a14",
-    "pink": "#f06292", "pink_soft": "#4a2433",
-    "window": "#1b1d1c", "base": "#222524", "text": "#e8eae9", "muted": "#9aa09c", "border": "#353a37",
-    "header": "#282c2a", "scroll": "#4a504c",
+    "pink": "#f06292", "pink_soft": "#4a2433", "pink_line": "#6e3a50", "pink_hover": "#f48fb1",
+    "window": "#1c1a1b", "base": "#242123", "text": "#ece8ea", "muted": "#a39ca0", "border": "#3a3337",
+    "header": "#2e2529", "scroll": "#5c4250",
 }
 
 C = SimpleNamespace(**LIGHT)
@@ -129,14 +130,16 @@ def stylesheet(dark: bool) -> str:
     QToolTip {{ background: {c.text}; color: {c.base}; border: none; padding: 6px 8px; border-radius: 6px; }}
 
     QPushButton, QToolButton {{
-        background: {c.base}; color: {c.text}; border: 1px solid {c.border}; border-radius: 8px; padding: 6px 12px;
+        background: {c.base}; color: {c.text}; border: 1px solid {c.pink_line}; border-radius: 12px;
+        padding: 6px 14px;
     }}
-    QPushButton:hover, QToolButton:hover {{ border-color: {c.accent}; background: {c.accent_soft}; }}
-    QPushButton:pressed, QToolButton:pressed {{ background: {c.accent_soft}; border-color: {c.accent_hover}; }}
+    QPushButton:hover, QToolButton:hover {{ border-color: {c.pink}; background: {c.pink_soft}; }}
+    QPushButton:pressed, QToolButton:pressed {{ background: {c.pink_line}; border-color: {c.pink}; }}
     QPushButton:checked {{ background: {c.accent}; color: {c.on_accent}; border-color: {c.accent}; }}
     QPushButton:disabled, QToolButton:disabled {{ color: {c.muted}; background: {c.window}; border-color: {c.border}; }}
     QPushButton[primary="true"] {{
         background: {c.accent}; color: {c.on_accent}; border: 1px solid {c.accent}; font-weight: bold;
+        border-radius: 14px; padding: 7px 18px;
     }}
     QPushButton[primary="true"]:hover {{ background: {c.accent_hover}; border-color: {c.accent_hover}; }}
     QPushButton[primary="true"]:disabled {{ background: {c.accent_soft}; color: {c.muted}; border-color: {c.border}; }}
@@ -169,7 +172,7 @@ def stylesheet(dark: bool) -> str:
     QComboBox::down-arrow {{ image: url("{down}"); width: 10px; height: 10px; }}
     QDateEdit::drop-down {{ subcontrol-origin: padding; subcontrol-position: center right; width: 20px; border: none; }}
     QDateEdit::down-arrow {{ image: url("{down}"); width: 10px; height: 10px; }}
-    QPushButton[small="true"] {{ padding: 2px; }}
+    QPushButton[small="true"] {{ padding: 2px; border-radius: 10px; }}
     QComboBox QAbstractItemView {{
         background: {c.base}; border: 1px solid {c.border}; selection-background-color: {c.accent_soft};
         selection-color: {c.text}; outline: none;
@@ -181,7 +184,7 @@ def stylesheet(dark: bool) -> str:
         border-bottom: 3px solid transparent; margin-right: 2px;
     }}
     QTabBar::tab:hover {{ color: {c.text}; }}
-    QTabBar::tab:selected {{ color: {c.accent}; border-bottom: 3px solid {c.accent}; font-weight: bold; }}
+    QTabBar::tab:selected {{ color: {c.pink}; border-bottom: 3px solid {c.pink}; font-weight: bold; }}
 
     QTableView, QTableWidget, QListView, QListWidget, QTreeView {{
         background: {c.base}; color: {c.text}; border: 1px solid {c.border}; border-radius: 8px;
@@ -189,7 +192,7 @@ def stylesheet(dark: bool) -> str:
         alternate-background-color: {c.header};
     }}
     QHeaderView::section {{
-        background: {c.header}; color: {c.muted}; border: none; border-bottom: 1px solid {c.border};
+        background: {c.header}; color: {c.pink}; border: none; border-bottom: 1px solid {c.border};
         border-right: 1px solid {c.border}; padding: 6px 6px; font-weight: bold;
     }}
     QTableCornerButton::section {{ background: {c.header}; border: none; }}
@@ -200,19 +203,19 @@ def stylesheet(dark: bool) -> str:
     }}
     QGroupBox::title {{
         subcontrol-origin: margin; subcontrol-position: top left; left: 12px; padding: 0 4px;
-        color: {c.accent}; font-weight: bold;
+        color: {c.pink}; font-weight: bold;
     }}
 
     QMenu {{ background: {c.base}; color: {c.text}; border: 1px solid {c.border}; border-radius: 8px; padding: 4px; }}
     QMenu::item {{ padding: 6px 22px 6px 14px; border-radius: 6px; }}
-    QMenu::item:selected {{ background: {c.accent_soft}; color: {c.text}; }}
+    QMenu::item:selected {{ background: {c.pink_soft}; color: {c.text}; }}
     QMenu::separator {{ height: 1px; background: {c.border}; margin: 4px 8px; }}
 
     QScrollBar:vertical {{ background: transparent; width: 10px; margin: 2px; }}
     QScrollBar:horizontal {{ background: transparent; height: 10px; margin: 2px; }}
     QScrollBar::handle:vertical {{ background: {c.scroll}; border-radius: 4px; min-height: 30px; }}
     QScrollBar::handle:horizontal {{ background: {c.scroll}; border-radius: 4px; min-width: 30px; }}
-    QScrollBar::handle:hover {{ background: {c.accent}; }}
+    QScrollBar::handle:hover {{ background: {c.pink}; }}
     QScrollBar::add-line, QScrollBar::sub-line {{ width: 0; height: 0; }}
     QScrollBar::add-page, QScrollBar::sub-page {{ background: transparent; }}
 
@@ -226,11 +229,11 @@ def stylesheet(dark: bool) -> str:
     QCheckBox::indicator:disabled {{ border-color: {c.border}; background: {c.window}; }}
     QCheckBox::indicator:checked:disabled {{ background: {c.accent_soft}; border-color: {c.accent_soft}; }}
 
-    QCalendarWidget QWidget#qt_calendar_navigationbar {{ background: {c.accent}; border-top-left-radius: 8px;
+    QCalendarWidget QWidget#qt_calendar_navigationbar {{ background: {c.pink}; border-top-left-radius: 8px;
         border-top-right-radius: 8px; }}
-    QCalendarWidget QToolButton {{ color: {c.on_accent}; background: transparent; border: none; font-weight: bold;
-        padding: 4px 8px; }}
-    QCalendarWidget QToolButton:hover {{ background: {c.accent_hover}; }}
+    QCalendarWidget QToolButton {{ color: white; background: transparent; border: none; font-weight: bold;
+        padding: 4px 8px; border-radius: 8px; }}
+    QCalendarWidget QToolButton:hover {{ background: {c.pink_hover}; }}
     QCalendarWidget QToolButton::menu-indicator {{ image: none; }}
     QCalendarWidget QSpinBox {{ background: {c.base}; color: {c.text}; }}
     QCalendarWidget QAbstractItemView {{
