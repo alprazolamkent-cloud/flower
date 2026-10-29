@@ -124,6 +124,17 @@ def holidays_calendar() -> Holidays:
     return parse_holidays(holidays_text())[0]
 
 
+def holiday_eve_time() -> time | None:
+    """Во сколько накануне праздника напомнить собрать заказы на завтра (None — не напоминать)."""
+    raw = str(_settings().value("holiday_eve_time", "18:00"))
+    if raw in ("", "off"):
+        return None
+    try:
+        return datetime.strptime(raw, "%H:%M").time()
+    except ValueError:
+        return time(18, 0)
+
+
 def report_settings() -> dict:
     """Автоматические отчёты в Telegram: утренний, недельный, месячный."""
     s = _settings()
@@ -312,6 +323,21 @@ class SettingsDialog(QDialog):
         form.addRow("Сообщить администраторам, если не собран за:", self.assembly_alert_box)
         form.addRow(_gray_label("Окно «Не собрано!» всплывает поверх всех окон и повторяется каждые 10 минут,\n"
                                 "пока букет не отметят собранным. Заказы на дальние дни собирать заранее не нужно."))
+        eve = holiday_eve_time()
+        self.eve_check = QCheckBox("Накануне праздника напомнить собрать заказы на завтра, в")
+        self.eve_check.setChecked(eve is not None)
+        self.eve_edit = QTimeEdit()
+        self.eve_edit.setDisplayFormat("HH:mm")
+        self.eve_edit.setTime(QTime((eve or time(18, 0)).hour, (eve or time(18, 0)).minute))
+        self.eve_check.toggled.connect(self.eve_edit.setEnabled)
+        self.eve_edit.setEnabled(eve is not None)
+        eve_row = QHBoxLayout()
+        eve_row.addWidget(self.eve_check)
+        eve_row.addWidget(self.eve_edit)
+        eve_row.addStretch(1)
+        form.addRow(eve_row)
+        form.addRow(_gray_label("Праздники — из списка «Праздничные дни…» (вкладка «Зарплата»). В праздник собирают\n"
+                                "с вечера: программа покажет все заказы на завтра, админам придёт сводка."))
         layout.addWidget(reminders)
 
         shifts = QGroupBox("Смены")
@@ -701,6 +727,10 @@ class SettingsDialog(QDialog):
         form.addRow(_gray_label("Сумму флорист вписывает каждый раз сам (букет + доставка). Бот присылает клиенту\n"
                                 "QR-код, сумму текстом (в статическом QR её нет — клиент вводит её сам) и кнопку\n"
                                 "«Я оплатил(а)». Заказ попадает в доставки, когда флорист подтвердит оплату."))
+        self.preorder_check = QCheckBox("За 2 недели до праздника предлагать в боте предзаказ (праздники — из списка "
+                                        "на вкладке «Зарплата»)")
+        self.preorder_check.setChecked(str(_settings().value("client_preorders", "true")) == "true")
+        form.addRow(self.preorder_check)
         form.addRow(_gray_label("Бот работает, пока компьютер включён и есть интернет. Что клиенты напишут,\n"
                                 "пока он выключен, бот получит позже (Telegram хранит сообщения сутки)."))
         layout.addLayout(form)
@@ -947,6 +977,8 @@ class SettingsDialog(QDialog):
             ("требовать собрать за (мин)", assembly_minutes(), self.assembly_box.value(), False),
             ("сообщить, если не собран за (мин)", assembly_alert_minutes(), self.assembly_alert_box.value(), False),
             ("копия в Telegram", backup_to_telegram(), self.tg_backup_check.isChecked(), False),
+            ("напоминание накануне праздника", holiday_eve_time().strftime("%H:%M") if holiday_eve_time() else "выкл",
+             self.eve_edit.time().toString("HH:mm") if self.eve_check.isChecked() else "выкл", False),
             ("пересменка", shift_change().strftime("%H:%M"), self.change_edit.time().toString("HH:mm"), False),
             ("сдать смену ещё (мин)", grace_minutes(), self.grace_box.value(), False),
             ("вода раз в (дн.)", schedule.every, self.water_every.value(), False),
@@ -1008,6 +1040,7 @@ class SettingsDialog(QDialog):
         settings.setValue("client_token", client_token)
         settings.setValue("client_shop", self.shop_edit.text().strip())
         settings.setValue("client_requisites", self.requisites_edit.toPlainText().strip())
+        settings.setValue("client_preorders", _bool(self.preorder_check.isChecked()))
         if self._qr_changed:
             self.db.set_file(QR_FILE, self._qr)
         max_token = self.max_token_edit.text().strip()
@@ -1024,6 +1057,8 @@ class SettingsDialog(QDialog):
         settings.setValue("assembly_minutes", self.assembly_box.value())
         settings.setValue("assembly_alert_minutes", self.assembly_alert_box.value())
         settings.setValue("backup_to_telegram", _bool(self.tg_backup_check.isChecked()))
+        settings.setValue("holiday_eve_time", self.eve_edit.time().toString("HH:mm") if self.eve_check.isChecked()
+                          else "off")
         settings.setValue("shift_change", self.change_edit.time().toString("HH:mm"))
         settings.setValue("grace_minutes", self.grace_box.value())
         settings.setValue("water_every", self.water_every.value())

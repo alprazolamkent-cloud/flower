@@ -13,7 +13,9 @@ from datetime import datetime
 from PySide6.QtCore import QObject, QSettings, QTimer, Signal
 
 from . import telegram
-from .client_flow import ClientFlow, Incoming
+from .client_flow import PREORDER_DAYS, ClientFlow, Incoming
+from .holidays import DEFAULT_TEXT as DEFAULT_HOLIDAYS
+from .holidays import next_holiday
 from .photos import shrink
 
 POLL_EVERY_MS = 30_000  # запасной таймер: если опрос оборвался, запустить заново
@@ -50,6 +52,13 @@ def is_max(chat_id: str) -> bool:
 def max_settings() -> dict:
     s = _settings()
     return {"token": str(s.value("max_token", "")).strip(), "username": str(s.value("max_bot_username", ""))}
+
+
+def preorder(now: datetime) -> tuple | None:
+    """Ближайший праздник из списка в настройках (за 2 недели) — бот принимает на него предзаказы."""
+    if str(_settings().value("client_preorders", "true")) != "true":
+        return None
+    return next_holiday(str(_settings().value("holidays_text", DEFAULT_HOLIDAYS)), now.date(), PREORDER_DAYS)
 
 
 def client_configured() -> bool:
@@ -212,7 +221,7 @@ class ClientBot(QObject):
             self.flush()
 
     def process(self, parsed: list[Parsed], now: datetime):
-        flow = ClientFlow(self.db, client_settings()["shop"], self.link_tries, self.staff_state)
+        flow = ClientFlow(self.db, client_settings()["shop"], self.link_tries, self.staff_state, preorder(now))
         for p in parsed:
             if p.message is None:
                 continue

@@ -7,6 +7,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QDialog, QDialogButtonBox, QLabel, QScrollArea, QVBoxLayout
 
 from .db import Database, Delivery
+from .holidays import holiday_name
 from .delivery_dialog import money
 from .reminders import parse_deadline_time, parse_start_time
 from .shifts import Shift, WaterSchedule, window
@@ -38,7 +39,7 @@ def _sort_key(d: Delivery):
 
 
 def plan_html(db: Database, shift: Shift, change: time, water: WaterSchedule | None, lead_minutes: int,
-              now: datetime | None = None) -> str:
+              now: datetime | None = None, holidays: str = "") -> str:
     now = now or datetime.now()
     start, end = window(shift.day, change)
     parts = [f"<h3>План на смену</h3><span style='color:{C.gray}'>{start:%d.%m %H:%M} → {end:%d.%m %H:%M}</span>"]
@@ -63,6 +64,16 @@ def plan_html(db: Database, shift: Shift, change: time, water: WaterSchedule | N
         first = min(later, key=_sort_key)
         parts.append(f"<p>📅 Заказов на следующие {AHEAD_DAYS} дней: <b>{len(later)}</b> — собирать заранее не нужно. "
                      f"Ближайший: {first.day:%d.%m} {html.escape(first.time or '')}.</p>")
+        for day in sorted({d.day for d in later}):
+            name = holiday_name(holidays, day) if holidays else None
+            if name is None:
+                continue
+            on_day = [d for d in later if d.day == day]
+            todo = sum(not d.assembled for d in on_day)
+            soon = day <= now.date() + timedelta(days=1)
+            parts.append(f"<p style='color:{C.red if soon else C.orange}'>🎉 <b>{day:%d.%m} — "
+                         f"{html.escape(name or 'праздник')}</b>: заказов {len(on_day)}, не собрано {todo}. "
+                         "В праздник собирают заранее, с вечера накануне — список в «📅 Заказы вперёд».</p>")
 
     if water is not None and water.is_water_day(shift.day):
         done = db.water_change(shift.day)
@@ -83,12 +94,12 @@ def plan_html(db: Database, shift: Shift, change: time, water: WaterSchedule | N
 
 class ShiftPlanDialog(QDialog):
     def __init__(self, parent, db: Database, shift: Shift, change: time, water: WaterSchedule | None,
-                 lead_minutes: int):
+                 lead_minutes: int, holidays: str = ""):
         super().__init__(parent)
         self.setWindowTitle("План на смену")
         self.resize(640, 520)
         layout = QVBoxLayout(self)
-        label = QLabel(plan_html(db, shift, change, water, lead_minutes))
+        label = QLabel(plan_html(db, shift, change, water, lead_minutes, holidays=holidays))
         label.setWordWrap(True)
         label.setAlignment(Qt.AlignTop | Qt.AlignLeft)  # план сверху окна, а не посередине
         label.setContentsMargins(8, 4, 8, 4)

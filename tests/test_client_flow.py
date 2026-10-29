@@ -511,3 +511,29 @@ def test_staff_showcase_paging_and_photo_replace(db):
     assert "Фото заменил" in texts(say(flow, photo=b"second"))
     say(flow, "Нежность 3500")
     assert db.showcase()[-1].photo == b"second"
+
+
+def test_preorder_for_holiday(db):
+    from app.client_flow import PREORDER
+    from app.holidays import DEFAULT_TEXT, next_holiday
+    assert next_holiday(DEFAULT_TEXT, date(2026, 2, 25), 14) == (date(2026, 3, 8), "8 Марта")  # «канун» пропускаем
+    assert next_holiday(DEFAULT_TEXT, date(2026, 4, 1), 14) is None
+    assert next_holiday("14.02", date(2026, 2, 10), 14) == (date(2026, 2, 14), "14.02")  # без названия — дата
+    item = db.save_showcase_item(ShowcaseItem(0, "Тюльпаны", price=2500))
+    holiday = (date(2026, 10, 25), "День цветов")
+    flow = ClientFlow(db, "Страна Чудес", preorder=holiday)
+    hello = say(flow, "/start")
+    assert "предзаказы на День цветов (25.10)" in texts(hello)
+    assert hello.replies[0].markup["keyboard"][0][0]["text"] == PREORDER + "День цветов"
+    start = say(flow, PREORDER + "День цветов")
+    assert "дату я уже записал" in texts(start) and any("Тюльпаны" in r.text for r in start.replies)
+    # с витрины: дату не спрашиваем — только время
+    assert "25.10 — во сколько" in texts(say(flow, callback=f"pick:{item}"))
+    say(flow, "с 10 до 12")
+    assert db.client_chat(CHAT_ID).data["day"] == "2026-10-25" and db.client_chat(CHAT_ID).state == "address"
+    # свой букет в предзаказе: тоже только время
+    say(flow, PREORDER + "День цветов")
+    say(flow, CUSTOM)
+    assert "25.10 — во сколько" in texts(say(flow, "Белые розы"))
+    # без праздника меню обычное
+    assert ClientFlow(db, "").handle(Incoming("1", "/start"), NOW).replies[0].markup["keyboard"][0][0]["text"] == SHOWCASE

@@ -29,6 +29,7 @@ from .duties_dialog import ChecklistDialog
 from .reports import due_reports, report_text
 from .settings_dialog import (
     SettingsDialog, assembly_alert_minutes, assembly_minutes, backup_dir, backup_keep, backup_to_telegram,
+    holiday_eve_time, holidays_calendar, holidays_text,
     grace_minutes, last_backup, late_minutes, lead_minutes,
     penalty_catalog, report_settings, salary_rules, set_last_backup, shift_change, theme_mode, water_schedule,
     writeoff_alert,
@@ -46,6 +47,8 @@ from .max_bot import MaxBot
 from .client_center import NEEDS_ACTION, ClientCenter, StaffLinkDialog, needs_action
 from .client_flow import inline, order_summary
 from .photos import PhotoViewer
+from .future_orders import FutureOrdersDialog
+from .holidays import holiday_name
 from .heartbeat import Heartbeat
 from .reminders import assembly_due, assembly_escalations, due_reminders, overdue_deliveries, reminder_key
 from .shift_plan import ShiftPlanDialog
@@ -212,6 +215,7 @@ class MainWindow(QMainWindow):
         self.max_bot.event.connect(self._on_client_event)
         self.client_bot.queued.connect(self.max_bot.flush)  # сообщение клиенту из MAX уходит через бота MAX
         self.client_center: ClientCenter | None = None
+        self.future_orders: FutureOrdersDialog | None = None
         self._photo_wanted: dict[str, list[int]] = {}  # чат флориста → доставки, к которым бот просил фото
         self._last_photo: dict[str, tuple[str, int, datetime]] = {}  # чат → (альбом, доставка, когда)
         self._client_nag_at: datetime | None = None
@@ -366,6 +370,11 @@ class MainWindow(QMainWindow):
             b.setMinimumHeight(32)
             buttons.addWidget(b)
         buttons.addStretch(1)
+        self.future_btn = QPushButton("📅 Заказы вперёд")
+        self.future_btn.setToolTip("Все будущие заказы списком по дням — для праздников и предзаказов")
+        self.future_btn.setMinimumHeight(32)
+        self.future_btn.clicked.connect(lambda: self.open_future())
+        buttons.addWidget(self.future_btn)
         self.clients_btn = QPushButton("🛍 Клиенты")
         self.clients_btn.setToolTip("Заказы и сообщения из ботов для клиентов (Telegram и MAX), витрина букетов")
         self.clients_btn.setMinimumHeight(32)
@@ -766,6 +775,8 @@ class MainWindow(QMainWindow):
         self.assembly.hide()
         if self.client_center is not None:
             self.client_center.hide()
+        if self.future_orders is not None:
+            self.future_orders.hide()
         self.tray.hide()
         QApplication.quit()
 
@@ -937,6 +948,7 @@ class MainWindow(QMainWindow):
         self._check_reports(now)
         self._maybe_send_backup(now)
         self._check_clients(now)
+        self._check_holiday_eve(now)
         self._flush_admin_photos()
         if self._photos_pruned != now.date():  # раз в день
             self._photos_pruned = now.date()
@@ -1388,7 +1400,8 @@ class MainWindow(QMainWindow):
         if shift is None:
             QMessageBox.information(self, "План на смену", "Сейчас никто не на смене.")
             return
-        ShiftPlanDialog(self, self.db, shift, shift_change(), water_schedule(), assembly_minutes()).exec()
+        ShiftPlanDialog(self, self.db, shift, shift_change(), water_schedule(), assembly_minutes(),
+                        holidays_text()).exec()
         QTimer.singleShot(0, self.show_unread_announcements)  # пока был открыт план, объявление ждало
 
     # ----- копия базы в Telegram -----
@@ -1495,6 +1508,40 @@ class MainWindow(QMainWindow):
         self.telegram.queue(f"ℹ️ {who or 'Администратор'}: удаление {verdict} — {describe_delivery(d)}",
                             key=f"deldone:{d.id}:{verdict}:{datetime.now():%Y%m%d%H%M%S}",
                             except_chat=self._current_bot_chat)
+
+    # ----- заказы вперёд и праздники -----
+
+    def open_future(self, day: date | None = None):
+        if self.future_orders is None:
+            self.future_orders = FutureOrdersDialog(self, day)
+        else:
+            self.future_orders.show_day(day)
+        self.future_orders.show()
+        self.future_orders.raise_()
+        self.future_orders.activateWindow()
+
+    def _check_holiday_eve(self, now: datetime):
+        """Накануне праздника (вечером, по настройке) — один раз: все заказы на завтра и сводка администраторам."""
+        eve = holiday_eve_time()
+        tomorrow = now.date() + timedelta(days=1)
+        if eve is None or now.time() < eve or not holidays_calendar().is_holiday(tomorrow):
+            return
+        if str(self.settings.value("holiday_eve_done", "")) == tomorrow.isoformat():
+            return
+        self.settings.setValue("holiday_eve_done", tomorrow.isoformat())
+        items = [d for d in self.db.for_day(tomorrow) if not d.delivered and d.delete_requested_at is None]
+        if not items:
+            return
+        todo = sum(not d.assembled for d in items)
+        name = holiday_name(holidays_text(), tomorrow) or "праздник"
+        self.tray.showMessage(f"🎉 Завтра {name}", f"Заказов на завтра: {len(items)}, собрать: {todo}. "
+                              "Список — в «📅 Заказы вперёд».", QSystemTrayIcon.Warning, 60_000)
+        QApplication.beep()
+        QApplication.alert(self)
+        self.telegram.queue(f"🎉 Завтра {name} ({tomorrow:%d.%m}): заказов {len(items)}, собрано {len(items) - todo}, "
+                            f"собрать {todo}.", key=f"holiday_eve:{tomorrow.isoformat()}")
+        if self.isVisible():
+            self.open_future(tomorrow)
 
     # ----- бот для клиентов -----
 
