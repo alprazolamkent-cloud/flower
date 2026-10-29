@@ -66,4 +66,6 @@ def unsent_report(path: str, settings: QSettings | None = None, limit: int = 350
         text = f.read()
     settings.setValue("hang_log_sent", size)
     text = text.strip()
-    return text[-limit:] if text else ""
+    if "\n=== " in "\n" + text:  # последнее зависание; самое важное (где застряла) — в его начале
+        text = "=== " + ("\n" + text).rsplit("\n=== ", 1)[1]
+    return text[:limit]
