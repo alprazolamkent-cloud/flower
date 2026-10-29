@@ -325,7 +325,8 @@ class ClientCenter(QDialog):
             return
         now = datetime.now()
         try:
-            d = self.db.confirm_client_order(o.id, self.main.user.id if self.main.user else None, now)
+            d = self.db.confirm_client_order(o.id, self.main.user.id if self.main.user else None, now,
+                                             self.main.sale_shift_id())
         except UserError as e:
             QMessageBox.warning(self, "Принять заказ", str(e))
             return

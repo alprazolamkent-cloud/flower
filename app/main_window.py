@@ -48,6 +48,7 @@ from .client_center import NEEDS_ACTION, ClientCenter, StaffLinkDialog, needs_ac
 from .client_flow import inline, order_summary
 from .photos import PhotoViewer
 from .future_orders import FutureOrdersDialog
+from .stock_window import StockWindow
 from .holidays import holiday_name
 from .heartbeat import Heartbeat
 from .reminders import assembly_due, assembly_escalations, due_reminders, overdue_deliveries, reminder_key
@@ -216,6 +217,7 @@ class MainWindow(QMainWindow):
         self.client_bot.queued.connect(self.max_bot.flush)  # сообщение клиенту из MAX уходит через бота MAX
         self.client_center: ClientCenter | None = None
         self.future_orders: FutureOrdersDialog | None = None
+        self.stock_window: StockWindow | None = None
         self._photo_wanted: dict[str, list[int]] = {}  # чат флориста → доставки, к которым бот просил фото
         self._last_photo: dict[str, tuple[str, int, datetime]] = {}  # чат → (альбом, доставка, когда)
         self._client_nag_at: datetime | None = None
@@ -370,6 +372,11 @@ class MainWindow(QMainWindow):
             b.setMinimumHeight(32)
             buttons.addWidget(b)
         buttons.addStretch(1)
+        self.stock_btn = QPushButton("🛒 Продажи")
+        self.stock_btn.setToolTip("Продажа (F2), остатки, поставки, техкарты букетов и аналитика")
+        self.stock_btn.setMinimumHeight(32)
+        self.stock_btn.clicked.connect(self.open_stock)
+        buttons.addWidget(self.stock_btn)
         self.future_btn = QPushButton("📅 Заказы вперёд")
         self.future_btn.setToolTip("Все будущие заказы списком по дням — для праздников и предзаказов")
         self.future_btn.setMinimumHeight(32)
@@ -410,6 +417,7 @@ class MainWindow(QMainWindow):
         right.addWidget(self.hint)
 
         QShortcut(QKeySequence.New, self, activated=self.add_delivery)
+        QShortcut(QKeySequence("F2"), self, activated=self.open_stock)
         QShortcut(QKeySequence.Delete, self.table, activated=self.delete_delivery)
 
         self._setup_tray()
@@ -730,6 +738,8 @@ class MainWindow(QMainWindow):
         self.user = user
         if user is None:
             self.shift = None
+            if self.stock_window is not None:  # там суммы и себестоимость — не оставлять открытым
+                self.stock_window.hide()
             self.user_btn.setText("")
             self.update_shift_box()
             return
@@ -1542,6 +1552,26 @@ class MainWindow(QMainWindow):
                             f"собрать {todo}.", key=f"holiday_eve:{tomorrow.isoformat()}")
         if self.isVisible():
             self.open_future(tomorrow)
+
+    # ----- продажи и склад -----
+
+    def sale_shift_id(self) -> int | None:
+        """В какую смену записать продажу: смена вошедшего, а у админа без смены — единственная открытая."""
+        if self.shift is not None:
+            return self.shift.id
+        shifts = self.db.open_shifts()
+        return shifts[0].id if len(shifts) == 1 else None
+
+    def open_stock(self):
+        if self.user is None:
+            return
+        if self.stock_window is None:
+            self.stock_window = StockWindow(self)
+        else:
+            self.stock_window.refresh()
+        self.stock_window.show()
+        self.stock_window.raise_()
+        self.stock_window.activateWindow()
 
     # ----- бот для клиентов -----
 

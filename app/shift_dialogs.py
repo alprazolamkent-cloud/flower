@@ -176,7 +176,7 @@ class CloseShiftDialog(QDialog):
         columns = QHBoxLayout()
         layout.addLayout(columns)
 
-        sales = QGroupBox("Выручка за смену (из Hoog)")
+        sales = QGroupBox("Выручка за смену")
         sales_form = QFormLayout(sales)
         self.revenue_box = count_box("— введите —")
         self.revenue_box.setToolTip("Вся сумма за смену: наличные, терминал, QR-код — всё вместе")
@@ -189,7 +189,7 @@ class CloseShiftDialog(QDialog):
         self.qr_box = money_box()
         sales_form.addRow("QR-код:", self.qr_box)
         self.sales_box = count_box("— введите —")
-        self.sales_box.setToolTip("Продажи наличными за смену из отчёта Hoog")
+        self.sales_box.setToolTip("Продажи наличными за смену")
         sales_form.addRow("Продажи наличными:", self.sales_box)
         self.check_label = QLabel()  # две строки разбиты сами; запас по высоте — значок ⚠ выше обычных букв
         self.check_label.setMinimumHeight(self.check_label.fontMetrics().lineSpacing() * 2 + 8)
@@ -269,6 +269,18 @@ class CloseShiftDialog(QDialog):
         note_form.addRow("", _gray("Комментарий увидит администратор и следующая смена."))
         layout.addLayout(note_form)
         layout.addWidget(_buttons(self, "Сдать смену"))
+
+        self.sold = db.shift_sales(s.id)  # продажи и списания, внесённые в программе за эту смену
+        if self.sold.count:
+            self.revenue_box.setValue(self.sold.revenue)
+            self.flowers_box.setValue(self.sold.flowers)
+            self.terminal_box.setValue(self.sold.card)
+            self.qr_box.setValue(self.sold.qr)
+            self.sales_box.setValue(self.sold.cash)
+            sales.setTitle(f"Выручка за смену — {self.sold.count} продаж из «🛒 Продажи»")
+        for reason, amount in self.sold.writeoffs.items():
+            box = self.writeoff_boxes.get(reason) or self.writeoff_boxes[WRITEOFF_REASONS[-1]]
+            box.setValue(box.value() + amount)
 
         for box in (self.revenue_box, self.terminal_box, self.qr_box, self.sales_box,
                     self.courier_box, self.cash_box, *self.writeoff_boxes.values()):

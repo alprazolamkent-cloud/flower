@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta
 
 from .auth import hash_password, verify_password
+from .stock import STOCK_SCHEMA, CartLine, StockError, StockStore
 from .shifts import (
     KIND_TEXT, Adjustment, CashOp, ChecklistItem, Duty, Penalty, Shift, delivery_business_day,
     opening_business_day,
@@ -402,8 +403,7 @@ def _row_to_delivery(row) -> Delivery:
     )
 
 
-class UserError(Exception):
-    """Ошибка с понятным пользователю текстом."""
+UserError = StockError  # ошибка с понятным пользователю текстом (склад бросает ту же)
 
 
 # ----- бот клиентов: витрина, заказы, переписка, фото букетов -----
@@ -668,8 +668,10 @@ class ClientStore:
         r = self.conn.execute("SELECT paid_photo FROM client_orders WHERE id=?", (order_id,)).fetchone()
         return r[0] if r else None
 
-    def confirm_client_order(self, order_id: int, user_id: int | None, now: datetime) -> Delivery:
-        """Оплата пришла: заказ становится доставкой в календаре (букет ещё не собран)."""
+    def confirm_client_order(self, order_id: int, user_id: int | None, now: datetime,
+                             shift_id: int | None = None) -> Delivery:
+        """Оплата пришла: заказ становится доставкой в календаре (букет ещё не собран), а букет —
+        продажей по QR в смене shift_id (доставка не входит: она идёт в «взяли за доставки»)."""
         order = self.get_client_order(order_id)
         if order is None:
             raise UserError("Такого заказа нет.")
@@ -689,6 +691,10 @@ class ClientStore:
         self.conn.execute("UPDATE client_orders SET status='confirmed', delivery_id=?, updated_at=? WHERE id=?",
                           (d.id, _ts(now), order_id))
         self.conn.commit()
+        bouquet = order.amount - order.delivery_fee
+        if bouquet > 0:
+            self.add_sale([CartLine(order.items.splitlines()[0] if order.items else "Букет", 1, bouquet)], "qr",
+                          user_id, shift_id, now, note=f"Заказ из бота №{order_id}", flowers=True)
         return d
 
     def order_for_delivery(self, delivery_id: int) -> ClientOrder | None:
@@ -850,11 +856,12 @@ class ClientStore:
         self.conn.commit()
 
 
-class Database(ClientStore):
+class Database(ClientStore, StockStore):
     def __init__(self, path: str):
         self.path = path
         self.conn = sqlite3.connect(path)
         self.conn.executescript(SCHEMA)
+        self.conn.executescript(STOCK_SCHEMA)
         existing = {r[1] for r in self.conn.execute("PRAGMA table_info(deliveries)")}
         for column, sql in MIGRATIONS.items():
             if column not in existing:

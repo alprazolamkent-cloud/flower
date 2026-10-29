@@ -153,7 +153,7 @@ class Shift:
     opening_cash: int
     closed_at: datetime | None = None
     closing_cash: int | None = None
-    cash_sales: int = 0  # продажи наличными из Hoog
+    cash_sales: int = 0  # продажи наличными за смену
     delivery_cash: int = 0  # только у старых смен
     courier_cash: int = 0
     note: str = ""
