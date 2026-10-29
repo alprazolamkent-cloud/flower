@@ -312,6 +312,13 @@ class MainWindow(QMainWindow):
         left.addWidget(self.month_box)
         self.updater = UpdateController(self)
         left.addStretch(1)
+        self.sale_btn = QPushButton("🛒  Продажа   ·   F2")
+        self.sale_btn.setToolTip("Продать букет или товар: F2 в любой момент — и сразу печатайте название")
+        self.sale_btn.setMinimumHeight(58)
+        self.sale_btn.setStyleSheet("font-size: 15pt;")
+        primary(self.sale_btn)
+        self.sale_btn.clicked.connect(lambda: self.open_stock(sale=True))
+        left.addWidget(self.sale_btn)
 
         # Правая часть: доставки за день
         right = QVBoxLayout()
@@ -373,8 +380,8 @@ class MainWindow(QMainWindow):
             b.setMinimumHeight(32)
             buttons.addWidget(b)
         buttons.addStretch(1)
-        self.stock_btn = QPushButton("🛒 Продажи")
-        self.stock_btn.setToolTip("Продажа (F2), остатки, поставки, техкарты букетов и аналитика")
+        self.stock_btn = QPushButton("📦 Склад")
+        self.stock_btn.setToolTip("Остатки, поставки, техкарты букетов, продажи за день и аналитика")
         self.stock_btn.setMinimumHeight(32)
         self.stock_btn.clicked.connect(self.open_stock)
         buttons.addWidget(self.stock_btn)
@@ -418,7 +425,7 @@ class MainWindow(QMainWindow):
         right.addWidget(self.hint)
 
         QShortcut(QKeySequence.New, self, activated=self.add_delivery)
-        QShortcut(QKeySequence("F2"), self, activated=self.open_stock)
+        QShortcut(QKeySequence("F2"), self, activated=lambda: self.open_stock(sale=True))
         QShortcut(QKeySequence.Delete, self.table, activated=self.delete_delivery)
 
         self._setup_tray()
@@ -1563,16 +1570,21 @@ class MainWindow(QMainWindow):
         shifts = self.db.open_shifts()
         return shifts[0].id if len(shifts) == 1 else None
 
-    def open_stock(self):
+    def open_stock(self, sale: bool = False):
+        """sale — сразу на продажу, курсор в поиске (F2 и большая кнопка «🛒 Продажа»)."""
         if self.user is None:
             return
         if self.stock_window is None:
             self.stock_window = StockWindow(self)
-        else:
+        elif not sale:
             self.stock_window.refresh()
+        if sale:
+            self.stock_window.start_sale()
         self.stock_window.show()
         self.stock_window.raise_()
         self.stock_window.activateWindow()
+        if sale:
+            self.stock_window.search_edit.setFocus()
 
     # ----- бот для клиентов -----
 

@@ -207,3 +207,19 @@ def test_import_button(main, db, tmp_path, monkeypatch):
     assert next(p for p in db.products() if p.name == "Роза").price == 260
     assert main.log[-1][0] == "Товары загружены из таблицы"
     w.deleteLater()
+
+
+def test_keyboard_sale(main, db):
+    w = StockWindow(main)
+    w.tabs.setCurrentIndex(1)
+    w.start_sale()  # F2: на продажу, курсор в поиске
+    assert w.tabs.currentIndex() == 0
+    w.search_edit.setText("букет")
+    w._add_selected()  # Enter
+    w._sell_key("qr")  # F7
+    sale = db.sales_between(datetime.now() - timedelta(minutes=1), datetime.now() + timedelta(minutes=1))[0]
+    assert (sale.total, sale.payment) == (2900, "qr") and not w.rows
+    w._sell_key("cash")  # пустая корзина — ничего
+    assert len(db.sales_between(datetime.now() - timedelta(minutes=1), datetime.now() + timedelta(minutes=1))) == 1
+    assert "F5" in w.pay_buttons[0].text() and "F7" in w.pay_buttons[2].text()
+    w.deleteLater()

@@ -319,3 +319,14 @@ def test_custom_fine_in_app_is_penalty(db, app, monkeypatch, request):
     dlg._add()
     [p] = db.penalties_for_shift(shift.id)
     assert (p.title, p.amount, p.kind_id) == ("Разбила вазу", 700, 0) and changes == ["set"]
+
+
+def test_big_sale_button_opens_sale(window):
+    w = window
+    assert "F2" in w.sale_btn.text() and w.sale_btn.property("primary")
+    w.sale_btn.click()
+    assert w.stock_window is not None and w.stock_window.tabs.currentIndex() == 0
+    w.stock_window.tabs.setCurrentIndex(1)
+    w.open_stock(sale=True)  # F2 ещё раз — снова на продажу
+    assert w.stock_window.tabs.currentIndex() == 0
+    w.stock_window.hide()

@@ -943,9 +943,24 @@ class StockWindow(QDialog):
         self.analytics_index = self.tabs.addTab(self._analytics_tab(), "📊 Аналитика")
         layout.addWidget(self.tabs, 1)
         self.tabs.currentChanged.connect(lambda _: self.refresh())
-        QShortcut(QKeySequence("Ctrl+F"), self, activated=lambda: (self.tabs.setCurrentIndex(0),
-                                                                     self.search_edit.setFocus()))
+        QShortcut(QKeySequence("Ctrl+F"), self, activated=self.start_sale)
+        QShortcut(QKeySequence("F2"), self, activated=self.start_sale)
+        for key, code in (("F5", "cash"), ("F6", "card"), ("F7", "qr")):  # оплата с клавиатуры
+            QShortcut(QKeySequence(key), self, activated=lambda c=code: self._sell_key(c))
         self.refresh()
+
+    def start_sale(self):
+        """На продажу, курсор в поиске — можно сразу печатать название."""
+        if self.tabs.currentIndex() != 0:
+            self.tabs.setCurrentIndex(0)  # само обновит плитки
+        else:
+            self.refresh()
+        self.search_edit.setFocus()
+        self.search_edit.selectAll()
+
+    def _sell_key(self, payment: str):
+        if self.tabs.currentIndex() == 0 and self.rows:
+            self._sell(payment)
 
     @property
     def admin(self) -> bool:
@@ -982,7 +997,7 @@ class StockWindow(QDialog):
         left = QVBoxLayout()
         top = QHBoxLayout()
         self.search_edit = QLineEdit()
-        self.search_edit.setPlaceholderText("🔍 Букет или товар (Ctrl+F), Enter — в корзину")
+        self.search_edit.setPlaceholderText("🔍 Печатайте название (F2), Enter — в корзину; оплата F5 / F6 / F7")
         self.search_edit.setClearButtonEnabled(True)
         self.search_edit.textChanged.connect(self._refresh_catalog)
         self.search_edit.returnPressed.connect(self._add_selected)
@@ -1059,8 +1074,8 @@ class StockWindow(QDialog):
         pay = QHBoxLayout()
         self.pay_buttons = []
         for code, title in PAYMENTS.items():
-            icon = {"cash": "💵", "card": "💳", "qr": "📱"}[code]
-            button = QPushButton(f"{icon} {title}")
+            icon, key = {"cash": ("💵", "F5"), "card": ("💳", "F6"), "qr": ("📱", "F7")}[code]
+            button = QPushButton(f"{icon} {title}  ·  {key}")
             button.setMinimumHeight(46)
             primary(button)
             button.clicked.connect(lambda _=False, c=code: self._sell(c))
