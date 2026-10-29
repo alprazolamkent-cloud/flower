@@ -1,11 +1,11 @@
 """Склад и продажи: поставки, средняя себестоимость, техкарты, продажи, списания, итог смены."""
 
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timedelta
 
 import pytest
 
 from app.db import Database, UserError
-from app.stock import CartLine, Product, Recipe, day_range
+from app.stock import CartLine, Product, Recipe, day_range, reorder_text
 
 NOW = datetime(2026, 10, 29, 12, 0)
 
@@ -207,3 +207,32 @@ def test_recipe_composition_and_hidden_from_bot(shop):
     db.assemble(shown, 1, user.id, shift.id, NOW)
     db.archive_recipe(shown)
     assert db.showcase(only_active=True) == []  # в архиве — из бота убрали
+
+
+def test_barcode(shop):
+    db, *_ , paper = shop
+    card = db.save_product(Product(0, "Открытка", "Сопутствующие", price=100, barcode="4 600000 000017"))
+    assert db.find_barcode("4600000000017").id == card and db.find_barcode("123") is None
+    with pytest.raises(UserError, match="уже у товара «Открытка»"):
+        db.save_product(Product(0, "Шар", barcode="4600000000017"))
+
+
+def test_reorder_count_many_time_and_stale(shop):
+    db, user, shift, rose, eucalyptus, paper = shop
+    for day in range(14):  # по 3 розы в день две недели
+        db.add_sale([CartLine("Роза", 3, 250, product_id=rose)], "cash", user.id, shift.id,
+                    NOW - timedelta(days=day, hours=1))
+    db.write_off(eucalyptus, 18, "Завяло", user.id, shift.id, NOW)  # эвкалипта осталось 2
+    lines = {x.product.name: x for x in db.reorder(NOW)}
+    assert lines["Роза красная"].per_day == 3 and lines["Роза красная"].need == 9 - 8  # осталось 8, на 3 дня — 9
+    assert "Эвкалипт" in lines and "Крафт" not in lines  # крафта 10 при минимуме 5 — хватает
+    text = reorder_text(list(lines.values()), NOW.date())
+    assert text.startswith("Заказ на 29.10") and "• Роза красная — 1 шт" in text
+
+    changed, diff = db.count_many({rose: 8, paper: 7, eucalyptus: 2}, user.id, NOW)
+    assert (changed, diff) == (1, -3 * 20)  # крафта нашли 7 вместо 10 — недостача 60 ₽
+    hours, weekdays = db.sales_by_time(*day_range(NOW.date() - timedelta(days=13), NOW.date()))
+    assert hours[11] == 14 * 750 and sum(weekdays) == 14 * 750
+    stale = [p.name for p, _ in db.stale(NOW)]
+    assert "Крафт" in stale and "Роза красная" not in stale
+    assert db.writeoff_top(*day_range(NOW.date(), NOW.date()))[0] == ("Эвкалипт", 18, 18 * 30)

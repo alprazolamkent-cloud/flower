@@ -10,7 +10,7 @@ from datetime import date, datetime, timedelta
 from PySide6.QtCore import QRectF, Qt, QTimer
 from PySide6.QtGui import QColor, QFont, QKeySequence, QPainter, QPixmap, QShortcut
 from PySide6.QtWidgets import (
-    QAbstractItemView, QButtonGroup, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFileDialog,
+    QAbstractItemView, QApplication, QButtonGroup, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFileDialog,
     QFormLayout, QFrame, QGridLayout, QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit, QMenu, QMessageBox,
     QPushButton, QRadioButton, QScrollArea, QSpinBox, QTableWidget, QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget,
 )
@@ -21,7 +21,7 @@ from .delivery_dialog import money, money_box
 from .icon import flower_icon
 from .photos import pick_photo, pixmap
 from .shifts import WRITEOFF_REASONS
-from .stock import CATEGORIES, PAYMENTS, CartLine, Product, Recipe, day_range, qty_text
+from .stock import CATEGORIES, PAYMENTS, CartLine, Product, Recipe, day_range, qty_text, reorder_text
 from .theme import C, primary
 
 MOVE_KINDS = {"supply": "Поставка", "sale": "Продажа", "writeoff": "Списание", "count": "Инвентаризация",
@@ -532,6 +532,9 @@ class ProductDialog(QDialog):
         self.min_box = qty_box()
         self.min_box.setValue(product.min_stock)
         form.addRow("Мало, если остаток ≤:", self.min_box)
+        self.barcode_edit = QLineEdit(product.barcode)
+        self.barcode_edit.setPlaceholderText("отсканируйте сканером или впишите цифры (необязательно)")
+        form.addRow("Штрихкод:", self.barcode_edit)
         self.photo = PhotoPicker(parent.db.photo_of("product", product.id) if product.id else None)
         form.addRow("Фото:", self.photo)
         form.addRow(_gray("Себестоимость считается сама — по ценам из поставок. 0 в «мало» — не следить."))
@@ -541,6 +544,7 @@ class ProductDialog(QDialog):
         p = self.product
         p.name, p.category = self.name_edit.text(), self.category_box.currentText().strip() or "Цветы"
         p.unit, p.price, p.min_stock = self.unit_edit.text(), self.price_box.value(), self.min_box.value()
+        p.barcode = self.barcode_edit.text()
         try:
             self.parent().db.save_product(p)
         except UserError as e:
@@ -587,7 +591,10 @@ class LinesEditor(QWidget):
         pid = self.pick.currentData()
         if pid is None:
             text = self.pick.currentText().strip().lower()
-            pid = next((p.id for p in self.products if text and text in p.name.lower()), None)
+            code = "".join(text.split())
+            pid = next((p.id for p in self.products if code and p.barcode == code), None)  # отсканировали
+            if pid is None:
+                pid = next((p.id for p in self.products if text and text in p.name.lower()), None)
         if pid is not None:
             self.add(pid, 1, self._product(pid).avg_cost)
             self.pick.setCurrentIndex(-1)
@@ -923,6 +930,130 @@ class DisassembleDialog(QDialog):
             self.table.item(i, 3).setText(qty_text(max(total - box.value(), 0)))
 
 
+class ReorderDialog(QDialog):
+    """Что заказать: заканчивается и сколько взять, с правкой количества и копированием для поставщика."""
+
+    def __init__(self, parent, lines: list):
+        super().__init__(parent)
+        self.lines = lines
+        self.setWindowTitle("Что заказать")
+        self.resize(760, 560)
+        layout = QVBoxLayout(self)
+        layout.addWidget(_gray("Сколько заказать, чтобы хватило на 3 дня — по тому, сколько уходило за последние "
+                               "две недели (продажи, сборка букетов, списания), и не меньше двух «минимальных остатков». "
+                               "Количество можно поправить."))
+        self.table = _table(["Товар", "Осталось", "Уходит в день", "Заказать"], stretch=0)
+        self.table.setRowCount(len(lines))
+        self.boxes = []
+        for i, x in enumerate(lines):
+            p = x.product
+            stock = _item(f"{qty_text(p.stock)} {p.unit}", align_right=True)
+            if p.low:
+                stock.setForeground(QColor(C.red))
+            for col, item in enumerate((_item(p.name), stock, _item(qty_text(x.per_day) if x.per_day else "—",
+                                                                     align_right=True))):
+                self.table.setItem(i, col, item)
+            box = qty_box(p.unit)
+            box.setDecimals(0 if p.unit == "шт" else 2)
+            box.setValue(x.need)
+            self.table.setCellWidget(i, 3, box)
+            self.boxes.append(box)
+        layout.addWidget(self.table, 1)
+        if not lines:
+            layout.addWidget(QLabel("Всего хватает — заказывать нечего 🌷"))
+        row = QHBoxLayout()
+        copy = QPushButton("📋 Скопировать для поставщика")
+        primary(copy)
+        copy.clicked.connect(self._copy)
+        copy.setEnabled(bool(lines))
+        row.addWidget(copy)
+        row.addStretch(1)
+        close = QPushButton("Закрыть")
+        close.clicked.connect(self.accept)
+        row.addWidget(close)
+        layout.addLayout(row)
+
+    def text(self) -> str:
+        for x, box in zip(self.lines, self.boxes):
+            x.need = box.value()
+        return reorder_text(self.lines, date.today() + timedelta(days=1))
+
+    def _copy(self):
+        text = self.text()
+        QApplication.clipboard().setText(text)
+        QMessageBox.information(self, "Что заказать", "Скопировано — вставьте поставщику в мессенджер."
+                                if text else "Везде 0 — копировать нечего.")
+
+
+class InventoryDialog(QDialog):
+    """Инвентаризация списком: «по программе» и «на самом деле» для всех товаров, недостача в рублях."""
+
+    def __init__(self, parent, products: list):
+        super().__init__(parent)
+        self.products = products
+        self.setWindowTitle("Инвентаризация списком")
+        self.resize(820, 640)
+        layout = QVBoxLayout(self)
+        top = QHBoxLayout()
+        self.category = QComboBox()
+        self.category.addItem("Все разделы", "")
+        for c in sorted({p.category for p in products}, key=lambda c: (c not in CATEGORIES, c)):
+            self.category.addItem(c, c)
+        self.category.currentIndexChanged.connect(self._filter)
+        top.addWidget(QLabel("Пересчитываю:"))
+        top.addWidget(self.category)
+        top.addStretch(1)
+        layout.addLayout(top)
+        layout.addWidget(_gray("Впишите, сколько на самом деле. Не пересчитывали — оставьте пусто: этот товар не тронется."))
+        self.table = _table(["Товар", "Раздел", "По программе", "На самом деле", "Разница"])
+        self.table.setRowCount(len(products))
+        self.boxes = []
+        for i, p in enumerate(products):
+            self.table.setItem(i, 0, _item(p.name))
+            self.table.setItem(i, 1, _item(p.category))
+            self.table.setItem(i, 2, _item(f"{qty_text(p.stock)} {p.unit}", align_right=True))
+            box = QDoubleSpinBox()
+            box.setRange(-1, 1_000_000)
+            box.setDecimals(0 if p.unit == "шт" else 2)
+            box.setSpecialValueText("—")  # −1 — не пересчитывали
+            box.setValue(-1)
+            box.setSuffix(f" {p.unit}")
+            box.valueChanged.connect(self._update)
+            self.table.setCellWidget(i, 3, box)
+            self.table.setItem(i, 4, _item("", align_right=True))
+            self.boxes.append(box)
+        layout.addWidget(self.table, 1)
+        self.total = QLabel()
+        layout.addWidget(self.total)
+        layout.addWidget(_buttons(self, "Записать пересчёт"))
+        self._update()
+
+    def _filter(self):
+        category = self.category.currentData()
+        for i, p in enumerate(self.products):
+            self.table.setRowHidden(i, bool(category) and p.category != category)
+
+    def actual(self) -> dict[int, float]:
+        return {p.id: box.value() for p, box in zip(self.products, self.boxes) if box.value() >= 0}
+
+    def _update(self):
+        counted = money_diff = 0
+        for i, (p, box) in enumerate(zip(self.products, self.boxes)):
+            item = self.table.item(i, 4)
+            if box.value() < 0:
+                item.setText("")
+                continue
+            counted += 1
+            diff = box.value() - p.stock
+            money_diff += diff * p.avg_cost
+            item.setText(("+" if diff > 0 else "") + qty_text(diff) if diff else "сошлось")
+            item.setForeground(QColor(C.green if diff >= 0 else C.red))
+        word = "недостача" if money_diff < 0 else "излишек"
+        self.total.setText(f"Пересчитано: <b>{counted}</b> из {len(self.products)}"
+                           + (f" · {word} <b style='color:{C.red if money_diff < 0 else C.green}'>"
+                              f"{money(abs(round(money_diff)))}</b> по себестоимости" if round(money_diff) else ""))
+
+
 class ImportDialog(QDialog):
     """Предпросмотр загрузки из таблицы: что добавится, что обновится, что не так."""
 
@@ -1011,6 +1142,7 @@ class StockWindow(QDialog):
     def refresh(self):
         self.tabs.setTabVisible(self.analytics_index, self.admin)
         for widget in (self.add_product_btn, self.edit_product_btn, self.count_btn, self.archive_btn, self.import_btn,
+                       self.inventory_btn,
                        self.add_recipe_btn, self.edit_recipe_btn, self.archive_recipe_btn):
             widget.setVisible(self.admin)
         page = self.tabs.currentIndex()
@@ -1202,7 +1334,17 @@ class StockWindow(QDialog):
         return self._photos[key]
 
     def _add_selected(self):
-        """Enter в поиске — первая плитка в корзину."""
+        """Enter в поиске — первая плитка в корзину; цифры штрихкода (сканер) — этот товар."""
+        code = "".join(self.search_edit.text().split())
+        if code.isdigit() and len(code) >= 6:
+            found = self.db.find_barcode(code)
+            if found is not None:
+                self._add_line(CartLine(found.name, 1, found.price, product_id=found.id), unit=found.unit)
+                self.search_edit.clear()
+                return
+            if not any(w.isalpha() for w in self.search_edit.text()):
+                self._unknown_barcode(code)
+                return
         if self._search_timer.isActive():  # нажали Enter, не дождавшись поиска
             self._search_timer.stop()
             self._refresh_catalog()
@@ -1211,6 +1353,21 @@ class StockWindow(QDialog):
             self._add_tile(kind, ident)
             self.search_edit.selectAll()
             self.search_edit.setFocus()
+
+    def _unknown_barcode(self, code: str):
+        self.search_edit.clear()
+        if not self.admin:
+            QMessageBox.information(self, "Штрихкод", f"Товара со штрихкодом {code} нет. Попросите администратора "
+                                    "завести его («📦 Остатки» → «➕ Товар») или продайте как «✏️ Своя позиция».")
+            return
+        if not _confirm(self, "Штрихкод", f"Товара со штрихкодом {code} ещё нет. Завести новый товар?"):
+            return
+        p = Product(0, "", "Сопутствующие", barcode=code)
+        if ProductDialog(self, p).exec() == QDialog.Accepted:
+            self.main.audit("Товар добавлен", f"{p.name}, {money(p.price)}, штрихкод {code}")
+            self._refresh_chips()
+            self._refresh_catalog()
+            self._add_line(CartLine(p.name, 1, p.price, product_id=p.id), unit=p.unit)
 
     def _add_tile(self, kind: str, ident: int):
         if kind == "recipe":
@@ -1400,11 +1557,17 @@ class StockWindow(QDialog):
         self.archive_btn = QPushButton("📁 В архив")
         self.archive_btn.setToolTip("Больше не возим — скрыть из списков (история останется)")
         self.archive_btn.clicked.connect(self._archive_product)
+        reorder_btn = QPushButton("🛒 Что заказать")
+        reorder_btn.setToolTip("Что заканчивается и сколько заказать — по расходу за две недели")
+        reorder_btn.clicked.connect(self._reorder)
+        self.inventory_btn = QPushButton("📋 Инвентаризация списком")
+        self.inventory_btn.setToolTip("Пересчитали склад — вписать всё сразу, видна недостача")
+        self.inventory_btn.clicked.connect(self._inventory)
         self.import_btn = QPushButton("📥 Загрузить из таблицы")
         self.import_btn.setToolTip("Excel (.xlsx) или CSV: шаблон программы или выгрузка из Hoog")
         self.import_btn.clicked.connect(self._import)
         for b in (self.add_product_btn, self.edit_product_btn, writeoff_btn, self.count_btn, history_btn,
-                  self.archive_btn, self.import_btn):
+                  self.archive_btn, reorder_btn, self.inventory_btn, self.import_btn):
             b.setMinimumHeight(30)
             buttons.addWidget(b)
         buttons.addStretch(1)
@@ -1551,6 +1714,23 @@ class StockWindow(QDialog):
         self.main.audit("Товары загружены из таблицы", f"{os.path.basename(path)}: добавлено {added}, "
                         f"обновлено {updated}")
         QMessageBox.information(self, "Загрузка из таблицы", f"Готово: добавлено {added}, обновлено {updated}.")
+        self._refresh_stock()
+
+    def _reorder(self):
+        ReorderDialog(self, self.db.reorder(datetime.now())).exec()
+
+    def _inventory(self):
+        dialog = InventoryDialog(self, self.db.products())
+        if dialog.exec() != QDialog.Accepted:
+            return
+        actual = dialog.actual()
+        if not actual:
+            return
+        changed, diff = self.db.count_many(actual, self.user_id, datetime.now())
+        self.main.audit("Инвентаризация списком", f"поправлено товаров: {changed}, разница {money(round(diff))}")
+        QMessageBox.information(self, "Инвентаризация", f"Готово. Поправлено товаров: {changed}.\n"
+                                + ("Недостача" if diff < 0 else "Излишек") + f" на {money(abs(round(diff)))} "
+                                "(по себестоимости)." if changed else "Всё сошлось — ничего не поправлено.")
         self._refresh_stock()
 
     # ----- поставки -----
@@ -1814,13 +1994,35 @@ class StockWindow(QDialog):
         layout.addWidget(QLabel("<b>Выручка по дням</b>"))
         self.chart = BarChart()
         layout.addWidget(self.chart)
-        tables = QHBoxLayout()
+        more = QTabWidget()
+        page_top = QWidget()
+        tables = QHBoxLayout(page_top)
         self.top_table = _table(["Топ продаж", "Сколько", "Выручка"])
         self.people_table = _table(["Сотрудник", "Продаж", "Выручка"])
         self.money_table = _table(["Оплата / списание", "Сумма"])
         for table in (self.top_table, self.people_table, self.money_table):
             tables.addWidget(table)
-        layout.addLayout(tables, 1)
+        more.addTab(page_top, "🏆 Топ и оплаты")
+        page_time = QWidget()
+        times = QHBoxLayout(page_time)
+        hours_box, days_box = QVBoxLayout(), QVBoxLayout()
+        hours_box.addWidget(QLabel("<b>По часам</b> — когда собирать витрину"))
+        self.hours_chart = BarChart()
+        hours_box.addWidget(self.hours_chart, 1)
+        days_box.addWidget(QLabel("<b>По дням недели</b> — где ставить вторую смену"))
+        self.days_chart = BarChart()
+        days_box.addWidget(self.days_chart, 1)
+        times.addLayout(hours_box, 3)
+        times.addLayout(days_box, 2)
+        more.addTab(page_time, "⏰ Когда продают")
+        page_stale = QWidget()
+        stale = QHBoxLayout(page_stale)
+        self.stale_table = _table(["Лежит без продаж 2 недели", "Остаток", "На сумму", "Уходил"])
+        self.writeoff_table = _table(["Чаще всего списывают", "Сколько", "На сумму"])
+        stale.addWidget(self.stale_table, 3)
+        stale.addWidget(self.writeoff_table, 2)
+        more.addTab(page_stale, "💤 Залёживается и списания")
+        layout.addWidget(more, 1)
         self.stock_line = QLabel()
         layout.addWidget(self.stock_line)
         return page
@@ -1865,6 +2067,22 @@ class StockWindow(QDialog):
         for i, (title, amount) in enumerate(rows):
             self.money_table.setItem(i, 0, _item(title))
             self.money_table.setItem(i, 1, _item(money(amount), align_right=True))
+        hours, weekdays = self.db.sales_by_time(*day_range(first, last))
+        busy = [h for h in range(24) if hours[h]]
+        span = range(min(busy), max(busy) + 1) if busy else range(8, 22)
+        self.hours_chart.set_values([(f"{h}:00", hours[h]) for h in span])
+        self.days_chart.set_values([(d, weekdays[i]) for i, d in enumerate(("пн", "вт", "ср", "чт", "пт", "сб", "вс"))])
+        stale = self.db.stale(datetime.now())
+        self.stale_table.setRowCount(len(stale))
+        for i, (p, moved) in enumerate(stale):
+            for col, text in enumerate((p.name, f"{qty_text(p.stock)} {p.unit}", money(round(p.stock * p.avg_cost)),
+                                        f"{moved:%d.%m}" if moved else "не продавался")):
+                self.stale_table.setItem(i, col, _item(text, align_right=col in (1, 2)))
+        top_off = self.db.writeoff_top(*day_range(first, last))
+        self.writeoff_table.setRowCount(len(top_off))
+        for i, (name, qty, amount) in enumerate(top_off):
+            for col, text in enumerate((name, qty_text(qty), money(amount))):
+                self.writeoff_table.setItem(i, col, _item(text, align_right=col > 0))
         low = [p for p in self.db.products() if p.low]
         self.stock_line.setText(
             f"На складе на <b>{money(self.db.stock_value())}</b> · поставок за период "

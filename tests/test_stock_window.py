@@ -270,3 +270,50 @@ def test_many_products_shown_by_pages(main, db):
     w._add_selected()  # Enter до окончания паузы — всё равно ищет и добавляет
     assert w.rows and w.rows[0].key[0].startswith("Шар н4")
     w.deleteLater()
+
+
+def test_barcode_reorder_inventory_and_time_charts(main, db, monkeypatch):
+    from app.stock_window import InventoryDialog, ProductDialog, ReorderDialog
+    paper = db.products()[0]
+    paper.barcode = "4600000000017"
+    db.save_product(paper)
+    w = StockWindow(main)
+    w.search_edit.setText("4600000000017")  # сканер «напечатал» код и Enter
+    w._add_selected()
+    assert len(w.rows) == 1 and w.rows[0].key[2] == paper.id and w.search_edit.text() == ""
+
+    monkeypatch.setattr(QMessageBox, "question", lambda *a, **k: QMessageBox.Yes)
+
+    def new_product(self):
+        assert self.barcode_edit.text() == "2000000000015"
+        self.name_edit.setText("Шар сердце")
+        self.price_box.setValue(300)
+        self.accept()
+        return QDialog.Accepted
+    monkeypatch.setattr(ProductDialog, "exec", new_product)
+    w.search_edit.setText("2000000000015")  # незнакомый код — завести товар и сразу в корзину
+    w._add_selected()
+    assert db.find_barcode("2000000000015").name == "Шар сердце" and len(w.rows) == 2
+
+    db.write_off(paper.id, 9, "Брак поставки", None, None, datetime.now())  # крафта остался 1
+    dialog = ReorderDialog(None, db.reorder(datetime.now()))
+    assert "• Крафт — " in dialog.text()
+    dialog.boxes[next(i for i, x in enumerate(dialog.lines) if x.product.id == paper.id)].setValue(25)
+    monkeypatch.setattr(QMessageBox, "information", lambda *a: None)
+    dialog._copy()
+    from PySide6.QtWidgets import QApplication
+    assert "Крафт — 25 шт" in QApplication.clipboard().text()
+
+    inv = InventoryDialog(None, db.products())
+    k = next(i for i, p in enumerate(inv.products) if p.id == paper.id)
+    inv.boxes[k].setValue(3)  # крафта на самом деле 3, остальное не считали
+    assert inv.actual() == {paper.id: 3} and "излишек" in inv.total.text()
+    monkeypatch.setattr(InventoryDialog, "exec", lambda self: (self.boxes[k].setValue(0), QDialog.Accepted)[1])
+    w._inventory()
+    assert db.stock_of(paper.id) == 0 and main.log[-1][0] == "Инвентаризация списком"
+
+    w.tabs.setCurrentIndex(w.analytics_index)
+    assert w.hours_chart.values and len(w.days_chart.values) == 7 and w.stale_table.rowCount() >= 1
+    for d in (dialog, inv):
+        d.deleteLater()
+    w.deleteLater()

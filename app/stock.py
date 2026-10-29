@@ -5,6 +5,7 @@
 Методы подмешиваются в Database (класс StockStore), таблицы создаёт STOCK_SCHEMA.
 """
 
+import math
 import sqlite3
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta
@@ -19,7 +20,8 @@ CREATE TABLE IF NOT EXISTS products (
     avg_cost  REAL    NOT NULL DEFAULT 0,
     min_stock REAL    NOT NULL DEFAULT 0,
     active    INTEGER NOT NULL DEFAULT 1,
-    photo     BLOB
+    photo     BLOB,
+    barcode   TEXT    NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS stock_moves (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -106,7 +108,9 @@ STOCK_MIGRATIONS = {  # (таблица, столбец) → как добави
     ("sales", "adjust_note"): "ALTER TABLE sales ADD COLUMN adjust_note TEXT NOT NULL DEFAULT ''",
     ("recipes", "ready_cost"): "ALTER TABLE recipes ADD COLUMN ready_cost REAL NOT NULL DEFAULT 0",
     ("recipes", "in_bot"): "ALTER TABLE recipes ADD COLUMN in_bot INTEGER NOT NULL DEFAULT 1",
+    ("products", "barcode"): "ALTER TABLE products ADD COLUMN barcode TEXT NOT NULL DEFAULT ''",
 }
+OUTGOING = "('sale', 'assembly', 'writeoff', 'return', 'disassembly')"  # расход со склада (возвраты — минусом)
 OPEN_ORDER = "('new', 'priced', 'paid_claimed')"  # заказ из бота ещё не принят — букет забронирован
 
 CATEGORIES = ("Цветы", "Зелень", "Упаковка", "Горшечные", "Сопутствующие")
@@ -146,6 +150,7 @@ class Product:
     active: bool = True
     stock: float = 0  # остаток (считается из движений)
     has_photo: bool = False
+    barcode: str = ""
 
     @property
     def low(self) -> bool:
@@ -222,6 +227,19 @@ class Supply:
 
 
 @dataclass
+class ReorderLine:
+    product: Product
+    per_day: float  # уходит в день (за последние две недели)
+    need: float  # сколько заказать
+
+
+def reorder_text(lines: list[ReorderLine], day: date) -> str:
+    """Список для поставщика — скопировать в мессенджер."""
+    rows = [f"• {x.product.name} — {qty_text(x.need)} {x.product.unit}" for x in lines if x.need > 0]
+    return f"Заказ на {day:%d.%m}:\n" + "\n".join(rows) if rows else ""
+
+
+@dataclass
 class SalesReport:
     """Аналитика за период (отменённые продажи не считаются)."""
     count: int = 0
@@ -269,11 +287,11 @@ class StockStore:
     def products(self, active_only: bool = True) -> list[Product]:
         sql = ("SELECT p.id, p.name, p.category, p.unit, p.price, p.avg_cost, p.min_stock, p.active,"
                " COALESCE((SELECT SUM(m.qty) FROM stock_moves m WHERE m.product_id = p.id), 0),"
-               " p.photo IS NOT NULL FROM products p")
+               " p.photo IS NOT NULL, p.barcode FROM products p")
         if active_only:
             sql += " WHERE p.active = 1"
         rows = self.conn.execute(sql + " ORDER BY p.category, p.name COLLATE NOCASE").fetchall()
-        return [Product(r[0], r[1], r[2], r[3], r[4], r[5], r[6], bool(r[7]), round(r[8], 3), bool(r[9]))
+        return [Product(r[0], r[1], r[2], r[3], r[4], r[5], r[6], bool(r[7]), round(r[8], 3), bool(r[9]), r[10])
                 for r in rows]
 
     def get_product(self, product_id: int) -> Product | None:
@@ -289,15 +307,31 @@ class StockStore:
             "SELECT name FROM products WHERE id <> ? AND active = 1", (p.id or 0,)).fetchall())
         if same:
             raise StockError(f"Товар «{name}» уже есть.")
+        barcode = "".join(p.barcode.split())
+        if barcode:
+            other = self.conn.execute("SELECT name FROM products WHERE barcode=? AND id<>? AND active=1",
+                                      (barcode, p.id or 0)).fetchone()
+            if other:
+                raise StockError(f"Этот штрихкод уже у товара «{other[0]}».")
         if p.id:
-            self.conn.execute("UPDATE products SET name=?, category=?, unit=?, price=?, min_stock=?, active=? WHERE id=?",
-                              (name, p.category, p.unit.strip() or "шт", p.price, p.min_stock, int(p.active), p.id))
+            self.conn.execute("UPDATE products SET name=?, category=?, unit=?, price=?, min_stock=?, active=?, barcode=?"
+                              " WHERE id=?", (name, p.category, p.unit.strip() or "шт", p.price, p.min_stock,
+                                              int(p.active), barcode, p.id))
         else:
             p.id = self.conn.execute(
-                "INSERT INTO products (name, category, unit, price, avg_cost, min_stock, active) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (name, p.category, p.unit.strip() or "шт", p.price, p.avg_cost, p.min_stock, int(p.active))).lastrowid
+                "INSERT INTO products (name, category, unit, price, avg_cost, min_stock, active, barcode)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (name, p.category, p.unit.strip() or "шт", p.price, p.avg_cost,
+                                                     p.min_stock, int(p.active), barcode)).lastrowid
         self.conn.commit()
         return p.id
+
+    def find_barcode(self, code: str) -> Product | None:
+        """Товар по штрихкоду (сканер «печатает» цифры и Enter)."""
+        code = "".join(code.split())
+        if not code:
+            return None
+        row = self.conn.execute("SELECT id FROM products WHERE barcode=? AND active=1", (code,)).fetchone()
+        return self.get_product(row[0]) if row else None
 
     def stock_of(self, product_id: int) -> float:
         return self.conn.execute("SELECT COALESCE(SUM(qty), 0) FROM stock_moves WHERE product_id=?",
@@ -742,6 +776,79 @@ class StockStore:
         """Сколько стоит всё, что лежит на складе и на витрине (по себестоимости)."""
         goods = sum(p.stock * p.avg_cost for p in self.products() if p.stock > 0)
         return round(goods + sum(r.ready * self._ready_cost(r.id) for r in self.recipes() if r.ready > 0))
+
+    # ----- что заказать, инвентаризация списком, когда продают, что залёживается -----
+
+    def usage(self, start: datetime, end: datetime) -> dict[int, float]:
+        """Сколько ушло со склада за период: продажи, сборка букетов, списания (минус возвраты и разборка)."""
+        return {pid: qty for pid, qty in self.conn.execute(
+            f"SELECT product_id, SUM(-qty) FROM stock_moves WHERE kind IN {OUTGOING} AND at >= ? AND at < ?"
+            " GROUP BY product_id", (_ts(start), _ts(end))).fetchall() if qty > 0}
+
+    def reorder(self, now: datetime, days: int = 14, cover: int = 3) -> list["ReorderLine"]:
+        """Что заказать: чтобы хватило на cover дней по расходу за последние days дней, и не меньше двух
+        «минимальных остатков». Сначала — чего уже нет или мало."""
+        used = self.usage(now - timedelta(days=days), now + timedelta(seconds=1))  # и то, что было только что
+        result = []
+        for p in self.products():
+            per_day = used.get(p.id, 0) / days
+            target = max(per_day * cover, p.min_stock * 2)
+            if target <= max(p.stock, 0) and not p.low:
+                continue
+            need = math.ceil(target - p.stock) if target > p.stock else 0
+            if need <= 0 and not p.low:
+                continue
+            result.append(ReorderLine(p, round(per_day, 2), max(need, 0)))
+        order = {c: i for i, c in enumerate(CATEGORIES)}
+        return sorted(result, key=lambda x: (x.product.stock > 0, order.get(x.product.category, 99),
+                                             x.product.name.casefold()))
+
+    def count_many(self, actual: dict[int, float], user_id: int | None, now: datetime) -> tuple[int, float]:
+        """Инвентаризация списком: {товар: сколько на самом деле}. Возвращает (сколько товаров поправили,
+        на сколько рублей изменился склад: минус — недостача)."""
+        changed, money_diff = 0, 0.0
+        for pid, qty in actual.items():
+            if qty < 0:
+                raise StockError("Остаток не может быть отрицательным.")
+            diff = round(qty - self.stock_of(pid), 3)
+            if diff:
+                self._move(pid, diff, "count", self._avg_cost(pid), now, reason="Инвентаризация", user_id=user_id)
+                changed += 1
+                money_diff += diff * self._avg_cost(pid)
+        self.conn.commit()
+        return changed, money_diff
+
+    def sales_by_time(self, start: datetime, end: datetime) -> tuple[list[int], list[int]]:
+        """Выручка по часам (0–23) и по дням недели (пн–вс) — когда больше всего продают."""
+        hours, weekdays = [0] * 24, [0] * 7
+        for at, total in self.conn.execute("SELECT at, total FROM sales WHERE at >= ? AND at < ? AND cancelled_at IS NULL",
+                                           (_ts(start), _ts(end))).fetchall():
+            moment = datetime.fromisoformat(at)
+            hours[moment.hour] += total
+            weekdays[moment.weekday()] += total
+        return hours, weekdays
+
+    def stale(self, now: datetime, days: int = 14) -> list[tuple[Product, datetime | None]]:
+        """Лежит без движения: есть на складе, но ни продаж, ни сборок за days дней. (товар, когда уходил в последний раз)"""
+        last = dict(self.conn.execute("SELECT product_id, MAX(at) FROM stock_moves WHERE kind IN ('sale', 'assembly')"
+                                      " GROUP BY product_id").fetchall())
+        since = now - timedelta(days=days)
+        result = []
+        for p in self.products():
+            moved = datetime.fromisoformat(last[p.id]) if last.get(p.id) else None
+            if p.stock > 0 and (moved is None or moved < since):
+                result.append((p, moved))
+        return sorted(result, key=lambda x: -(x[0].stock * x[0].avg_cost))
+
+    def writeoff_top(self, start: datetime, end: datetime, limit: int = 8) -> list[tuple[str, float, int]]:
+        """Что чаще всего списывают (товары и готовые букеты): (что, сколько, на сколько ₽)."""
+        rows = self.conn.execute(
+            "SELECT p.name, SUM(-m.qty), SUM(-m.qty * m.cost) FROM stock_moves m JOIN products p ON p.id = m.product_id"
+            " WHERE m.kind='writeoff' AND m.at >= ? AND m.at < ? GROUP BY p.id"
+            " UNION ALL SELECT '💐 ' || r.title, SUM(-m.qty), SUM(-m.qty * m.cost) FROM ready_moves m"
+            " JOIN recipes r ON r.id = m.recipe_id WHERE m.kind='writeoff' AND m.at >= ? AND m.at < ? GROUP BY r.id",
+            (_ts(start), _ts(end), _ts(start), _ts(end))).fetchall()
+        return sorted(((n, q, round(a)) for n, q, a in rows), key=lambda x: -x[2])[:limit]
 
     def stock_moves_of(self, product_id: int, limit: int = 100) -> list[tuple[datetime, str, float, str]]:
         """История товара: (когда, что, сколько, причина)."""
