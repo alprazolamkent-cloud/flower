@@ -49,6 +49,16 @@ def alert_text(pinned: dict | None, now: datetime, tz: tzinfo) -> str | None:
             "Нет интернета, выключен компьютер или закрыта программа. Напомню через 10 минут.")
 
 
+HEARTBEAT_MARKS = ("Компьютер в магазине на связи", PAUSED_MARK)
+
+
+def find_heartbeat(pins: list[dict | None]) -> dict | None:
+    """Закреплённое сообщение программы «на связи» среди закреплённых в чатах (самое свежее).
+    Чужие закреплённые сообщения не в счёт — неважно, в каком порядке вписаны чаты."""
+    ours = [p for p in pins if p and any(mark in (p.get("text") or "") for mark in HEARTBEAT_MARKS)]
+    return max(ours, key=lambda p: p.get("edit_date") or p.get("date") or 0, default=None)
+
+
 def main() -> int:
     token = os.environ.get("TG_TOKEN", "").strip()
     chats = [c for c in re.split(r"[,;\s]+", os.environ.get("TG_CHATS", "")) if c]
@@ -56,10 +66,27 @@ def main() -> int:
         print("Секреты TG_TOKEN и TG_CHATS не заданы — сторож выключен.")
         return 0
     tz = zone(os.environ.get("TG_TZ", "").strip())
-    pinned = call(token, "getChat", {"chat_id": chats[0]}).get("result", {}).get("pinned_message")
-    text = alert_text(pinned, datetime.now(timezone.utc), tz)
+    pins = []
+    for chat in chats:
+        try:
+            pins.append(call(token, "getChat", {"chat_id": chat}).get("result", {}).get("pinned_message"))
+        except Exception as e:  # noqa: BLE001 — неверный номер чата не должен ронять проверку
+            print(f"Чат {chat}: не получилось прочитать ({e}) — проверьте номер в TG_CHATS.")
+    pinned = find_heartbeat(pins)
+    now = datetime.now(timezone.utc)
+    if pinned is None:
+        print("Закреплённого сообщения «🟢 Компьютер в магазине на связи» нет ни в одном чате из TG_CHATS. "
+              "Программа ставит его сама, если в Настройки → Telegram включено «Следить, что компьютер на связи», "
+              "и пишет в первый чат из поля «Чаты» — он должен быть и в TG_CHATS. Пока его нет, сторож молчит.")
+        return 0
+    if PAUSED_MARK in (pinned.get("text") or ""):
+        print("Слежение выключено в программе (Настройки → Telegram) — сторож молчит.")
+        return 0
+    text = alert_text(pinned, now, tz)
     if text is None:
-        print("Связь в порядке (или слежение не настроено).")
+        updated = datetime.fromtimestamp(pinned.get("edit_date") or pinned.get("date") or 0, timezone.utc)
+        print(f"Связь в порядке: программа отмечалась {updated.astimezone(tz):%d.%m %H:%M} "
+              f"({int((now - updated).total_seconds() // 60)} мин назад).")
         return 0
     for chat in chats:
         try:

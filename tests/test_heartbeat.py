@@ -39,6 +39,16 @@ def test_watchdog_alert_text():
     assert watchdog.alert_text(None, now, tz) is None  # ещё не настроено
 
 
+def test_watchdog_finds_program_message_in_any_chat():
+    ours_old = {"text": "🟢 Компьютер в магазине на связи\nОбновлено: 29.10 12:00", "date": 100, "edit_date": 500}
+    ours_new = {"text": "🟢 Компьютер в магазине на связи\nОбновлено: 29.10 12:02", "date": 100, "edit_date": 900}
+    foreign = {"text": "Не забыть про поставку", "date": 2000}
+    assert watchdog.find_heartbeat([foreign, ours_old, None, ours_new]) is ours_new  # порядок чатов неважен
+    assert watchdog.find_heartbeat([foreign, None]) is None  # чужое закреплённое — не «на связи»
+    paused = {"text": "⏸ Слежение за связью выключено", "date": 50}
+    assert watchdog.find_heartbeat([paused]) is paused
+
+
 def test_watchdog_zone_fallback():
     assert watchdog.zone("") is watchdog.MOSCOW and watchdog.zone("Нет/Такого") is watchdog.MOSCOW
 
