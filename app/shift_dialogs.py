@@ -200,7 +200,7 @@ class CloseShiftDialog(QDialog):
         sales_form.addRow("", _gray("перевод / QR — в кассу не идёт"))
         columns.addWidget(sales)
 
-        writeoff = QGroupBox("Списано цветов за смену")
+        writeoff = QGroupBox("Списано за смену")
         writeoff_form = QFormLayout(writeoff)
         writeoff_form.addRow(_gray("На какую сумму списали, по причинам. Не было — оставьте 0."))
         self.writeoff_boxes: dict[str, QSpinBox] = {}

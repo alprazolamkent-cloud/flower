@@ -111,6 +111,7 @@ OPEN_ORDER = "('new', 'priced', 'paid_claimed')"  # заказ из бота е�
 
 CATEGORIES = ("Цветы", "Зелень", "Упаковка", "Горшечные", "Сопутствующие")
 FLOWER_CATEGORIES = ("Цветы", "Зелень")  # что считается «цветами» в выручке смены
+IMPORT_SUPPLIER = "Загрузка из таблицы"  # остатки на начало — не закупка, в «поставки за период» не идут
 PAYMENTS = {"cash": "Наличные", "card": "Терминал", "qr": "QR / перевод"}
 
 
@@ -128,8 +129,9 @@ def _ts(moment: datetime) -> str:
 
 
 def qty_text(qty: float) -> str:
-    """3.0 → «3», 2.5 → «2,5»."""
-    return f"{qty:g}".replace(".", ",")
+    """3.0 → «3», 2.5 → «2,5», 4100 → «4 100», −12 → «−12» (без «1e+06» у больших чисел)."""
+    text = f"{abs(qty):,.3f}".rstrip("0").rstrip(".").replace(",", " ").replace(".", ",")
+    return ("−" if qty < 0 and text != "0" else "") + text
 
 
 @dataclass
@@ -555,6 +557,34 @@ class StockStore:
 
     # ----- продажи -----
 
+    def shortages(self, lines: list[CartLine]) -> list[str]:
+        """Чего не хватит на складе для продажи (перед продажей — переспросить, а не уйти молча в минус):
+        «Кения: на складе 12 шт, нужно 4 100 шт». Готовые букеты, забронированные ботом, — тоже."""
+        need: dict[int, float] = {}
+        problems = []
+        for line in lines:
+            if line.product_id is not None:
+                need[line.product_id] = need.get(line.product_id, 0) + line.qty
+            elif line.recipe_id is not None:
+                recipe = self.get_recipe(line.recipe_id)
+                if recipe is None:
+                    continue
+                ready, reserved = max(self.ready_of(recipe.id), 0), self.reserved_of(recipe.id)
+                free = max(ready - reserved, 0)
+                if reserved and line.qty > free:
+                    problems.append(f"«{recipe.title}»: собранных {qty_text(ready)}, из них {reserved} заказаны "
+                                    "в боте — продадите заказанный")
+                rest = max(line.qty - ready, 0)  # собранных не хватило — остальное по техкарте со склада
+                for pid, q in recipe.items:
+                    if rest:
+                        need[pid] = need.get(pid, 0) + q * rest
+        names = {p.id: p for p in self.products(active_only=False)}
+        for pid, qty in need.items():
+            p = names.get(pid)
+            if p is not None and qty > p.stock:
+                problems.append(f"{p.name}: на складе {qty_text(p.stock)} {p.unit}, нужно {qty_text(qty)} {p.unit}")
+        return problems
+
     def add_sale(self, lines: list[CartLine], payment: str, user_id: int | None, shift_id: int | None, now: datetime,
                  discount: int = 0, note: str = "", flowers: bool = False, adjust_note: str = "") -> int:
         # discount < 0 — наценка (срочно, доставка до двери, сложная упаковка): прибавляется к сумме;
@@ -681,8 +711,8 @@ class StockStore:
             " GROUP BY reason ORDER BY 2 DESC", (_ts(start), _ts(end))).fetchall()}
 
     def supplies_total(self, start: datetime, end: datetime) -> int:
-        return self.conn.execute("SELECT COALESCE(SUM(total), 0) FROM supplies WHERE at >= ? AND at < ?",
-                                 (_ts(start), _ts(end))).fetchone()[0]
+        return self.conn.execute("SELECT COALESCE(SUM(total), 0) FROM supplies WHERE at >= ? AND at < ?"
+                                 " AND supplier <> ?", (_ts(start), _ts(end), IMPORT_SUPPLIER)).fetchone()[0]
 
     def sales_report(self, start: datetime, end: datetime, top: int = 10) -> SalesReport:
         report = SalesReport()

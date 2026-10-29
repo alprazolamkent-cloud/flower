@@ -18,7 +18,7 @@ LIGHT = {
     "weekend": "#c62828",
     "delivered_bg": "#e3f4e4", "delivered_fg": "#1b1f1b",
     "pending_day": "#ffe0b2", "done_day": "#c8e6c9", "shift_name": "#546e7a",
-    "note_bg": "#fff8e1", "note_border": "#ffe082", "info_bg": "#e3f2fd", "info_border": "#90caf9",
+    "note_bg": "#fff8e1", "note_border": "#ffe082", "info_bg": "#fdeef3", "info_border": "#f1c3d3",
     "note_fg": "#212121",
     "card_bg": "#ffffff", "card_border": "#e1e5e0", "bar": "#a5d6a7",
     # скругление кнопок не больше половины их высоты — иначе Qt рисует прямые углы
@@ -33,7 +33,7 @@ DARK = {
     "weekend": "#ff8a80",
     "delivered_bg": "#1f3a24", "delivered_fg": "#e8f5e9",
     "pending_day": "#4a3218", "done_day": "#1e3a24", "shift_name": "#b0bec5",
-    "note_bg": "#3a3320", "note_border": "#6d5a1e", "info_bg": "#1c2b3a", "info_border": "#2f5d8a",
+    "note_bg": "#3a3320", "note_border": "#6d5a1e", "info_bg": "#3a2430", "info_border": "#6e3a50",
     "note_fg": "#f1f1f1",
     "card_bg": "#262928", "card_border": "#3a3f3c", "bar": "#2f6a36",
     "accent": "#4caf85", "accent_hover": "#5cc196", "accent_soft": "#22362c", "on_accent": "#0f1a14",

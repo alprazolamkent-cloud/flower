@@ -10,7 +10,7 @@ import re
 from dataclasses import dataclass
 from datetime import datetime
 
-from .stock import CATEGORIES, Product, StockError
+from .stock import CATEGORIES, IMPORT_SUPPLIER, Product, StockError
 
 # столбец → слова, по которым его узнать (первое совпадение в заголовке)
 COLUMNS = {
@@ -225,5 +225,5 @@ def apply(db, rows: list[ImportRow], user_id: int | None, now: datetime) -> tupl
         if r.stock is not None:
             db.count_stock(p.id, max(r.stock, 0), user_id, now)
     if supply:
-        db.add_supply("Загрузка из таблицы", supply, user_id, now, "остатки на начало")
+        db.add_supply(IMPORT_SUPPLIER, supply, user_id, now, "остатки на начало")
     return added, updated

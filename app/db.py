@@ -1,6 +1,7 @@
 """Хранение доставок, сотрудников и смен в SQLite."""
 
 import json
+import re
 import sqlite3
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta
@@ -707,8 +708,9 @@ class ClientStore:
         bouquet = order.amount - order.delivery_fee
         item = self.get_showcase_item(order.showcase_id) if order.showcase_id else None
         recipe_id = item.recipe_id if item else None  # собранный букет с витрины — продаётся с витрины, без списания
-        if bouquet > 0:
-            self.add_sale([CartLine(order.items.splitlines()[0] if order.items else "Букет", 1, bouquet, recipe_id)],
+        title = item.title if item else re.sub(r"\s+—\s+[\d\s ]+₽\s*$", "", (order.items.splitlines() or ["Букет"])[0])
+        if bouquet > 0:  # в «Топ продаж» — название без «— 3 500 ₽»
+            self.add_sale([CartLine(title or "Букет", 1, bouquet, recipe_id)],
                           "qr", user_id, shift_id, now, note=f"Заказ из бота №{order_id}", flowers=True)
         return d
 

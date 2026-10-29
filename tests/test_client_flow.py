@@ -84,6 +84,7 @@ def test_order_from_showcase_and_payment(db):
     assert "Открытка: С днём рождения!" in d.items and d.source == "Telegram-бот"
     sale = db.sales_between(NOW, NOW + timedelta(seconds=1))[0]  # букет без доставки — продажа по QR
     assert (sale.total, sale.flowers, sale.payment, sale.note) == (3500, 3500, "qr", f"Заказ из бота №{order_id}")
+    assert sale.lines[0][0] == "Нежность"  # без «— 3 500 ₽»
     with pytest.raises(UserError):
         db.confirm_client_order(order_id, None, NOW)
     assert "принят ✅" in texts(say(flow, ORDERS))

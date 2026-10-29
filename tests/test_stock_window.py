@@ -57,6 +57,7 @@ def test_sell_from_window_and_close_shift(main, db):
     assert [c.text() for c in w.chips.buttons()] == ["Все", "💐 Букеты", "Цветы", "Упаковка"]
     assert len(w.grid.tiles) == 3
     w.search_edit.setText("букет")
+    w._refresh_catalog()  # поиск ждёт, пока допечатают
     assert len(w.grid.tiles) == 1
     w._add_selected()
     w.grid.tiles[0].on_add(*w.grid.tiles[0].key)  # плитка — тот же букет, количество 2
@@ -222,4 +223,50 @@ def test_keyboard_sale(main, db):
     w._sell_key("cash")  # пустая корзина — ничего
     assert len(db.sales_between(datetime.now() - timedelta(minutes=1), datetime.now() + timedelta(minutes=1))) == 1
     assert "F5" in w.pay_buttons[0].text() and "F7" in w.pay_buttons[2].text()
+    w.deleteLater()
+
+
+def test_sale_asks_when_stock_is_short(main, db, monkeypatch):
+    asked = []
+    monkeypatch.setattr(QMessageBox, "question", lambda *a, **k: asked.append(a[2]) or QMessageBox.No)
+    w = StockWindow(main)
+    w.search_edit.setText("крафт")
+    w._add_selected()
+    w.rows[0].qty.setValue(4100)  # вписали цену в количество
+    assert w.rows[0].qty.suffix() == " шт"
+    w._sell("cash")
+    assert asked and "Крафт: на складе 10 шт, нужно 4 100 шт" in asked[0]
+    assert w.rows and db.stock_of(db.products()[0].id) == 10  # отказались — ничего не продано
+    monkeypatch.setattr(QMessageBox, "question", lambda *a, **k: QMessageBox.Yes)
+    w._sell("cash")
+    assert not w.rows and db.get_product(db.products()[0].id).stock == -4090
+    w.tabs.setCurrentIndex(1)
+    assert w.stock_table.item(0, 2).text() == "−4 090 шт"
+    w.deleteLater()
+
+
+def test_shortages_for_reserved_and_recipe(main, db):
+    from app.stock import CartLine
+    recipe = db.recipes()[0]  # 9 роз и крафт
+    assert db.shortages([CartLine("", 3, 0, recipe_id=recipe.id)]) == []  # 27 роз из 30 — хватает
+    assert db.shortages([CartLine("", 4, 0, recipe_id=recipe.id)]) == ["Роза: на складе 30 шт, нужно 36 шт"]
+    db.assemble(recipe.id, 1, None, None, datetime.now())
+    item = db.showcase()[0]
+    db.touch_client("1", "", "", datetime.now())
+    db.add_client_order("1", datetime.now(), date.today(), "", "", "", "", "", "", item.id)
+    assert "заказаны в боте" in db.shortages([CartLine("", 1, 0, recipe_id=recipe.id)])[0]
+
+
+def test_many_products_shown_by_pages(main, db):
+    from app.stock_window import TILE_PAGE
+    for i in range(TILE_PAGE + 5):
+        db.save_product(Product(0, f"Шар н{i}", "Сопутствующие", price=100))
+    w = StockWindow(main)
+    w.chips.buttons()[0].click()  # «Все»
+    assert len(w.grid.tiles) == TILE_PAGE and "осталось" in w.grid.more.text()
+    w.grid.more.click()
+    assert len(w.grid.tiles) == len(w.grid.data) and w.grid.more.isHidden()
+    w.search_edit.setText("шар н4")
+    w._add_selected()  # Enter до окончания паузы — всё равно ищет и добавляет
+    assert w.rows and w.rows[0].key[0].startswith("Шар н4")
     w.deleteLater()

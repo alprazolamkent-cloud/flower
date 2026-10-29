@@ -47,6 +47,7 @@ def test_template_xlsx(db, tmp_path):
     ribbon = next(p for p in db.products() if p.name == "Лента атласная")
     assert (ribbon.unit, ribbon.stock, ribbon.category) == ("м", 100.5, "Упаковка")
     assert db.supplies()[0].supplier == "Загрузка из таблицы"
+    assert db.supplies()[0].total > 0 and db.supplies_total(NOW.replace(hour=0), NOW.replace(hour=23)) == 0
 
 
 def test_hoog_like_csv_updates_existing(db, tmp_path):

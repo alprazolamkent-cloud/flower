@@ -7,7 +7,7 @@ import html
 import os
 from datetime import date, datetime, timedelta
 
-from PySide6.QtCore import QRectF, Qt
+from PySide6.QtCore import QRectF, Qt, QTimer
 from PySide6.QtGui import QColor, QFont, QKeySequence, QPainter, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView, QButtonGroup, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFileDialog,
@@ -143,7 +143,7 @@ class BarChart(QWidget):
             p.setPen(QColor(C.gray))
             if i % label_every == 0:
                 p.drawText(QRectF(i * slot - 10, h - bottom + 3, slot + 20, bottom), Qt.AlignHCenter, label)
-            if value == peak or n <= 10:
+            if value and (value == peak or n <= 10):  # пустые дни без «0» — не засоряют
                 p.drawText(QRectF(i * slot - 20, h - bottom - height - top, slot + 40, top),
                            Qt.AlignHCenter | Qt.AlignBottom, f"{value / 1000:.1f}k" if value >= 10_000 else str(value))
 
@@ -240,13 +240,17 @@ class Tile(QFrame):
             self.on_add(*self.key)
 
 
-class TileGrid(QWidget):
-    """Плитки сеткой: столбцов столько, сколько влезает по ширине."""
+TILE_PAGE = 40  # плиток за раз: 500 товаров сразу рисуются секунды — дальше «Показать ещё»
 
-    def __init__(self, on_add):
+
+class TileGrid(QWidget):
+    """Плитки сеткой: столбцов столько, сколько влезает по ширине; по TILE_PAGE за раз."""
+
+    def __init__(self, on_add, photo_of):
         super().__init__()
-        self.on_add = on_add
+        self.on_add, self.photo_of = on_add, photo_of  # photo_of(kind, id) — фото грузим только для видимых
         self.tiles: list[Tile] = []
+        self.data: list[tuple] = []
         self.columns = 0
         self.layout_ = QGridLayout(self)
         self.layout_.setSpacing(10)
@@ -254,16 +258,28 @@ class TileGrid(QWidget):
         self.empty = _gray("Ничего не нашлось. Нет товара — добавьте его в «📦 Остатки» "
                            "или продайте как «✏️ Своя позиция».")
         self.layout_.addWidget(self.empty, 0, 0)
+        self.more = QPushButton()
+        self.more.clicked.connect(self._show_more)
+        self.more.hide()
 
     def set_tiles(self, tiles: list[tuple]):
+        """tiles — (вид, номер, название, цена, остаток, мало, есть фото)."""
         for tile in self.tiles:  # убрать сразу: deleteLater сработает позже, а до того старые видны под новыми
             self.layout_.removeWidget(tile)
             tile.hide()
             tile.deleteLater()
-        self.tiles = [Tile((kind, ident), title, price, stock, low, photo, self.on_add)
-                      for kind, ident, title, price, stock, low, photo in tiles]
+        self.data, self.tiles = tiles, []
+        self._add(TILE_PAGE)
+
+    def _add(self, count: int):
+        for kind, ident, title, price, stock, low, has_photo in self.data[len(self.tiles):len(self.tiles) + count]:
+            photo = self.photo_of(kind, ident) if has_photo else None
+            self.tiles.append(Tile((kind, ident), title, price, stock, low, photo, self.on_add))
         self.columns = 0
         self._place()
+
+    def _show_more(self):
+        self._add(TILE_PAGE)
 
     def _place(self):
         columns = max(1, (self.width() - 10) // (TILE_PHOTO + 26))
@@ -272,14 +288,21 @@ class TileGrid(QWidget):
         self.columns = columns
         for tile in self.tiles:
             self.layout_.removeWidget(tile)
+        self.layout_.removeWidget(self.more)
         self.empty.setVisible(not self.tiles)
         for i, tile in enumerate(self.tiles):
             self.layout_.addWidget(tile, i // columns, i % columns)
         rows = -(-len(self.tiles) // columns)
+        left = len(self.data) - len(self.tiles)
+        self.more.setVisible(left > 0)
+        if left > 0:
+            self.more.setText(f"⬇ Показать ещё (осталось {left}) — или найдите поиском")
+            self.layout_.addWidget(self.more, rows, 0, 1, columns)
         margins = self.layout_.contentsMargins()
         height = self.tiles[0].height() if self.tiles else 0
+        extra = (self.more.sizeHint().height() + self.layout_.verticalSpacing()) if left > 0 else 0
         # прокрутка сама не узнаёт высоту сетки — иначе она ужимает ряды, и плитки наезжают друг на друга
-        self.setMinimumHeight(rows * height + max(rows - 1, 0) * self.layout_.verticalSpacing()
+        self.setMinimumHeight(rows * height + max(rows - 1, 0) * self.layout_.verticalSpacing() + extra
                               + margins.top() + margins.bottom())
 
     def resizeEvent(self, event):  # noqa: N802
@@ -317,7 +340,8 @@ class CartRow(QFrame):
         self.qty = QDoubleSpinBox()
         self.qty.setProperty("small", True)  # стрелочки нулевой ширины: NoButtons под стилем ломает поле в Qt
         self.qty.setAlignment(Qt.AlignCenter)
-        self.qty.setFixedWidth(64)
+        self.qty.setFixedWidth(82)
+        self.qty.setSuffix(f" {unit or 'шт'}")  # чтобы не спутать количество с ценой
         self.qty.setRange(1 if line.recipe_id else 0.01, 100_000)
         self.qty.setDecimals(0 if line.recipe_id or unit in ("", "шт") else 2)
         self.qty.setValue(line.qty)
@@ -423,6 +447,12 @@ class AdjustDialog(QDialog):
             self.note_box.setFocus()
             return
         super().accept()
+
+
+def _confirm(parent, title: str, text: str) -> bool:
+    """Переспросить; по умолчанию — «Нет» (Enter случайно не подтвердит)."""
+    return QMessageBox.question(parent, title, text, QMessageBox.Yes | QMessageBox.No,
+                                QMessageBox.No) == QMessageBox.Yes
 
 
 def _buttons(dialog: QDialog, ok: str = "Сохранить") -> QDialogButtonBox:
@@ -716,7 +746,14 @@ class RecipeDialog(QDialog):
 
     def accept(self):
         r = self.recipe
-        r.title, r.price, r.items = self.title_edit.text(), self.price_box.value(), self.lines.lines()
+        items = self.lines.lines()
+        names = {p.id: p for p in self.db.products(active_only=False)}
+        huge = [f"{names[pid].name} × {qty_text(q)} {names[pid].unit}" for pid, q in items
+                if pid in names and q > 100]
+        if huge and not _confirm(self, "Техкарта", "Столько на ОДИН букет?\n• " + "\n• ".join(huge)
+                                 + "\n\nПроверьте: может, в количество вписали цену."):
+            return
+        r.title, r.price, r.items = self.title_edit.text(), self.price_box.value(), items
         r.in_bot = self.in_bot.isChecked()
         try:
             self.db.save_recipe(r)
@@ -785,8 +822,9 @@ class AssembleDialog(QDialog):
                     item.setForeground(QColor(C.red))
                 self.table.setItem(i, col, item)
             if have < need and p:
-                short.append(f"{p.name} (не хватает {qty_text(need - have)}{unit})")
-        self.short.setText(f"<span style='color:{C.orange}'>⚠ По программе не хватает: {html.escape(', '.join(short))}. "
+                short.append(f"{p.name}: на складе {qty_text(have)}{unit}, нужно {qty_text(need)}{unit}")
+        self.short_list = short
+        self.short.setText(f"<span style='color:{C.orange}'>⚠ По программе не хватает: {html.escape('; '.join(short))}. "
                            "Если на самом деле есть — значит, поставку не внесли; собрать всё равно можно.</span>"
                            if short else "")
 
@@ -977,6 +1015,7 @@ class StockWindow(QDialog):
             widget.setVisible(self.admin)
         page = self.tabs.currentIndex()
         if page == 0:
+            self._photos.clear()  # фото могли поменять в «Остатках» / «Техкартах»
             self._refresh_chips()
             self._refresh_catalog()
             self._refresh_today()
@@ -999,7 +1038,9 @@ class StockWindow(QDialog):
         self.search_edit = QLineEdit()
         self.search_edit.setPlaceholderText("🔍 Печатайте название (F2), Enter — в корзину; оплата F5 / F6 / F7")
         self.search_edit.setClearButtonEnabled(True)
-        self.search_edit.textChanged.connect(self._refresh_catalog)
+        self._search_timer = QTimer(self, singleShot=True, interval=150)  # ищем, когда допечатали
+        self._search_timer.timeout.connect(self._refresh_catalog)
+        self.search_edit.textChanged.connect(self._search_timer.start)
         self.search_edit.returnPressed.connect(self._add_selected)
         top.addWidget(self.search_edit, 1)
         free_btn = QPushButton("✏️ Своя позиция")
@@ -1013,7 +1054,7 @@ class StockWindow(QDialog):
         self.chips.setExclusive(True)
         self.chips.buttonClicked.connect(lambda _: self._refresh_catalog())
         left.addLayout(self.chips_row)
-        self.grid = TileGrid(self._add_tile)
+        self.grid = TileGrid(self._add_tile, self._photo)
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
@@ -1130,7 +1171,6 @@ class StockWindow(QDialog):
         self.chips_row.addStretch(1)
 
     def _refresh_catalog(self):
-        self._photos.clear()  # фото могли поменять в «Остатках» / «Техкартах»
         query = self.search_edit.text().strip().lower()
         chip = self.chips.checkedButton().property("chip") if self.chips.checkedButton() else "all"
         if query:
@@ -1152,8 +1192,7 @@ class StockWindow(QDialog):
                 continue
             stock = (f"готово: {qty_text(item.ready)}" if item.ready > 0 else "") if kind == "recipe" else \
                 f"{qty_text(item.stock)} {item.unit}"
-            tiles.append((kind, ident, title, item.price, stock, kind == "product" and item.low,
-                          self._photo(kind, ident) if item.has_photo else None))
+            tiles.append((kind, ident, title, item.price, stock, kind == "product" and item.low, item.has_photo))
         self.grid.set_tiles(tiles)
 
     def _photo(self, kind: str, ident: int) -> QPixmap:
@@ -1164,6 +1203,9 @@ class StockWindow(QDialog):
 
     def _add_selected(self):
         """Enter в поиске — первая плитка в корзину."""
+        if self._search_timer.isActive():  # нажали Enter, не дождавшись поиска
+            self._search_timer.stop()
+            self._refresh_catalog()
         if self.grid.tiles:
             kind, ident = self.grid.tiles[0].key
             self._add_tile(kind, ident)
@@ -1252,6 +1294,11 @@ class StockWindow(QDialog):
 
     def _sell(self, payment: str):
         lines = self.cart_lines()
+        short = self.db.shortages(lines)
+        if short and not _confirm(self, "Продажа", "Не хватает на складе:\n• " + "\n• ".join(short)
+                                  + "\n\nПроверьте количество в корзине. Если на самом деле товар есть — значит, "
+                                  "не внесли поставку, остаток уйдёт в минус.\n\nВсё равно продать?"):
+            return
         try:
             sale_id = self.db.add_sale(lines, payment, self.user_id, self.main.sale_shift_id(), datetime.now(),
                                        discount=self.adjust, adjust_note=self.adjust_note)
@@ -1376,10 +1423,12 @@ class StockWindow(QDialog):
         self.stock_table.setRowCount(len(products))
         for i, p in enumerate(products):
             cells = [p.name, p.category, f"{qty_text(p.stock)} {p.unit}", money(p.price),
-                     money(round(p.avg_cost)) if self.admin else "—",
+                     money(round(p.avg_cost)) if self.admin and p.avg_cost else "—",
                      f"{qty_text(p.min_stock)} {p.unit}" if p.min_stock else ""]
             for col, text in enumerate(cells):
                 item = _item(text, p.id, align_right=col >= 2)
+                if col == 4 and self.admin and not p.avg_cost:
+                    item.setToolTip("Поставок с закупочной ценой не было — себестоимость неизвестна")
                 if p.low and col == 2:
                     item.setForeground(QColor(C.red))
                     item.setToolTip("Отрицательный остаток — значит, поставку не внесли" if p.stock < 0
@@ -1420,6 +1469,10 @@ class StockWindow(QDialog):
         if dialog.exec() != QDialog.Accepted:
             return
         qty, reason = dialog.qty_box.value(), dialog.reason_box.currentText()
+        if qty > max(p.stock, 0) and not _confirm(
+                self, "Списание", f"На складе по программе {qty_text(p.stock)} {p.unit}, а списываете "
+                f"{qty_text(qty)} {p.unit}. Остаток уйдёт в минус.\n\nТочно списать?"):
+            return
         try:
             self.db.write_off(p.id, qty, reason, self.user_id, self.main.sale_shift_id(), datetime.now())
         except UserError as e:
@@ -1646,6 +1699,11 @@ class StockWindow(QDialog):
         if dialog.exec() != QDialog.Accepted:
             return
         qty = dialog.qty_box.value()
+        short = dialog.short_list
+        if short and not _confirm(self, "Собрать", "По программе не хватает:\n• " + "\n• ".join(short)
+                                  + "\n\nЕсли на самом деле есть — значит, не внесли поставку, остаток уйдёт "
+                                  "в минус. Собрать всё равно?"):
+            return
         try:
             self.db.assemble(r.id, qty, self.user_id, self.main.sale_shift_id(), datetime.now())
         except UserError as e:
