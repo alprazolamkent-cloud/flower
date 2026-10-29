@@ -6,7 +6,7 @@
 import os
 from types import SimpleNamespace
 
-from PySide6.QtCore import QEvent, QObject, QPointF, QStandardPaths, Qt
+from PySide6.QtCore import QPointF, QStandardPaths, Qt
 from PySide6.QtGui import QColor, QPainter, QPalette, QPen, QPixmap
 from PySide6.QtWidgets import QDialogButtonBox, QPushButton
 
@@ -251,19 +251,12 @@ def primary(button: QPushButton, on: bool = True) -> QPushButton:
     return button
 
 
-class _PrimaryOk(QObject):
-    """«ОК» / «Сохранить» во всех окнах с QDialogButtonBox — главные, без правки каждого окна."""
-
-    def eventFilter(self, obj, event):  # noqa: N802 — имя из Qt
-        if event.type() == QEvent.Polish and isinstance(obj, QPushButton):
-            box = obj.parent()
-            if isinstance(box, QDialogButtonBox) and box.buttonRole(obj) in (QDialogButtonBox.AcceptRole,
-                                                                             QDialogButtonBox.YesRole):
-                primary(obj)
-        return False
-
-
-_filter = _PrimaryOk()
+def primary_ok(buttons: QDialogButtonBox) -> QDialogButtonBox:
+    """«ОК» / «Сохранить» в окне — главная (зелёная) кнопка."""
+    for button in buttons.buttons():
+        if buttons.buttonRole(button) in (QDialogButtonBox.AcceptRole, QDialogButtonBox.YesRole):
+            primary(button)
+    return buttons
 
 
 def apply(app, mode: str) -> bool:
@@ -275,6 +268,4 @@ def apply(app, mode: str) -> bool:
         app.styleHints().setColorScheme(scheme.Dark if dark else scheme.Light)
     app.setPalette(dark_palette() if dark else light_palette(app))
     app.setStyleSheet(stylesheet(dark))
-    app.removeEventFilter(_filter)
-    app.installEventFilter(_filter)
     return dark

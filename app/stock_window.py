@@ -258,7 +258,7 @@ class TileGrid(QWidget):
         self.empty = _gray("Ничего не нашлось. Нет товара — добавьте его в «📦 Остатки» "
                            "или продайте как «✏️ Своя позиция».")
         self.layout_.addWidget(self.empty, 0, 0)
-        self.more = QPushButton()
+        self.more = QPushButton(self)  # с родителем: без него show() в Windows открывает отдельное окно
         self.more.clicked.connect(self._show_more)
         self.more.hide()
 
@@ -294,10 +294,10 @@ class TileGrid(QWidget):
             self.layout_.addWidget(tile, i // columns, i % columns)
         rows = -(-len(self.tiles) // columns)
         left = len(self.data) - len(self.tiles)
-        self.more.setVisible(left > 0)
-        if left > 0:
+        if left > 0:  # сначала в сетку, потом показать
             self.more.setText(f"⬇ Показать ещё (осталось {left}) — или найдите поиском")
             self.layout_.addWidget(self.more, rows, 0, 1, columns)
+        self.more.setVisible(left > 0)
         margins = self.layout_.contentsMargins()
         height = self.tiles[0].height() if self.tiles else 0
         extra = (self.more.sizeHint().height() + self.layout_.verticalSpacing()) if left > 0 else 0
@@ -460,6 +460,7 @@ def _buttons(dialog: QDialog, ok: str = "Сохранить") -> QDialogButtonBo
     buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
     buttons.button(QDialogButtonBox.Ok).setText(ok)
     buttons.button(QDialogButtonBox.Cancel).setText("Отмена")
+    primary(buttons.button(QDialogButtonBox.Ok))
     buttons.accepted.connect(dialog.accept)
     buttons.rejected.connect(dialog.reject)
     return buttons

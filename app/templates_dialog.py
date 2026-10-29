@@ -6,6 +6,7 @@ from PySide6.QtWidgets import (
 )
 
 from .messaging import DEFAULT_TEMPLATES, KINDS, PLACEHOLDERS
+from .theme import primary_ok
 
 
 def load_templates() -> dict[str, str]:
@@ -39,6 +40,7 @@ class TemplatesDialog(QDialog):
         form.addRow(reset)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+        primary_ok(buttons)
         buttons.button(QDialogButtonBox.Save).setText("Сохранить")
         buttons.button(QDialogButtonBox.Cancel).setText("Отмена")
         buttons.accepted.connect(self.accept)

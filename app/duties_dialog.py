@@ -10,7 +10,7 @@ from PySide6.QtWidgets import (
 
 from .db import Database
 from .shifts import Shift
-from .theme import C
+from .theme import C, primary_ok
 
 
 class DutiesEditor(QDialog):
@@ -45,6 +45,7 @@ class DutiesEditor(QDialog):
         layout.addWidget(hint)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+        primary_ok(buttons)
         buttons.button(QDialogButtonBox.Save).setText("Сохранить")
         buttons.button(QDialogButtonBox.Cancel).setText("Отмена")
         buttons.accepted.connect(self.accept)

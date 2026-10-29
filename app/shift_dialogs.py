@@ -21,7 +21,7 @@ from .shifts import (
     expected_cash, revenue_mismatch, window,
 )
 from .salary_view import SalaryPanel
-from .theme import C
+from .theme import C, primary_ok
 
 MONTHS = ["январь", "февраль", "март", "апрель", "май", "июнь",
           "июль", "август", "сентябрь", "октябрь", "ноябрь", "декабрь"]
@@ -59,6 +59,7 @@ def count_box(placeholder: str = "— пересчитайте —") -> QSpinBox
 
 def _buttons(dialog: QDialog, ok_text: str) -> QDialogButtonBox:
     buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+    primary_ok(buttons)
     buttons.button(QDialogButtonBox.Ok).setText(ok_text)
     buttons.button(QDialogButtonBox.Cancel).setText("Отмена")
     buttons.accepted.connect(dialog.accept)
@@ -1021,6 +1022,7 @@ class DisputeDialog(QDialog):
         self.text.setFixedHeight(90)
         form.addRow("Объяснение:", self.text)
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        primary_ok(buttons)
         buttons.button(QDialogButtonBox.Ok).setText("Отправить администратору")
         buttons.button(QDialogButtonBox.Cancel).setText("Отмена")
         buttons.accepted.connect(self.accept)

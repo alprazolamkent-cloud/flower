@@ -9,7 +9,7 @@ from PySide6.QtWidgets import (
 
 from .db import Database, User, UserError
 from .icon import flower_icon
-from .theme import C
+from .theme import C, primary_ok
 
 
 def _password_edit() -> QLineEdit:
@@ -20,6 +20,7 @@ def _password_edit() -> QLineEdit:
 
 def _buttons(dialog: QDialog, ok_text: str) -> QDialogButtonBox:
     buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+    primary_ok(buttons)
     buttons.button(QDialogButtonBox.Ok).setText(ok_text)
     buttons.button(QDialogButtonBox.Cancel).setText("Отмена")
     buttons.accepted.connect(dialog.accept)

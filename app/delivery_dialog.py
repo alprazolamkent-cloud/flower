@@ -12,7 +12,7 @@ from PySide6.QtWidgets import (
 from .db import Delivery
 from .messaging import CHANNELS
 from .photos import PhotoViewer, pick_photo, pixmap
-from .theme import C
+from .theme import C, primary_ok
 
 MAX_MONEY = 10_000_000
 
@@ -116,6 +116,7 @@ class DeliveryDialog(QDialog):
             self._show_photos()
 
         buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+        primary_ok(buttons)
         buttons.button(QDialogButtonBox.Save).setText("Сохранить")
         buttons.button(QDialogButtonBox.Cancel).setText("Отмена")
         buttons.accepted.connect(self.accept)

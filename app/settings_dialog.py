@@ -28,7 +28,7 @@ from .reports import parse_time
 from .salary_dialog import EmployeeTiersDialog, HolidaysDialog, PenaltyCatalogEditor, TiersEditor
 from .shifts import DEFAULT_CHANGE, DEFAULT_GRACE_MINUTES, WaterSchedule
 from .templates_dialog import TemplatesDialog
-from .theme import C
+from .theme import C, primary_ok
 
 DEFAULT_LEAD_MINUTES = 20
 
@@ -238,6 +238,7 @@ class ChatPicker(QDialog):
             self.list.addItem(item)
         layout.addWidget(self.list)
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        primary_ok(buttons)
         buttons.button(QDialogButtonBox.Ok).setText("Готово")
         buttons.button(QDialogButtonBox.Cancel).setText("Отмена")
         buttons.accepted.connect(self.accept)
@@ -271,6 +272,7 @@ class SettingsDialog(QDialog):
         layout.addWidget(self.tabs)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+        primary_ok(buttons)
         buttons.button(QDialogButtonBox.Save).setText("Сохранить")
         buttons.button(QDialogButtonBox.Cancel).setText("Отмена")
         buttons.accepted.connect(self.accept)

@@ -11,7 +11,7 @@ from .holidays import holiday_name
 from .delivery_dialog import money
 from .reminders import parse_deadline_time, parse_start_time
 from .shifts import Shift, WaterSchedule, window
-from .theme import C
+from .theme import C, primary_ok
 
 AHEAD_DAYS = 7  # сколько дней вперёд показать заказы «на потом»
 
@@ -109,6 +109,7 @@ class ShiftPlanDialog(QDialog):
         scroll.setWidget(label)
         layout.addWidget(scroll, 1)
         buttons = QDialogButtonBox(QDialogButtonBox.Ok)
+        primary_ok(buttons)
         buttons.button(QDialogButtonBox.Ok).setText("Понятно")
         buttons.accepted.connect(self.accept)
         layout.addWidget(buttons)

@@ -10,6 +10,7 @@ from PySide6.QtWidgets import QApplication, QMessageBox
 
 from app import theme
 from app.db import Database
+from app.hang_log import HangLog, unsent_report
 from app.main_window import MainWindow
 from app.settings_dialog import theme_mode
 from app.updater import cleanup_old
@@ -68,12 +69,21 @@ def main():
         app.installTranslator(translator)
 
     try:
+        from app.version import VERSION
+        hang_log = HangLog(os.path.dirname(data_path()), VERSION)  # зависла / упала — где именно
+    except Exception:  # noqa: BLE001 — без «чёрного ящика» программа всё равно работает
+        hang_log = None
+    try:
         db = Database(data_path())
     except Exception as e:  # noqa: BLE001 — показать пользователю понятную ошибку
         QMessageBox.critical(None, "Ошибка", f"Не удалось открыть базу данных:\n{e}")
         return 1
 
     window = MainWindow(db)
+    report = unsent_report(hang_log.path) if hang_log else ""
+    if report and ("не отвечает" in report or "Fatal Python error" in report):
+        window.telegram.queue("⚠ Программа в магазине зависала или закрывалась с ошибкой. Для разработчика "
+                              "(перешлите ему):\n\n" + report, key=f"hang:{int(time.time())}")
     # При автозапуске окно (и вход) появятся, когда откроют программу из трея.
     if "--minimized" not in sys.argv:
         if not window.login():

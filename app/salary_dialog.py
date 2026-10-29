@@ -10,6 +10,7 @@ from PySide6.QtWidgets import (
 from .db import Database
 from .holidays import parse_holidays
 from .salary import MAX_TIERS, PenaltyKind, Tier
+from .theme import primary_ok
 
 
 class TiersEditor(QWidget):
@@ -73,6 +74,7 @@ class EmployeeTiersDialog(QDialog):
         layout.addWidget(self.editor)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+        primary_ok(buttons)
         buttons.button(QDialogButtonBox.Save).setText("Сохранить")
         buttons.button(QDialogButtonBox.Cancel).setText("Отмена")
         buttons.accepted.connect(self.accept)
@@ -187,6 +189,7 @@ class HolidaysDialog(QDialog):
         self.edit = QPlainTextEdit(text)
         layout.addWidget(self.edit, 1)
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        primary_ok(buttons)
         buttons.button(QDialogButtonBox.Ok).setText("Готово")
         buttons.button(QDialogButtonBox.Cancel).setText("Отмена")
         buttons.accepted.connect(self.accept)
