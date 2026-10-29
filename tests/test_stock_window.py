@@ -54,16 +54,23 @@ def test_periods():
 
 def test_sell_from_window_and_close_shift(main, db):
     w = StockWindow(main)
+    assert [c.text() for c in w.chips.buttons()] == ["Все", "💐 Букеты", "Цветы", "Упаковка"]
+    assert len(w.grid.tiles) == 3
     w.search_edit.setText("букет")
-    assert w.catalog.rowCount() == 1
+    assert len(w.grid.tiles) == 1
     w._add_selected()
-    w._add_selected()  # второй раз — тот же букет, количество 2
-    assert w.cart.rowCount() == 1 and w.cart.cellWidget(0, 1).value() == 2
+    w.grid.tiles[0].on_add(*w.grid.tiles[0].key)  # плитка — тот же букет, количество 2
+    assert len(w.rows) == 1 and w.rows[0].qty.value() == 2
     w.search_edit.setText("крафт")
     w._add_selected()
-    w.discount_box.setValue(200)
+    w.set_adjust(200)
+    assert "Скидка" in w.adjust_label.text() and "5 750" in w.total_label.text()
     w._sell("card")
-    assert w.cart.rowCount() == 0 and w.today_table.rowCount() == 1
+    assert not w.rows and w.adjust == 0 and w.today_table.rowCount() == 1
+    assert w.chips.buttons()[0].text() == "⭐ Частые" and w.chips.checkedButton().text() == "Все"  # выбор не сбили
+    fresh = StockWindow(main)
+    assert fresh.chips.checkedButton().text() == "⭐ Частые" and len(fresh.grid.tiles) == 2
+    fresh.deleteLater()
     assert db.stock_of(db.products()[1].id) == 12  # роза: 30 − 2 × 9 (первым в списке идёт крафт)
     assert main.log[-1][0] == "Продажа" and "5 750" in main.log[-1][1]
 
@@ -109,3 +116,25 @@ def test_supply_and_recipe_dialogs(main, db):
     assert db.get_recipe(recipe.id).price == 3100
     dlg.deleteLater()
     edit.deleteLater()
+
+
+def test_markup_and_change_total(main, db):
+    w = StockWindow(main)
+    w.search_edit.setText("крафт")
+    w._add_selected()
+    w.rows[0].qty.setValue(2)
+    w.set_adjust(-100)  # наценка
+    assert "Наценка: +100" in w.adjust_label.text() and "400" in w.total_label.text()
+    w._sell("cash")
+    sale = db.sales_between(datetime.now() - timedelta(minutes=1), datetime.now() + timedelta(minutes=1))[0]
+    assert (sale.total, sale.discount) == (400, -100) and "наценка" in w.today_table.item(0, 1).text()
+    from app.stock_window import AdjustDialog, initials
+    dlg = AdjustDialog(None, False, 2000)
+    dlg.kind_box.setCurrentIndex(1)
+    dlg.value_box.setValue(10)
+    assert dlg.amount() == 200 and "1 800" in dlg.result.text()
+    assert initials("Гелий") == "ГЕ" and initials("Хриз Алтай") == "ХА" and initials("Букет «Нежность»") == "БН"
+    db.set_photo("product", db.products()[0].id, b"not an image")  # битое фото — плитка с буквами, без падения
+    w._refresh_catalog()
+    dlg.deleteLater()
+    w.deleteLater()

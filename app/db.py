@@ -862,6 +862,7 @@ class Database(ClientStore, StockStore):
         self.conn = sqlite3.connect(path)
         self.conn.executescript(SCHEMA)
         self.conn.executescript(STOCK_SCHEMA)
+        self.migrate_stock()
         existing = {r[1] for r in self.conn.execute("PRAGMA table_info(deliveries)")}
         for column, sql in MIGRATIONS.items():
             if column not in existing:

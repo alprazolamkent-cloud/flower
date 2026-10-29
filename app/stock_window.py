@@ -6,16 +6,17 @@
 from datetime import date, datetime, timedelta
 
 from PySide6.QtCore import QRectF, Qt
-from PySide6.QtGui import QColor, QFont, QKeySequence, QPainter, QShortcut
+from PySide6.QtGui import QColor, QFont, QKeySequence, QPainter, QPixmap, QShortcut
 from PySide6.QtWidgets import (
-    QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFormLayout, QFrame,
-    QGridLayout, QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit, QMessageBox, QPushButton,
-    QTableWidget, QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget,
+    QAbstractItemView, QButtonGroup, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFormLayout,
+    QFrame, QGridLayout, QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit, QMenu, QMessageBox, QPushButton,
+    QScrollArea, QSpinBox, QTableWidget, QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget,
 )
 
 from .db import UserError
 from .delivery_dialog import money, money_box
 from .icon import flower_icon
+from .photos import pick_photo, pixmap
 from .shifts import WRITEOFF_REASONS
 from .stock import CATEGORIES, PAYMENTS, CartLine, Product, Recipe, day_range, qty_text
 from .theme import C
@@ -168,7 +169,265 @@ class Card(QFrame):
         self.delta.setText(f"<span style='color:{delta[1]}'>{delta[0]}</span>")
 
 
+TILE_PHOTO = 150  # ширина плитки и фото в продаже
+
+
+def initials(title: str) -> str:
+    """«Гелий» → «ГЕ», «Хриз Алтай» → «ХА» — вместо фото, пока его нет."""
+    words = [w for w in title.replace("«", " ").replace("»", " ").split() if w[:1].isalpha()]
+    if len(words) >= 2:
+        return (words[0][0] + words[1][0]).upper()
+    return (words[0][:2] if words else "?").upper()
+
+
+class Tile(QFrame):
+    """Плитка товара или букета: фото, название, цена, остаток, «+»."""
+
+    def __init__(self, key: tuple[str, int], title: str, price: int, stock: str, low: bool,
+                 photo: QPixmap | None, on_add):
+        super().__init__()
+        self.key, self.on_add = key, on_add
+        self.setObjectName("tile")
+        self.setCursor(Qt.PointingHandCursor)
+        self.setStyleSheet(f"#tile {{ background: {C.card_bg}; border: 1px solid {C.card_border}; "
+                           "border-radius: 10px; }")
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(4)
+        image = QLabel()
+        image.setFixedSize(TILE_PHOTO, round(TILE_PHOTO * 0.72))
+        image.setAlignment(Qt.AlignCenter)
+        if photo is not None and not photo.isNull():
+            cover = photo.scaled(image.size(), Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
+            x, y = (cover.width() - image.width()) // 2, (cover.height() - image.height()) // 2
+            image.setPixmap(cover.copy(x, y, image.width(), image.height()))
+        else:
+            image.setText(("💐 " if key[0] == "recipe" else "") + initials(title))
+            image.setStyleSheet(f"color: {C.gray}; font-size: 20pt; font-weight: bold; "
+                                f"background: {C.info_bg}; border-radius: 6px;")
+        layout.addWidget(image)
+        name = QLabel(title)
+        name.setWordWrap(True)
+        name.setFixedSize(TILE_PHOTO, name.fontMetrics().lineSpacing() * 2 + 2)
+        name.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+        layout.addWidget(name)
+        line = QHBoxLayout()
+        price_label = QLabel(f"<b style='font-size:12pt'>{money(price)}</b>")
+        line.addWidget(price_label)
+        line.addStretch(1)
+        if stock:
+            left = QLabel(stock)
+            left.setStyleSheet(f"color: {C.red if low else C.gray}")
+            left.setToolTip("Осталось на складе")
+            line.addWidget(left)
+        layout.addLayout(line)
+        plus = QPushButton("+")
+        plus.setMinimumHeight(30)
+        plus.setStyleSheet("font-size: 15pt;")
+        plus.clicked.connect(lambda: on_add(*key))
+        layout.addWidget(plus)
+        self.ensurePolished()  # размер — уже с крупными шрифтами цены и «+» из стилей
+        self.setFixedSize(TILE_PHOTO + 16, self.sizeHint().height())  # все плитки одинаковые, сетка их не сжимает
+
+    def mouseReleaseEvent(self, event):  # noqa: N802 — щелчок по плитке, как «+»
+        if event.button() == Qt.LeftButton:
+            self.on_add(*self.key)
+
+
+class TileGrid(QWidget):
+    """Плитки сеткой: столбцов столько, сколько влезает по ширине."""
+
+    def __init__(self, on_add):
+        super().__init__()
+        self.on_add = on_add
+        self.tiles: list[Tile] = []
+        self.columns = 0
+        self.layout_ = QGridLayout(self)
+        self.layout_.setSpacing(10)
+        self.layout_.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        self.empty = _gray("Ничего не нашлось. Нет товара — добавьте его в «📦 Остатки» "
+                           "или продайте как «✏️ Своя позиция».")
+        self.layout_.addWidget(self.empty, 0, 0)
+
+    def set_tiles(self, tiles: list[tuple]):
+        for tile in self.tiles:  # убрать сразу: deleteLater сработает позже, а до того старые видны под новыми
+            self.layout_.removeWidget(tile)
+            tile.hide()
+            tile.deleteLater()
+        self.tiles = [Tile((kind, ident), title, price, stock, low, photo, self.on_add)
+                      for kind, ident, title, price, stock, low, photo in tiles]
+        self.columns = 0
+        self._place()
+
+    def _place(self):
+        columns = max(1, (self.width() - 10) // (TILE_PHOTO + 26))
+        if columns == self.columns and all(t.parent() is self for t in self.tiles):
+            return
+        self.columns = columns
+        for tile in self.tiles:
+            self.layout_.removeWidget(tile)
+        self.empty.setVisible(not self.tiles)
+        for i, tile in enumerate(self.tiles):
+            self.layout_.addWidget(tile, i // columns, i % columns)
+        rows = -(-len(self.tiles) // columns)
+        margins = self.layout_.contentsMargins()
+        height = self.tiles[0].height() if self.tiles else 0
+        # прокрутка сама не узнаёт высоту сетки — иначе она ужимает ряды, и плитки наезжают друг на друга
+        self.setMinimumHeight(rows * height + max(rows - 1, 0) * self.layout_.verticalSpacing()
+                              + margins.top() + margins.bottom())
+
+    def resizeEvent(self, event):  # noqa: N802
+        super().resizeEvent(event)
+        self._place()
+
+
+class CartRow(QFrame):
+    """Строка корзины: название, − сколько +, цена за штуку, сумма, ✕."""
+
+    def __init__(self, line: CartLine, unit: str, on_change, on_remove):
+        super().__init__()
+        self.key = (line.title, line.recipe_id, line.product_id)
+        self.setObjectName("cartrow")
+        self.setStyleSheet(f"#cartrow {{ border-bottom: 1px solid {C.card_border}; }}")
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(4, 6, 4, 6)
+        head = QHBoxLayout()
+        title = QLabel(line.title)
+        title.setWordWrap(True)
+        head.addWidget(title, 1)
+        remove = QPushButton("✕")
+        remove.setFixedWidth(28)
+        remove.setToolTip("Убрать из корзины")
+        remove.clicked.connect(lambda: on_remove(self))
+        head.addWidget(remove)
+        layout.addLayout(head)
+        row = QHBoxLayout()
+        minus = QPushButton("−")
+        plus = QPushButton("+")
+        for b in (minus, plus):
+            b.setFixedSize(34, 30)
+        self.qty = QDoubleSpinBox()
+        self.qty.setButtonSymbols(QDoubleSpinBox.NoButtons)
+        self.qty.setAlignment(Qt.AlignCenter)
+        self.qty.setFixedWidth(64)
+        self.qty.setRange(1 if line.recipe_id else 0.01, 100_000)
+        self.qty.setDecimals(0 if line.recipe_id or unit in ("", "шт") else 2)
+        self.qty.setValue(line.qty)
+        minus.clicked.connect(lambda: self.qty.setValue(max(self.qty.value() - 1, self.qty.minimum())))
+        plus.clicked.connect(lambda: self.qty.setValue(self.qty.value() + 1))
+        for widget in (minus, self.qty, plus):
+            row.addWidget(widget)
+        row.addWidget(QLabel("×"))
+        self.price = money_box()
+        self.price.setSingleStep(10)
+        self.price.setValue(line.price)
+        self.price.setToolTip("Цена за штуку — можно поменять")
+        row.addWidget(self.price)
+        row.addStretch(1)
+        self.amount = QLabel()
+        row.addWidget(self.amount)
+        layout.addLayout(row)
+        self.qty.valueChanged.connect(on_change)
+        self.price.valueChanged.connect(on_change)
+        self.qty.valueChanged.connect(self._show)
+        self.price.valueChanged.connect(self._show)
+        self._show()
+
+    def line(self) -> CartLine:
+        title, recipe_id, product_id = self.key
+        return CartLine(title, self.qty.value(), self.price.value(), recipe_id, product_id)
+
+    def _show(self):
+        self.amount.setText(f"<b>{money(self.line().amount)}</b>")
+
+
+class AdjustDialog(QDialog):
+    """Скидка или наценка: в рублях или процентах."""
+
+    def __init__(self, parent, markup: bool, gross: int):
+        super().__init__(parent)
+        self.gross = gross
+        self.setWindowTitle("Наценка" if markup else "Скидка")
+        form = QFormLayout(self)
+        form.addRow(QLabel(f"Сумма по корзине: <b>{money(gross)}</b>"))
+        line = QHBoxLayout()
+        self.value_box = QSpinBox()
+        self.value_box.setRange(0, 10_000_000)
+        self.value_box.setGroupSeparatorShown(True)
+        line.addWidget(self.value_box, 1)
+        self.kind_box = QComboBox()
+        self.kind_box.addItems(["₽", "%"])
+        line.addWidget(self.kind_box)
+        form.addRow("Наценка:" if markup else "Скидка:", line)
+        self.result = QLabel()
+        form.addRow(self.result)
+        quick = QHBoxLayout()
+        for pct in (5, 10, 15, 20):
+            b = QPushButton(f"{pct} %")
+            b.clicked.connect(lambda _=False, v=pct: (self.kind_box.setCurrentIndex(1), self.value_box.setValue(v)))
+            quick.addWidget(b)
+        form.addRow(quick)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        form.addRow(buttons)
+        self.markup = markup
+        self.value_box.valueChanged.connect(self._show)
+        self.kind_box.currentIndexChanged.connect(self._show)
+        self._show()
+        self.value_box.setFocus()
+
+    def amount(self) -> int:
+        value = self.value_box.value()
+        return round(self.gross * value / 100) if self.kind_box.currentIndex() == 1 else value
+
+    def _show(self):
+        total = self.gross + self.amount() if self.markup else max(self.gross - self.amount(), 0)
+        self.result.setText(f"К оплате: <b>{money(total)}</b>")
+
+
 # ----- диалоги -----
+
+class PhotoPicker(QWidget):
+    """Фото товара или букета для плитки в продаже: выбрать с компьютера или убрать."""
+
+    def __init__(self, photo: bytes | None):
+        super().__init__()
+        self.photo, self.changed = photo, False
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self.preview = QLabel()
+        self.preview.setFixedSize(96, 70)
+        self.preview.setAlignment(Qt.AlignCenter)
+        layout.addWidget(self.preview)
+        pick = QPushButton("📷 Выбрать…")
+        pick.clicked.connect(self._pick)
+        layout.addWidget(pick)
+        self.remove = QPushButton("Убрать")
+        self.remove.clicked.connect(lambda: self._set(None))
+        layout.addWidget(self.remove)
+        layout.addStretch(1)
+        self._show()
+
+    def _pick(self):
+        data = pick_photo(self, "Фото для плитки в продаже", 800, 85)
+        if data:
+            self._set(data)
+
+    def _set(self, data: bytes | None):
+        self.photo, self.changed = data, True
+        self._show()
+
+    def _show(self):
+        pm = pixmap(self.photo, 96)
+        if pm.isNull():
+            self.preview.setText("нет фото")
+            self.preview.setStyleSheet(f"color: {C.gray}; border: 1px dashed {C.card_border};")
+        else:
+            self.preview.setPixmap(pm.scaled(96, 70, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+            self.preview.setStyleSheet("")
+        self.remove.setVisible(self.photo is not None)
+
 
 class ProductDialog(QDialog):
     def __init__(self, parent, product: Product):
@@ -194,6 +453,8 @@ class ProductDialog(QDialog):
         self.min_box = qty_box()
         self.min_box.setValue(product.min_stock)
         form.addRow("Мало, если остаток ≤:", self.min_box)
+        self.photo = PhotoPicker(parent.db.photo_of("product", product.id) if product.id else None)
+        form.addRow("Фото:", self.photo)
         form.addRow(_gray("Себестоимость считается сама — по ценам из поставок. 0 в «мало» — не следить."))
         buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self.accept)
@@ -209,6 +470,8 @@ class ProductDialog(QDialog):
         except UserError as e:
             QMessageBox.warning(self, "Товар", str(e))
             return
+        if self.photo.changed:
+            self.parent().db.set_photo("product", p.id, self.photo.photo)
         super().accept()
 
 
@@ -367,6 +630,8 @@ class RecipeDialog(QDialog):
         self.price_box = money_box()
         self.price_box.setValue(recipe.price)
         form.addRow("Цена продажи:", self.price_box)
+        self.photo = PhotoPicker(db.photo_of("recipe", recipe.id) if recipe.id else None)
+        form.addRow("Фото:", self.photo)
         layout.addLayout(form)
         self.lines = LinesEditor(db.products(active_only=False), with_cost=False)
         for pid, qty in recipe.items:
@@ -404,6 +669,8 @@ class RecipeDialog(QDialog):
         except UserError as e:
             QMessageBox.warning(self, "Техкарта", str(e))
             return
+        if self.photo.changed:
+            self.db.set_photo("recipe", r.id, self.photo.photo)
         super().accept()
 
 
@@ -435,6 +702,7 @@ class StockWindow(QDialog):
         self.db = window.db
         self.setWindowTitle("Продажи и склад")
         self.setWindowIcon(flower_icon())
+        self._photos: dict[tuple[str, int], QPixmap] = {}
         self.resize(1180, 720)
         layout = QVBoxLayout(self)
         self.tabs = QTabWidget()
@@ -464,6 +732,7 @@ class StockWindow(QDialog):
             widget.setVisible(self.admin)
         page = self.tabs.currentIndex()
         if page == 0:
+            self._refresh_chips()
             self._refresh_catalog()
             self._refresh_today()
         elif page == 1:
@@ -481,98 +750,183 @@ class StockWindow(QDialog):
         page = QWidget()
         layout = QHBoxLayout(page)
         left = QVBoxLayout()
+        top = QHBoxLayout()
         self.search_edit = QLineEdit()
-        self.search_edit.setPlaceholderText("🔍 Букет или товар (Ctrl+F)…")
+        self.search_edit.setPlaceholderText("🔍 Букет или товар (Ctrl+F), Enter — в корзину")
         self.search_edit.setClearButtonEnabled(True)
         self.search_edit.textChanged.connect(self._refresh_catalog)
         self.search_edit.returnPressed.connect(self._add_selected)
-        left.addWidget(self.search_edit)
-        self.catalog = _table(["Что", "Цена", "Остаток"])
-        self.catalog.itemDoubleClicked.connect(lambda _: self._add_selected())
-        left.addWidget(self.catalog, 1)
-        row = QHBoxLayout()
-        add_btn = QPushButton("➕ В чек")
-        add_btn.clicked.connect(self._add_selected)
+        top.addWidget(self.search_edit, 1)
         free_btn = QPushButton("✏️ Своя позиция")
         free_btn.setToolTip("Букет не по техкарте, открытка, услуга — без списания со склада")
         free_btn.clicked.connect(self._add_free)
-        row.addWidget(add_btn)
-        row.addWidget(free_btn)
-        left.addLayout(row)
-        layout.addLayout(left, 4)
+        top.addWidget(free_btn)
+        left.addLayout(top)
+        self.chips_row = QHBoxLayout()
+        self.chips_row.setSpacing(6)
+        self.chips = QButtonGroup(self)
+        self.chips.setExclusive(True)
+        self.chips.buttonClicked.connect(lambda _: self._refresh_catalog())
+        left.addLayout(self.chips_row)
+        self.grid = TileGrid(self._add_tile)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setWidget(self.grid)
+        left.addWidget(scroll, 1)
+        layout.addLayout(left, 3)
 
         right = QVBoxLayout()
-        right.addWidget(QLabel("<b>Чек</b>"))
-        self.cart = _table(["Что", "Сколько", "Цена", "Сумма", ""])
-        self.cart.setMinimumHeight(180)
-        right.addWidget(self.cart, 2)
-        totals = QFormLayout()
-        self.discount_box = money_box()
-        self.discount_box.setSingleStep(50)
-        self.discount_box.valueChanged.connect(self._update_cart)
-        totals.addRow("Скидка:", self.discount_box)
+        head = QHBoxLayout()
+        head.addWidget(QLabel("<b style='font-size:13pt'>Корзина</b>"))
+        head.addStretch(1)
+        self.adjust_btn = QPushButton("🧮 Скидка / наценка")
+        menu = QMenu(self.adjust_btn)
+        menu.addAction("💸 Добавить наценку", lambda: self._ask_adjust(markup=True))
+        menu.addAction("％ Добавить скидку", lambda: self._ask_adjust(markup=False))
+        menu.addAction("✏️ Изменить сумму", self._ask_total)
+        self.adjust_btn.setMenu(menu)
+        head.addWidget(self.adjust_btn)
+        clear_btn = QPushButton("🗑")
+        clear_btn.setToolTip("Очистить корзину")
+        clear_btn.clicked.connect(self._clear_cart)
+        head.addWidget(clear_btn)
+        right.addLayout(head)
+        self.cart_box = QWidget()
+        self.cart_layout = QVBoxLayout(self.cart_box)
+        self.cart_layout.setContentsMargins(0, 0, 0, 0)
+        self.cart_empty = _gray("Корзина пуста — нажмите на букет или товар слева.")
+        self.cart_layout.addWidget(self.cart_empty)
+        self.cart_layout.addStretch(1)
+        cart_scroll = QScrollArea()
+        cart_scroll.setWidgetResizable(True)
+        cart_scroll.setWidget(self.cart_box)
+        cart_scroll.setMinimumHeight(200)
+        right.addWidget(cart_scroll, 3)
+        self.rows: list[CartRow] = []
+        self.adjust = 0  # больше нуля — скидка, меньше — наценка
+
+        self.sum_label = QLabel()
+        self.adjust_row = QHBoxLayout()
+        self.adjust_label = QLabel()
+        self.adjust_row.addWidget(self.adjust_label, 1)
+        self.adjust_clear = QPushButton("✕")
+        self.adjust_clear.setFixedWidth(28)
+        self.adjust_clear.setToolTip("Убрать скидку / наценку")
+        self.adjust_clear.clicked.connect(lambda: self.set_adjust(0))
+        self.adjust_row.addWidget(self.adjust_clear)
+        right.addWidget(self.sum_label)
+        right.addLayout(self.adjust_row)
+        total_row = QHBoxLayout()
+        total_row.addWidget(QLabel("К оплате"))
+        total_row.addStretch(1)
         self.total_label = QLabel()
-        totals.addRow("К оплате:", self.total_label)
-        right.addLayout(totals)
+        total_row.addWidget(self.total_label)
+        right.addLayout(total_row)
         pay = QHBoxLayout()
         self.pay_buttons = []
         for code, title in PAYMENTS.items():
             icon = {"cash": "💵", "card": "💳", "qr": "📱"}[code]
             button = QPushButton(f"{icon} {title}")
-            button.setMinimumHeight(44)
+            button.setMinimumHeight(46)
             button.clicked.connect(lambda _=False, c=code: self._sell(c))
             pay.addWidget(button)
             self.pay_buttons.append(button)
         right.addLayout(pay)
         self.shift_hint = _gray("")
         right.addWidget(self.shift_hint)
-        right.addWidget(_gray("🧾 Чек пробейте на кассе АТОЛ, как обычно. Здесь продажа нужна для склада и "
-                              "выручки смены: при сдаче смены суммы подставятся сами."))
-        right.addWidget(QLabel("<b>Продажи за сегодня</b>"))
-        self.today_table = _table(["Время", "Что", "Сумма", "Оплата", "Кто"], stretch=1)
-        right.addWidget(self.today_table, 3)
-        bottom = QHBoxLayout()
+        right.addWidget(_gray("🧾 Чек пробейте на АТОЛ, как обычно — при сдаче смены суммы подставятся сами."))
+        today_head = QHBoxLayout()
         self.today_total = QLabel()
-        bottom.addWidget(self.today_total, 1)
+        today_head.addWidget(self.today_total, 1)
         cancel_btn = QPushButton("↩ Отменить продажу")
         cancel_btn.setToolTip("Возврат или ошиблись: товар вернётся на склад, сумма уйдёт из выручки")
         cancel_btn.clicked.connect(self._cancel_sale)
-        bottom.addWidget(cancel_btn)
-        right.addLayout(bottom)
-        layout.addLayout(right, 5)
+        today_head.addWidget(cancel_btn)
+        right.addLayout(today_head)
+        self.today_table = _table(["Время", "Что", "Сумма", "Оплата", "Кто"], stretch=1)
+        right.addWidget(self.today_table, 2)
+        layout.addLayout(right, 2)
         self._update_cart()
         return page
 
+    def _refresh_chips(self):
+        current = self.chips.checkedButton().property("chip") if self.chips.checkedButton() else None
+        for button in self.chips.buttons():
+            self.chips.removeButton(button)
+            button.deleteLater()
+        while self.chips_row.count():
+            self.chips_row.takeAt(0)
+        names = []
+        if self.db.popular(datetime.now() - timedelta(days=30), 1):
+            names.append(("popular", "⭐ Частые"))
+        names.append(("all", "Все"))
+        if self.db.recipes():
+            names.append(("recipes", "💐 Букеты"))
+        present = {p.category for p in self.db.products()}
+        names += [(c, c) for c in (*CATEGORIES, *sorted(present - set(CATEGORIES))) if c in present]
+        for key, title in names:
+            chip = QPushButton(title)
+            chip.setCheckable(True)
+            chip.setProperty("chip", key)
+            chip.setCursor(Qt.PointingHandCursor)
+            chip.setStyleSheet(
+                f"QPushButton {{ border: 1px solid {C.card_border}; border-radius: 14px; padding: 4px 14px; }}"
+                f"QPushButton:checked {{ background: {C.green}; color: white; border-color: {C.green}; }}")
+            self.chips.addButton(chip)
+            self.chips_row.addWidget(chip)
+            chip.setChecked(key == (current or ("popular" if names[0][0] == "popular" else "all")))
+        if self.chips.checkedButton() is None and self.chips.buttons():
+            self.chips.buttons()[0].setChecked(True)
+        self.chips_row.addStretch(1)
+
     def _refresh_catalog(self):
+        self._photos.clear()  # фото могли поменять в «Остатках» / «Техкартах»
         query = self.search_edit.text().strip().lower()
-        rows = [("💐 " + r.title, r.price, "", ("recipe", r.id)) for r in self.db.recipes()
-                if query in r.title.lower()]
-        rows += [(p.name, p.price, f"{qty_text(p.stock)} {p.unit}", ("product", p.id), p.low)
-                 for p in self.db.products() if query in p.name.lower() or query in p.category.lower()]
-        self.catalog.setRowCount(len(rows))
-        for i, row in enumerate(rows):
-            self.catalog.setItem(i, 0, _item(row[0], row[3]))
-            self.catalog.setItem(i, 1, _item(money(row[1]), align_right=True))
-            stock = _item(row[2], align_right=True)
-            if len(row) > 4 and row[4]:
-                stock.setForeground(QColor(C.red))
-            self.catalog.setItem(i, 2, stock)
-        if rows:
-            self.catalog.selectRow(0)
+        chip = self.chips.checkedButton().property("chip") if self.chips.checkedButton() else "all"
+        if query:
+            chip = "all"  # ищем везде
+        recipes = {r.id: r for r in self.db.recipes()}
+        products = {p.id: p for p in self.db.products()}
+        if chip == "popular":
+            keys = self.db.popular(datetime.now() - timedelta(days=30), 24)
+        else:
+            keys = ([("recipe", r) for r in recipes] if chip in ("all", "recipes") else [])
+            keys += [("product", p.id) for p in products.values() if chip == "all" or p.category == chip]
+        tiles = []
+        for kind, ident in keys:
+            item = recipes.get(ident) if kind == "recipe" else products.get(ident)
+            if item is None:
+                continue
+            title = item.title if kind == "recipe" else item.name
+            if query and query not in title.lower() and (kind == "recipe" or query not in item.category.lower()):
+                continue
+            stock = "" if kind == "recipe" else f"{qty_text(item.stock)} {item.unit}"
+            tiles.append((kind, ident, title, item.price, stock, kind == "product" and item.low,
+                          self._photo(kind, ident) if item.has_photo else None))
+        self.grid.set_tiles(tiles)
+
+    def _photo(self, kind: str, ident: int) -> QPixmap:
+        key = (kind, ident)
+        if key not in self._photos:
+            self._photos[key] = pixmap(self.db.photo_of(kind, ident), TILE_PHOTO * 2)
+        return self._photos[key]
 
     def _add_selected(self):
-        row = self.catalog.currentRow()
-        if row < 0:
-            return
-        kind, ident = self.catalog.item(row, 0).data(Qt.UserRole)
+        """Enter в поиске — первая плитка в корзину."""
+        if self.grid.tiles:
+            kind, ident = self.grid.tiles[0].key
+            self._add_tile(kind, ident)
+            self.search_edit.selectAll()
+            self.search_edit.setFocus()
+
+    def _add_tile(self, kind: str, ident: int):
         if kind == "recipe":
             r = self.db.get_recipe(ident)
             self._add_line(CartLine(r.title, 1, r.price, recipe_id=r.id))
         else:
             p = self.db.get_product(ident)
-            self._add_line(CartLine(p.name, 1, p.price, product_id=p.id))
-        self.search_edit.selectAll()
-        self.search_edit.setFocus()
+            self._add_line(CartLine(p.name, 1, p.price, product_id=p.id), unit=p.unit)
 
     def _add_free(self):
         title, ok = QInputDialog.getText(self, "Своя позиция", "Что продали:")
@@ -582,77 +936,92 @@ class StockWindow(QDialog):
         if ok:
             self._add_line(CartLine(title.strip(), 1, price))
 
-    def _add_line(self, line: CartLine):
-        for row in range(self.cart.rowCount()):
-            same = self.cart.item(row, 0).data(Qt.UserRole)
-            if (line.recipe_id or line.product_id) and same == (line.title, line.recipe_id, line.product_id):
-                box = self.cart.cellWidget(row, 1)
-                box.setValue(box.value() + 1)
+    def _add_line(self, line: CartLine, unit: str = ""):
+        for row in self.rows:
+            if (line.recipe_id or line.product_id) and row.key == (line.title, line.recipe_id, line.product_id):
+                row.qty.setValue(row.qty.value() + 1)
                 return
-        row = self.cart.rowCount()
-        self.cart.insertRow(row)
-        self.cart.setItem(row, 0, _item(line.title, (line.title, line.recipe_id, line.product_id)))
-        qty = qty_box()
-        qty.setDecimals(0 if line.recipe_id else 2)
-        qty.setMinimum(1 if line.recipe_id else 0.01)
-        qty.setValue(line.qty)
-        qty.valueChanged.connect(self._update_cart)
-        self.cart.setCellWidget(row, 1, qty)
-        price = money_box()
-        price.setSingleStep(10)
-        price.setValue(line.price)
-        price.valueChanged.connect(self._update_cart)
-        self.cart.setCellWidget(row, 2, price)
-        self.cart.setItem(row, 3, _item("", align_right=True))
-        remove = QPushButton("✕")
-        remove.clicked.connect(lambda: self._remove_line(remove))
-        self.cart.setCellWidget(row, 4, remove)
+        row = CartRow(line, unit, self._update_cart, self._remove_row)
+        self.rows.append(row)
+        self.cart_layout.insertWidget(self.cart_layout.count() - 1, row)
         self._update_cart()
 
-    def _remove_line(self, button):
-        for row in range(self.cart.rowCount()):
-            if self.cart.cellWidget(row, 4) is button:
-                self.cart.removeRow(row)
-                break
+    def _remove_row(self, row: "CartRow"):
+        self.rows.remove(row)
+        self.cart_layout.removeWidget(row)
+        row.hide()
+        row.deleteLater()
         self._update_cart()
+
+    def _clear_cart(self):
+        for row in list(self.rows):
+            self._remove_row(row)
+        self.set_adjust(0)
 
     def cart_lines(self) -> list[CartLine]:
-        lines = []
-        for row in range(self.cart.rowCount()):
-            title, recipe_id, product_id = self.cart.item(row, 0).data(Qt.UserRole)
-            lines.append(CartLine(title, self.cart.cellWidget(row, 1).value(), self.cart.cellWidget(row, 2).value(),
-                                  recipe_id, product_id))
-        return lines
+        return [row.line() for row in self.rows]
+
+    def gross(self) -> int:
+        return sum(line.amount for line in self.cart_lines())
+
+    def set_adjust(self, value: int):
+        self.adjust = value
+        self._update_cart()
+
+    def _ask_adjust(self, markup: bool):
+        gross = self.gross()
+        if not gross:
+            return
+        dialog = AdjustDialog(self, markup, gross)
+        if dialog.exec() == QDialog.Accepted:
+            amount = dialog.amount()
+            self.set_adjust(-amount if markup else min(amount, gross))
+
+    def _ask_total(self):
+        gross = self.gross()
+        if not gross:
+            return
+        total, ok = QInputDialog.getInt(self, "Изменить сумму", f"Сумма по корзине {money(gross)}.\nК оплате, ₽:",
+                                        gross - self.adjust, 0, 10_000_000, 50)
+        if ok:
+            self.set_adjust(gross - total)
 
     def _update_cart(self):
         lines = self.cart_lines()
-        for row, line in enumerate(lines):
-            self.cart.item(row, 3).setText(money(line.amount))
         gross = sum(line.amount for line in lines)
-        total = gross - self.discount_box.value()
-        self.total_label.setText(f"<span style='font-size:18pt; font-weight:bold; "
-                                 f"color:{C.red if total < 0 else C.green}'>{money(total)}</span>")
-        for button in getattr(self, "pay_buttons", []):
-            button.setEnabled(bool(lines) and total >= 0)
+        if not lines:
+            self.adjust = 0
+        self.adjust = min(self.adjust, gross)
+        total = gross - self.adjust
+        self.cart_empty.setVisible(not lines)
+        self.sum_label.setText(f"Сумма: {money(gross)}" if self.adjust else "")
+        self.sum_label.setVisible(bool(self.adjust))
+        what = f"Скидка: −{money(self.adjust)}" if self.adjust > 0 else f"Наценка: +{money(-self.adjust)}"
+        self.adjust_label.setText(f"<span style='color:{C.green if self.adjust > 0 else C.orange}'>{what}</span>"
+                                  + (f" ({100 * abs(self.adjust) / gross:.0f} %)" if gross else ""))
+        for widget in (self.adjust_label, self.adjust_clear):
+            widget.setVisible(bool(self.adjust))
+        self.total_label.setText(f"<span style='font-size:20pt; font-weight:bold'>{money(total)}</span>")
+        self.adjust_btn.setEnabled(bool(lines))
+        for button in self.pay_buttons:
+            button.setEnabled(bool(lines))
         shift_id = self.main.sale_shift_id()
-        if hasattr(self, "shift_hint"):
-            self.shift_hint.setText("" if shift_id else "⚠ Смена не начата — продажа не попадёт в выручку смены.")
-            self.shift_hint.setStyleSheet(f"color: {C.orange}")
+        self.shift_hint.setText("" if shift_id else "⚠ Смена не начата — продажа не попадёт в выручку смены.")
+        self.shift_hint.setStyleSheet(f"color: {C.orange}")
 
     def _sell(self, payment: str):
         lines = self.cart_lines()
         try:
             sale_id = self.db.add_sale(lines, payment, self.user_id, self.main.sale_shift_id(), datetime.now(),
-                                       discount=self.discount_box.value())
+                                       discount=self.adjust)
         except UserError as e:
             QMessageBox.warning(self, "Продажа", str(e))
             return
-        total = sum(line.amount for line in lines) - self.discount_box.value()
+        total = sum(line.amount for line in lines) - self.adjust
         self.main.audit("Продажа", f"№{sale_id}: {money(total)}, {PAYMENTS[payment]} — "
                         + ", ".join(f"{x.title} × {qty_text(x.qty)}" for x in lines))
-        self.cart.setRowCount(0)
-        self.discount_box.setValue(0)
-        self._update_cart()
+        self._clear_cart()
+        self._refresh_chips()
         self._refresh_catalog()
         self._refresh_today()
         self.search_edit.setFocus()
@@ -662,8 +1031,10 @@ class StockWindow(QDialog):
         self.today_table.setRowCount(len(sales))
         total = count = 0
         for i, s in enumerate(sales):
-            cells = [f"{s.at:%H:%M}", s.what + (f" (скидка {money(s.discount)})" if s.discount else ""),
-                     money(s.total), PAYMENTS.get(s.payment, s.payment), s.user_name or "бот"]
+            extra = (f" (скидка {money(s.discount)})" if s.discount > 0
+                     else f" (наценка {money(-s.discount)})" if s.discount < 0 else "")
+            cells = [f"{s.at:%H:%M}", s.what + extra, money(s.total), PAYMENTS.get(s.payment, s.payment),
+                     s.user_name or "бот"]
             for col, text in enumerate(cells):
                 item = _item(text, s.id, align_right=col == 2)
                 if s.cancelled_at:
@@ -678,7 +1049,7 @@ class StockWindow(QDialog):
             if not s.cancelled_at:
                 total += s.total
                 count += 1
-        self.today_total.setText(f"Сегодня: <b>{count}</b> продаж на <b>{money(total)}</b>")
+        self.today_total.setText(f"<b>Продажи за сегодня:</b> {count} на <b>{money(total)}</b>")
 
     def _cancel_sale(self):
         row = self.today_table.currentRow()

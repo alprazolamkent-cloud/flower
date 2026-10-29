@@ -18,7 +18,8 @@ CREATE TABLE IF NOT EXISTS products (
     price     INTEGER NOT NULL DEFAULT 0,
     avg_cost  REAL    NOT NULL DEFAULT 0,
     min_stock REAL    NOT NULL DEFAULT 0,
-    active    INTEGER NOT NULL DEFAULT 1
+    active    INTEGER NOT NULL DEFAULT 1,
+    photo     BLOB
 );
 CREATE TABLE IF NOT EXISTS stock_moves (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -46,7 +47,8 @@ CREATE TABLE IF NOT EXISTS recipes (
     id     INTEGER PRIMARY KEY AUTOINCREMENT,
     title  TEXT    NOT NULL,
     price  INTEGER NOT NULL DEFAULT 0,
-    active INTEGER NOT NULL DEFAULT 1
+    active INTEGER NOT NULL DEFAULT 1,
+    photo  BLOB
 );
 CREATE TABLE IF NOT EXISTS recipe_items (
     recipe_id  INTEGER NOT NULL,
@@ -59,7 +61,7 @@ CREATE TABLE IF NOT EXISTS sales (
     shift_id      INTEGER,
     user_id       INTEGER,
     total         INTEGER NOT NULL,
-    discount      INTEGER NOT NULL DEFAULT 0,
+    discount      INTEGER NOT NULL DEFAULT 0,  -- меньше нуля — наценка
     flowers       INTEGER NOT NULL DEFAULT 0,
     cost          REAL    NOT NULL DEFAULT 0,
     payment       TEXT    NOT NULL,
@@ -81,6 +83,11 @@ CREATE TABLE IF NOT EXISTS sale_lines (
 );
 CREATE INDEX IF NOT EXISTS idx_sale_lines_sale ON sale_lines(sale_id);
 """
+
+STOCK_MIGRATIONS = {  # (таблица, столбец) → как добавить в базу прошлой версии
+    ("products", "photo"): "ALTER TABLE products ADD COLUMN photo BLOB",
+    ("recipes", "photo"): "ALTER TABLE recipes ADD COLUMN photo BLOB",
+}
 
 CATEGORIES = ("Цветы", "Зелень", "Упаковка", "Горшечные", "Сопутствующие")
 FLOWER_CATEGORIES = ("Цветы", "Зелень")  # что считается «цветами» в выручке смены
@@ -111,6 +118,7 @@ class Product:
     min_stock: float = 0
     active: bool = True
     stock: float = 0  # остаток (считается из движений)
+    has_photo: bool = False
 
     @property
     def low(self) -> bool:
@@ -124,6 +132,7 @@ class Recipe:
     price: int = 0
     active: bool = True
     items: list[tuple[int, float]] = field(default_factory=list)  # (товар, сколько)
+    has_photo: bool = False
 
 
 @dataclass
@@ -218,11 +227,13 @@ class StockStore:
 
     def products(self, active_only: bool = True) -> list[Product]:
         sql = ("SELECT p.id, p.name, p.category, p.unit, p.price, p.avg_cost, p.min_stock, p.active,"
-               " COALESCE((SELECT SUM(m.qty) FROM stock_moves m WHERE m.product_id = p.id), 0) FROM products p")
+               " COALESCE((SELECT SUM(m.qty) FROM stock_moves m WHERE m.product_id = p.id), 0),"
+               " p.photo IS NOT NULL FROM products p")
         if active_only:
             sql += " WHERE p.active = 1"
         rows = self.conn.execute(sql + " ORDER BY p.category, p.name COLLATE NOCASE").fetchall()
-        return [Product(r[0], r[1], r[2], r[3], r[4], r[5], r[6], bool(r[7]), round(r[8], 3)) for r in rows]
+        return [Product(r[0], r[1], r[2], r[3], r[4], r[5], r[6], bool(r[7]), round(r[8], 3), bool(r[9]))
+                for r in rows]
 
     def get_product(self, product_id: int) -> Product | None:
         return next((p for p in self.products(active_only=False) if p.id == product_id), None)
@@ -260,6 +271,31 @@ class StockStore:
     def _avg_cost(self, product_id: int) -> float:
         r = self.conn.execute("SELECT avg_cost FROM products WHERE id=?", (product_id,)).fetchone()
         return r[0] if r else 0
+
+    def migrate_stock(self):
+        for (table, column), sql in STOCK_MIGRATIONS.items():
+            if column not in {r[1] for r in self.conn.execute(f"PRAGMA table_info({table})")}:
+                self.conn.execute(sql)
+
+    def photo_of(self, kind: str, ident: int) -> bytes | None:
+        """Фото товара (kind="product") или букета по техкарте (kind="recipe")."""
+        table = {"product": "products", "recipe": "recipes"}[kind]
+        r = self.conn.execute(f"SELECT photo FROM {table} WHERE id=?", (ident,)).fetchone()
+        return r[0] if r else None
+
+    def set_photo(self, kind: str, ident: int, photo: bytes | None):
+        table = {"product": "products", "recipe": "recipes"}[kind]
+        self.conn.execute(f"UPDATE {table} SET photo=? WHERE id=?", (photo, ident))
+        self.conn.commit()
+
+    def popular(self, since: datetime, limit: int = 12) -> list[tuple[str, int]]:
+        """Что чаще всего продают: [("recipe", id) / ("product", id)] — для «⭐ Частые» в продаже."""
+        rows = self.conn.execute(
+            "SELECT l.recipe_id, l.product_id FROM sale_lines l JOIN sales s ON s.id = l.sale_id"
+            " WHERE s.at >= ? AND s.cancelled_at IS NULL AND (l.recipe_id IS NOT NULL OR l.product_id IS NOT NULL)"
+            " GROUP BY l.recipe_id, l.product_id ORDER BY COUNT(*) DESC, SUM(l.qty) DESC LIMIT ?",
+            (_ts(since), limit)).fetchall()
+        return [("recipe", r[0]) if r[0] is not None else ("product", r[1]) for r in rows]
 
     # ----- поставки -----
 
@@ -323,12 +359,13 @@ class StockStore:
     # ----- техкарты -----
 
     def recipes(self, active_only: bool = True) -> list[Recipe]:
-        sql = "SELECT id, title, price, active FROM recipes" + (" WHERE active = 1" if active_only else "")
+        sql = ("SELECT id, title, price, active, photo IS NOT NULL FROM recipes"
+               + (" WHERE active = 1" if active_only else ""))
         result = []
         for r in self.conn.execute(sql + " ORDER BY title COLLATE NOCASE").fetchall():
             items = self.conn.execute("SELECT product_id, qty FROM recipe_items WHERE recipe_id=? ORDER BY rowid",
                                       (r[0],)).fetchall()
-            result.append(Recipe(r[0], r[1], r[2], bool(r[3]), [tuple(x) for x in items]))
+            result.append(Recipe(r[0], r[1], r[2], bool(r[3]), [tuple(x) for x in items], bool(r[4])))
         return result
 
     def get_recipe(self, recipe_id: int) -> Recipe | None:
@@ -367,6 +404,7 @@ class StockStore:
 
     def add_sale(self, lines: list[CartLine], payment: str, user_id: int | None, shift_id: int | None, now: datetime,
                  discount: int = 0, note: str = "", flowers: bool = False) -> int:
+        # discount < 0 — наценка (срочно, доставка до двери, сложная упаковка): прибавляется к сумме
         """Продажа: товары и цветы из техкарт списываются со склада сами. Остаток может уйти в минус —
         тогда в «Остатках» это будет видно (значит, поставку не внесли).
         flowers — свободные позиции (без склада) тоже считать цветами (букет из заказа бота)."""
@@ -376,8 +414,10 @@ class StockStore:
         if payment not in PAYMENTS:
             raise StockError("Выберите способ оплаты.")
         gross = sum(line.amount for line in lines)
-        if any(line.price < 0 for line in lines) or not 0 <= discount <= gross:
-            raise StockError("Скидка не может быть больше суммы и меньше нуля.")
+        if any(line.price < 0 for line in lines):
+            raise StockError("Цена не может быть отрицательной.")
+        if discount > gross:
+            raise StockError("Скидка не может быть больше суммы.")
         total = gross - discount
         flowers_gross = 0
         sale_id = self.conn.execute(
@@ -482,7 +522,7 @@ class StockStore:
             report.count += 1
             report.revenue += s.total
             report.cost += s.cost
-            report.discount += s.discount
+            report.discount += max(s.discount, 0)
             day = s.at.date()
             report.by_day[day] = report.by_day.get(day, 0) + s.total
             who = s.user_name or "Бот / без смены"
