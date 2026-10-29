@@ -19,7 +19,7 @@ from .db import ORDER_STATUS, ClientOrder, ShowcaseItem, UserError
 from .delivery_dialog import money, money_box
 from .icon import flower_icon
 from .photos import PhotoViewer, pick_photo, pixmap
-from .theme import C
+from .theme import C, primary
 
 STATUS_COLORS = {"new": "orange", "priced": "blue", "paid_claimed": "red", "confirmed": "green", "rejected": "gray"}
 NEEDS_ACTION = ("new", "paid_claimed")  # ждут флориста: назначить сумму / проверить оплату
@@ -172,6 +172,7 @@ class ClientCenter(QDialog):
         self.price_btn = QPushButton("💳 Отправить сумму и реквизиты")
         self.price_btn.clicked.connect(self._send_price)
         self.confirm_btn = QPushButton("✅ Оплата пришла — принять заказ")
+        primary(self.confirm_btn)
         self.confirm_btn.clicked.connect(self._confirm)
         for b in (self.price_btn, self.confirm_btn):
             b.setMinimumHeight(34)

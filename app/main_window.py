@@ -39,7 +39,7 @@ from .shifts import (
     PROBLEM_STATUSES, REMIND_BEFORE_MINUTES, Shift, business_day, opening_business_day, short_name, window,
 )
 from .templates_dialog import load_templates
-from .theme import C
+from .theme import C, primary
 from .update_ui import UpdateController
 from .assembly_dialog import SNOOZE, AssemblyReminder
 from .client_bot import ClientBot, chat_configured
@@ -353,6 +353,7 @@ class MainWindow(QMainWindow):
 
         buttons = QHBoxLayout()
         add_btn = QPushButton("➕ Добавить доставку")
+        primary(add_btn)
         add_btn.clicked.connect(self.add_delivery)
         self.edit_btn = QPushButton("✏️ Изменить")
         self.edit_btn.clicked.connect(self.edit_delivery)
@@ -1578,7 +1579,8 @@ class MainWindow(QMainWindow):
     def update_clients_button(self):
         n = needs_action(self.db)
         self.clients_btn.setText(f"🛍 Клиенты ({n})" if n else "🛍 Клиенты")
-        self.clients_btn.setStyleSheet(f"color: {C.orange}; font-weight: bold;" if n else "")
+        self.clients_btn.setStyleSheet(f"QPushButton {{ background: {C.pink}; color: white; border-color: {C.pink}; "
+                                       "font-weight: bold; }" if n else "")
 
     def open_clients(self, chat_id: str = ""):
         if self.client_center is None:

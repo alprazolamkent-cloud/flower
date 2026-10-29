@@ -22,7 +22,7 @@ from .icon import flower_icon
 from .photos import pick_photo, pixmap
 from .shifts import WRITEOFF_REASONS
 from .stock import CATEGORIES, PAYMENTS, CartLine, Product, Recipe, day_range, qty_text
-from .theme import C
+from .theme import C, primary
 
 MOVE_KINDS = {"supply": "Поставка", "sale": "Продажа", "writeoff": "Списание", "count": "Инвентаризация",
               "return": "Возврат", "assembly": "Собрали букет", "disassembly": "Разобрали букет",
@@ -207,8 +207,9 @@ class Tile(QFrame):
             image.setPixmap(cover.copy(x, y, image.width(), image.height()))
         else:
             image.setText(("💐 " if key[0] == "recipe" else "") + initials(title))
-            image.setStyleSheet(f"color: {C.gray}; font-size: 20pt; font-weight: bold; "
-                                f"background: {C.info_bg}; border-radius: 6px;")
+            soft, ink = (C.pink_soft, C.pink) if key[0] == "recipe" else (C.accent_soft, C.accent)
+            image.setStyleSheet(f"color: {ink}; font-size: 20pt; font-weight: bold; "
+                                f"background: {soft}; border-radius: 8px;")
         layout.addWidget(image)
         name = QLabel(title)
         name.setWordWrap(True)
@@ -227,7 +228,8 @@ class Tile(QFrame):
         layout.addLayout(line)
         plus = QPushButton("+")
         plus.setMinimumHeight(30)
-        plus.setStyleSheet("font-size: 15pt;")
+        plus.setStyleSheet(f"QPushButton {{ font-size: 15pt; color: {C.accent}; border-color: {C.accent}; }}"
+                           f"QPushButton:hover {{ background: {C.accent}; color: {C.on_accent}; }}")
         plus.clicked.connect(lambda: on_add(*key))
         layout.addWidget(plus)
         self.ensurePolished()  # размер — уже с крупными шрифтами цены и «+» из стилей
@@ -301,6 +303,7 @@ class CartRow(QFrame):
         head.addWidget(title, 1)
         remove = QPushButton("✕")
         remove.setFixedWidth(28)
+        remove.setProperty("small", True)
         remove.setToolTip("Убрать из корзины")
         remove.clicked.connect(lambda: on_remove(self))
         head.addWidget(remove)
@@ -310,8 +313,9 @@ class CartRow(QFrame):
         plus = QPushButton("+")
         for b in (minus, plus):
             b.setFixedSize(34, 30)
+            b.setProperty("small", True)
         self.qty = QDoubleSpinBox()
-        self.qty.setButtonSymbols(QDoubleSpinBox.NoButtons)
+        self.qty.setProperty("small", True)  # стрелочки нулевой ширины: NoButtons под стилем ломает поле в Qt
         self.qty.setAlignment(Qt.AlignCenter)
         self.qty.setFixedWidth(64)
         self.qty.setRange(1 if line.recipe_id else 0.01, 100_000)
@@ -595,6 +599,7 @@ class LinesEditor(QWidget):
             self.table.setItem(row, 3, _item("", align_right=True))
             col = 4
         remove = QPushButton("✕")
+        remove.setProperty("small", True)
         remove.setToolTip("Убрать строку")
         remove.clicked.connect(lambda: self._remove(remove))
         self.table.setCellWidget(row, col, remove)
@@ -1038,6 +1043,7 @@ class StockWindow(QDialog):
         self.adjust_row.addWidget(self.adjust_label, 1)
         self.adjust_clear = QPushButton("✕")
         self.adjust_clear.setFixedWidth(28)
+        self.adjust_clear.setProperty("small", True)
         self.adjust_clear.setToolTip("Убрать скидку / наценку")
         self.adjust_clear.clicked.connect(lambda: self.set_adjust(0))
         self.adjust_label.setWordWrap(True)
@@ -1056,6 +1062,7 @@ class StockWindow(QDialog):
             icon = {"cash": "💵", "card": "💳", "qr": "📱"}[code]
             button = QPushButton(f"{icon} {title}")
             button.setMinimumHeight(46)
+            primary(button)
             button.clicked.connect(lambda _=False, c=code: self._sell(c))
             pay.addWidget(button)
             self.pay_buttons.append(button)
@@ -1099,7 +1106,7 @@ class StockWindow(QDialog):
             chip.setCursor(Qt.PointingHandCursor)
             chip.setStyleSheet(
                 f"QPushButton {{ border: 1px solid {C.card_border}; border-radius: 14px; padding: 4px 14px; }}"
-                f"QPushButton:checked {{ background: {C.green}; color: white; border-color: {C.green}; }}")
+                f"QPushButton:checked {{ background: {C.accent}; color: {C.on_accent}; border-color: {C.accent}; }}")
             self.chips.addButton(chip)
             self.chips_row.addWidget(chip)
             chip.setChecked(key == (current or ("popular" if names[0][0] == "popular" else "all")))
