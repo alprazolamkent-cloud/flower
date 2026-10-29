@@ -62,6 +62,7 @@ CREATE TABLE IF NOT EXISTS sales (
     user_id       INTEGER,
     total         INTEGER NOT NULL,
     discount      INTEGER NOT NULL DEFAULT 0,  -- меньше нуля — наценка
+    adjust_note   TEXT    NOT NULL DEFAULT '',  -- почему скидка / наценка
     flowers       INTEGER NOT NULL DEFAULT 0,
     cost          REAL    NOT NULL DEFAULT 0,
     payment       TEXT    NOT NULL,
@@ -87,6 +88,7 @@ CREATE INDEX IF NOT EXISTS idx_sale_lines_sale ON sale_lines(sale_id);
 STOCK_MIGRATIONS = {  # (таблица, столбец) → как добавить в базу прошлой версии
     ("products", "photo"): "ALTER TABLE products ADD COLUMN photo BLOB",
     ("recipes", "photo"): "ALTER TABLE recipes ADD COLUMN photo BLOB",
+    ("sales", "adjust_note"): "ALTER TABLE sales ADD COLUMN adjust_note TEXT NOT NULL DEFAULT ''",
 }
 
 CATEGORIES = ("Цветы", "Зелень", "Упаковка", "Горшечные", "Сопутствующие")
@@ -165,6 +167,16 @@ class Sale:
     cancelled_at: datetime | None
     cancel_reason: str
     lines: list[tuple[str, float, int]] = field(default_factory=list)  # (что, сколько, цена)
+    adjust_note: str = ""
+
+    @property
+    def adjust_text(self) -> str:
+        """«скидка 200 ₽ — постоянный клиент» / «наценка 300 ₽ — срочно» / ""."""
+        if not self.discount:
+            return ""
+        what = "скидка" if self.discount > 0 else "наценка"
+        amount = f"{abs(self.discount):,}".replace(",", " ")
+        return f"{what} {amount} ₽" + (f" — {self.adjust_note}" if self.adjust_note else "")
 
     @property
     def what(self) -> str:
@@ -193,6 +205,8 @@ class SalesReport:
     by_user: dict[str, tuple[int, int]] = field(default_factory=dict)  # кто → (продаж, выручка)
     by_payment: dict[str, int] = field(default_factory=dict)
     top: list[tuple[str, float, int]] = field(default_factory=list)  # (что, сколько, выручка)
+    markup: int = 0
+    adjust_notes: dict[str, int] = field(default_factory=dict)  # «Скидка: постоянный клиент» → сумма
 
     @property
     def average(self) -> int:
@@ -403,8 +417,9 @@ class StockStore:
     # ----- продажи -----
 
     def add_sale(self, lines: list[CartLine], payment: str, user_id: int | None, shift_id: int | None, now: datetime,
-                 discount: int = 0, note: str = "", flowers: bool = False) -> int:
-        # discount < 0 — наценка (срочно, доставка до двери, сложная упаковка): прибавляется к сумме
+                 discount: int = 0, note: str = "", flowers: bool = False, adjust_note: str = "") -> int:
+        # discount < 0 — наценка (срочно, доставка до двери, сложная упаковка): прибавляется к сумме;
+        # adjust_note — почему скидка или наценка (без причины их не делают)
         """Продажа: товары и цветы из техкарт списываются со склада сами. Остаток может уйти в минус —
         тогда в «Остатках» это будет видно (значит, поставку не внесли).
         flowers — свободные позиции (без склада) тоже считать цветами (букет из заказа бота)."""
@@ -418,11 +433,15 @@ class StockStore:
             raise StockError("Цена не может быть отрицательной.")
         if discount > gross:
             raise StockError("Скидка не может быть больше суммы.")
+        if discount and not adjust_note.strip():
+            raise StockError(f"Напишите, почему {'скидка' if discount > 0 else 'наценка'}.")
         total = gross - discount
         flowers_gross = 0
         sale_id = self.conn.execute(
-            "INSERT INTO sales (at, shift_id, user_id, total, discount, payment, note) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (_ts(now), shift_id, user_id, total, discount, payment, note.strip())).lastrowid
+            "INSERT INTO sales (at, shift_id, user_id, total, discount, payment, note, adjust_note)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (_ts(now), shift_id, user_id, total, discount, payment, note.strip(),
+             adjust_note.strip() if discount else "")).lastrowid
         sale_cost = 0.0
         for line in lines:
             cost = 0.0
@@ -472,7 +491,7 @@ class StockStore:
     def _sales(self, where: str, params: tuple) -> list[Sale]:
         rows = self.conn.execute(
             "SELECT s.id, s.at, s.shift_id, s.user_id, COALESCE(NULLIF(u.name, ''), u.login, ''), s.total, s.discount,"
-            " s.flowers, s.cost, s.payment, s.note, s.cancelled_at, s.cancel_reason"
+            " s.flowers, s.cost, s.payment, s.note, s.cancelled_at, s.cancel_reason, s.adjust_note"
             f" FROM sales s LEFT JOIN users u ON u.id = s.user_id WHERE {where} ORDER BY s.at DESC, s.id DESC",
             params).fetchall()
         result = []
@@ -481,7 +500,7 @@ class StockStore:
                                       (r[0],)).fetchall()
             result.append(Sale(r[0], datetime.fromisoformat(r[1]), r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9],
                                r[10], datetime.fromisoformat(r[11]) if r[11] else None, r[12],
-                               [tuple(x) for x in lines]))
+                               [tuple(x) for x in lines], r[13]))
         return result
 
     def sales_between(self, start: datetime, end: datetime, include_cancelled: bool = True) -> list[Sale]:
@@ -523,6 +542,10 @@ class StockStore:
             report.revenue += s.total
             report.cost += s.cost
             report.discount += max(s.discount, 0)
+            report.markup += max(-s.discount, 0)
+            if s.discount:
+                key = ("Скидка" if s.discount > 0 else "Наценка") + (f": {s.adjust_note}" if s.adjust_note else "")
+                report.adjust_notes[key] = report.adjust_notes.get(key, 0) + abs(s.discount)
             day = s.at.date()
             report.by_day[day] = report.by_day.get(day, 0) + s.total
             who = s.user_name or "Бот / без смены"

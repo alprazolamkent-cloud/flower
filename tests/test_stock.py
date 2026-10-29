@@ -50,12 +50,15 @@ def test_sale_by_recipe_deducts_stock_and_cancel_returns(shop):
     db, user, shift, rose, eucalyptus, paper = shop
     recipe = db.save_recipe(Recipe(0, "Букет «Классика»", 3500, items=[(rose, 11), (eucalyptus, 3), (paper, 2)]))
     assert db.recipe_cost(db.get_recipe(recipe)) == 11 * 80 + 3 * 30 + 2 * 20
-    sale = db.add_sale([CartLine("Букет «Классика»", 1, 3500, recipe_id=recipe),
-                        CartLine("Открытка", 1, 100)], "card", user.id, shift.id, NOW, discount=360)
+    lines = [CartLine("Букет «Классика»", 1, 3500, recipe_id=recipe), CartLine("Открытка", 1, 100)]
+    with pytest.raises(UserError, match="почему скидка"):
+        db.add_sale(lines, "card", user.id, shift.id, NOW, discount=360)
+    sale = db.add_sale(lines, "card", user.id, shift.id, NOW, discount=360, adjust_note="Постоянный клиент")
     assert (db.stock_of(rose), db.stock_of(eucalyptus), db.stock_of(paper)) == (39, 17, 8)
     s = db.sales_of_shift(shift.id)[0]
     assert s.total == 3240 and s.flowers == 3150  # букет 3500 из 3600, скидка пропорционально
     assert s.cost == 1010 and s.user_name == "Анна" and "Открытка" in s.what
+    assert s.adjust_text == "скидка 360 ₽ — Постоянный клиент"
     db.cancel_sale(sale, "Передумал", user.id, NOW)
     assert db.stock_of(rose) == 50 and db.shift_sales(shift.id).revenue == 0
     with pytest.raises(UserError, match="уже отменена"):
@@ -110,3 +113,15 @@ def test_sales_report(shop):
     assert report.by_user == {"Анна": (1, 1250), "Бот / без смены": (1, 200)}
     assert report.top[0] == ("Роза красная", 5, 1250)
     assert db.stock_value() == 45 * 80 + 18 * 30 + 10 * 20
+
+
+def test_markup_note_in_report(shop):
+    db, user, shift, rose, *_ = shop
+    db.add_sale([CartLine("Роза", 3, 250, product_id=rose)], "cash", user.id, shift.id, NOW, discount=-300,
+                adjust_note="Срочно, за 30 минут")
+    db.add_sale([CartLine("Роза", 2, 250, product_id=rose)], "card", user.id, shift.id, NOW, discount=100,
+                adjust_note="Постоянный клиент")
+    report = db.sales_report(*day_range(NOW.date(), NOW.date()))
+    assert (report.revenue, report.discount, report.markup) == (1050 + 400, 100, 300)
+    assert report.adjust_notes == {"Наценка: Срочно, за 30 минут": 300, "Скидка: Постоянный клиент": 100}
+    assert db.sales_of_shift(shift.id)[1].adjust_text == "наценка 300 ₽ — Срочно, за 30 минут"

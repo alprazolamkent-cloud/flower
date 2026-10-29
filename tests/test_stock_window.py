@@ -3,7 +3,7 @@
 from datetime import date, datetime, time, timedelta
 
 import pytest
-from PySide6.QtWidgets import QWidget
+from PySide6.QtWidgets import QDialog, QMessageBox, QWidget
 
 from app.db import Database
 from app.shift_dialogs import CloseShiftDialog
@@ -63,8 +63,9 @@ def test_sell_from_window_and_close_shift(main, db):
     assert len(w.rows) == 1 and w.rows[0].qty.value() == 2
     w.search_edit.setText("крафт")
     w._add_selected()
-    w.set_adjust(200)
-    assert "Скидка" in w.adjust_label.text() and "5 750" in w.total_label.text()
+    w.set_adjust(200, "Постоянный клиент")
+    assert "Скидка" in w.adjust_label.text() and "Постоянный клиент" in w.adjust_label.text()
+    assert "5 750" in w.total_label.text()
     w._sell("card")
     assert not w.rows and w.adjust == 0 and w.today_table.rowCount() == 1
     assert w.chips.buttons()[0].text() == "⭐ Частые" and w.chips.checkedButton().text() == "Все"  # выбор не сбили
@@ -72,7 +73,7 @@ def test_sell_from_window_and_close_shift(main, db):
     assert fresh.chips.checkedButton().text() == "⭐ Частые" and len(fresh.grid.tiles) == 2
     fresh.deleteLater()
     assert db.stock_of(db.products()[1].id) == 12  # роза: 30 − 2 × 9 (первым в списке идёт крафт)
-    assert main.log[-1][0] == "Продажа" and "5 750" in main.log[-1][1]
+    assert main.log[-1][0] == "Продажа" and "5 750" in main.log[-1][1] and "Постоянный клиент" in main.log[-1][1]
 
     w.tabs.setCurrentIndex(1)
     w.stock_table.selectRow(0)  # «Крафт»: раздел «Упаковка» по алфавиту раньше «Цветов»
@@ -118,21 +119,33 @@ def test_supply_and_recipe_dialogs(main, db):
     edit.deleteLater()
 
 
-def test_markup_and_change_total(main, db):
+def test_markup_and_change_total(main, db, monkeypatch):
     w = StockWindow(main)
     w.search_edit.setText("крафт")
     w._add_selected()
     w.rows[0].qty.setValue(2)
-    w.set_adjust(-100)  # наценка
+    w.set_adjust(-100, "Срочно")  # наценка
     assert "Наценка: +100" in w.adjust_label.text() and "400" in w.total_label.text()
     w._sell("cash")
     sale = db.sales_between(datetime.now() - timedelta(minutes=1), datetime.now() + timedelta(minutes=1))[0]
-    assert (sale.total, sale.discount) == (400, -100) and "наценка" in w.today_table.item(0, 1).text()
+    assert (sale.total, sale.discount, sale.adjust_note) == (400, -100, "Срочно")
+    assert "наценка 100 ₽ — Срочно" in w.today_table.item(0, 1).text()
     from app.stock_window import AdjustDialog, initials
-    dlg = AdjustDialog(None, False, 2000)
+    dlg = AdjustDialog(None, "discount", 2000)
     dlg.kind_box.setCurrentIndex(1)
     dlg.value_box.setValue(10)
-    assert dlg.amount() == 200 and "1 800" in dlg.result.text()
+    assert dlg.amount() == 200 and "1 800" in dlg.result_label.text()
+    warned = []
+    monkeypatch.setattr(QMessageBox, "warning", lambda *a: warned.append(a[2]))
+    dlg.note_box.setCurrentText("")
+    dlg.accept()  # без причины не применить
+    assert warned and "причину" in warned[0] and dlg.result() != QDialog.Accepted
+    total = AdjustDialog(None, "total", 2000)
+    total.value_box.setValue(2300)
+    assert total.amount() == -300 and "наценка 300" in total.result_label.text()
+    markup = AdjustDialog(None, "markup", 2000)
+    markup.value_box.setValue(150)
+    assert markup.amount() == -150 and markup.note_box.itemText(0) == "Срочно"
     assert initials("Гелий") == "ГЕ" and initials("Хриз Алтай") == "ХА" and initials("Букет «Нежность»") == "БН"
     db.set_photo("product", db.products()[0].id, b"not an image")  # битое фото — плитка с буквами, без падения
     w._refresh_catalog()

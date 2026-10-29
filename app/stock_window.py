@@ -3,6 +3,7 @@
 Чек сотрудник пробивает на кассе АТОЛ сам — здесь продажа нужна для склада, выручки смены и отчётов.
 """
 
+import html
 from datetime import date, datetime, timedelta
 
 from PySide6.QtCore import QRectF, Qt
@@ -341,13 +342,19 @@ class CartRow(QFrame):
         self.amount.setText(f"<b>{money(self.line().amount)}</b>")
 
 
-class AdjustDialog(QDialog):
-    """Скидка или наценка: в рублях или процентах."""
+ADJUST_REASONS = {
+    "discount": ("Постоянный клиент", "Вялый / сломанный цветок", "Акция", "Не было сдачи — округлили"),
+    "markup": ("Срочно", "Сложная упаковка", "Доставка к двери", "Подбор под заказ"),
+}
 
-    def __init__(self, parent, markup: bool, gross: int):
+
+class AdjustDialog(QDialog):
+    """Скидка или наценка (в ₽ или %) или новая итоговая сумма — всегда с причиной."""
+
+    def __init__(self, parent, mode: str, gross: int, current: int = 0, note: str = ""):
         super().__init__(parent)
-        self.gross = gross
-        self.setWindowTitle("Наценка" if markup else "Скидка")
+        self.mode, self.gross = mode, gross  # mode: "discount", "markup" или "total"
+        self.setWindowTitle({"discount": "Скидка", "markup": "Наценка", "total": "Изменить сумму"}[mode])
         form = QFormLayout(self)
         form.addRow(QLabel(f"Сумма по корзине: <b>{money(gross)}</b>"))
         line = QHBoxLayout()
@@ -357,33 +364,68 @@ class AdjustDialog(QDialog):
         line.addWidget(self.value_box, 1)
         self.kind_box = QComboBox()
         self.kind_box.addItems(["₽", "%"])
+        if mode == "total":
+            self.kind_box.hide()
+            self.value_box.setSuffix(" ₽")
+            self.value_box.setSingleStep(50)
+            self.value_box.setValue(gross - current)
         line.addWidget(self.kind_box)
-        form.addRow("Наценка:" if markup else "Скидка:", line)
-        self.result = QLabel()
-        form.addRow(self.result)
-        quick = QHBoxLayout()
-        for pct in (5, 10, 15, 20):
-            b = QPushButton(f"{pct} %")
-            b.clicked.connect(lambda _=False, v=pct: (self.kind_box.setCurrentIndex(1), self.value_box.setValue(v)))
-            quick.addWidget(b)
-        form.addRow(quick)
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        form.addRow(buttons)
-        self.markup = markup
+        form.addRow({"discount": "Скидка:", "markup": "Наценка:", "total": "К оплате:"}[mode], line)
+        if mode != "total":
+            quick = QHBoxLayout()
+            for pct in (5, 10, 15, 20):
+                b = QPushButton(f"{pct} %")
+                b.clicked.connect(lambda _=False, v=pct: (self.kind_box.setCurrentIndex(1), self.value_box.setValue(v)))
+                quick.addWidget(b)
+            form.addRow(quick)
+        self.note_box = QComboBox()
+        self.note_box.setEditable(True)
+        reasons = ADJUST_REASONS["markup" if mode == "markup" else "discount"]
+        self.note_box.addItems(reasons if mode != "total" else (*ADJUST_REASONS["discount"], *ADJUST_REASONS["markup"]))
+        self.note_box.setCurrentText(note)
+        self.note_box.lineEdit().setPlaceholderText("Почему — обязательно (выберите или напишите)")
+        form.addRow("Причина:", self.note_box)
+        self.result_label = QLabel()
+        form.addRow(self.result_label)
+        form.addRow(_buttons(self, "Применить"))
         self.value_box.valueChanged.connect(self._show)
         self.kind_box.currentIndexChanged.connect(self._show)
         self._show()
         self.value_box.setFocus()
+        self.value_box.selectAll()
 
     def amount(self) -> int:
+        """Скидка (больше нуля) или наценка (меньше нуля) в рублях."""
         value = self.value_box.value()
-        return round(self.gross * value / 100) if self.kind_box.currentIndex() == 1 else value
+        if self.mode == "total":
+            return self.gross - value
+        rub = round(self.gross * value / 100) if self.kind_box.currentIndex() == 1 else value
+        return -rub if self.mode == "markup" else min(rub, self.gross)
+
+    def note(self) -> str:
+        return self.note_box.currentText().strip()
 
     def _show(self):
-        total = self.gross + self.amount() if self.markup else max(self.gross - self.amount(), 0)
-        self.result.setText(f"К оплате: <b>{money(total)}</b>")
+        adjust = self.amount()
+        what = "" if not adjust else f" ({'скидка' if adjust > 0 else 'наценка'} {money(abs(adjust))})"
+        self.result_label.setText(f"К оплате: <b>{money(self.gross - adjust)}</b>{what}")
+
+    def accept(self):
+        if self.amount() and not self.note():
+            QMessageBox.warning(self, self.windowTitle(), "Напишите причину — её увидит администратор.")
+            self.note_box.setFocus()
+            return
+        super().accept()
+
+
+def _buttons(dialog: QDialog, ok: str = "Сохранить") -> QDialogButtonBox:
+    """«Сохранить» / «Отмена» по-русски, даже если перевод Qt не загрузился."""
+    buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+    buttons.button(QDialogButtonBox.Ok).setText(ok)
+    buttons.button(QDialogButtonBox.Cancel).setText("Отмена")
+    buttons.accepted.connect(dialog.accept)
+    buttons.rejected.connect(dialog.reject)
+    return buttons
 
 
 # ----- диалоги -----
@@ -456,10 +498,7 @@ class ProductDialog(QDialog):
         self.photo = PhotoPicker(parent.db.photo_of("product", product.id) if product.id else None)
         form.addRow("Фото:", self.photo)
         form.addRow(_gray("Себестоимость считается сама — по ценам из поставок. 0 в «мало» — не следить."))
-        buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        form.addRow(buttons)
+        form.addRow(_buttons(self))
 
     def accept(self):
         p = self.product
@@ -600,11 +639,7 @@ class SupplyDialog(QDialog):
         layout.addWidget(self.lines, 1)
         layout.addWidget(_gray("Нет товара в списке — сначала добавьте его в «📦 Остатки» (администратор). "
                                "Цена закупки — за одну штуку / ветку; себестоимость пересчитается сама."))
-        buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
-        buttons.button(QDialogButtonBox.Save).setText("Принять поставку")
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
+        layout.addWidget(_buttons(self, "Принять поставку"))
 
     def accept(self):
         try:
@@ -643,10 +678,7 @@ class RecipeDialog(QDialog):
         self.lines.table.model().rowsRemoved.connect(self._update)
         self.price_box.valueChanged.connect(self._update)
         self.lines.table.cellChanged.connect(self._update)
-        buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
+        layout.addWidget(_buttons(self))
         self._update()
         self.startTimer(700)  # количество меняют в полях — пересчитывать себестоимость
 
@@ -686,11 +718,7 @@ class WriteOffDialog(QDialog):
         self.reason_box.addItems(WRITEOFF_REASONS)
         form.addRow("Причина:", self.reason_box)
         form.addRow(_gray("Сумма по себестоимости сама попадёт в «Списано» при сдаче смены."))
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        buttons.button(QDialogButtonBox.Ok).setText("Списать")
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        form.addRow(buttons)
+        form.addRow(_buttons(self, "Списать"))
 
 
 # ----- окно -----
@@ -782,9 +810,9 @@ class StockWindow(QDialog):
         head.addStretch(1)
         self.adjust_btn = QPushButton("🧮 Скидка / наценка")
         menu = QMenu(self.adjust_btn)
-        menu.addAction("💸 Добавить наценку", lambda: self._ask_adjust(markup=True))
-        menu.addAction("％ Добавить скидку", lambda: self._ask_adjust(markup=False))
-        menu.addAction("✏️ Изменить сумму", self._ask_total)
+        menu.addAction("💸 Добавить наценку", lambda: self._ask_adjust("markup"))
+        menu.addAction("％ Добавить скидку", lambda: self._ask_adjust("discount"))
+        menu.addAction("✏️ Изменить сумму", lambda: self._ask_adjust("total"))
         self.adjust_btn.setMenu(menu)
         head.addWidget(self.adjust_btn)
         clear_btn = QPushButton("🗑")
@@ -805,6 +833,7 @@ class StockWindow(QDialog):
         right.addWidget(cart_scroll, 3)
         self.rows: list[CartRow] = []
         self.adjust = 0  # больше нуля — скидка, меньше — наценка
+        self.adjust_note = ""  # почему
 
         self.sum_label = QLabel()
         self.adjust_row = QHBoxLayout()
@@ -814,6 +843,7 @@ class StockWindow(QDialog):
         self.adjust_clear.setFixedWidth(28)
         self.adjust_clear.setToolTip("Убрать скидку / наценку")
         self.adjust_clear.clicked.connect(lambda: self.set_adjust(0))
+        self.adjust_label.setWordWrap(True)
         self.adjust_row.addWidget(self.adjust_clear)
         right.addWidget(self.sum_label)
         right.addLayout(self.adjust_row)
@@ -964,27 +994,17 @@ class StockWindow(QDialog):
     def gross(self) -> int:
         return sum(line.amount for line in self.cart_lines())
 
-    def set_adjust(self, value: int):
-        self.adjust = value
+    def set_adjust(self, value: int, note: str = ""):
+        self.adjust, self.adjust_note = value, note.strip() if value else ""
         self._update_cart()
 
-    def _ask_adjust(self, markup: bool):
+    def _ask_adjust(self, mode: str):
         gross = self.gross()
         if not gross:
             return
-        dialog = AdjustDialog(self, markup, gross)
+        dialog = AdjustDialog(self, mode, gross, self.adjust, self.adjust_note)
         if dialog.exec() == QDialog.Accepted:
-            amount = dialog.amount()
-            self.set_adjust(-amount if markup else min(amount, gross))
-
-    def _ask_total(self):
-        gross = self.gross()
-        if not gross:
-            return
-        total, ok = QInputDialog.getInt(self, "Изменить сумму", f"Сумма по корзине {money(gross)}.\nК оплате, ₽:",
-                                        gross - self.adjust, 0, 10_000_000, 50)
-        if ok:
-            self.set_adjust(gross - total)
+            self.set_adjust(dialog.amount(), dialog.note())
 
     def _update_cart(self):
         lines = self.cart_lines()
@@ -998,7 +1018,8 @@ class StockWindow(QDialog):
         self.sum_label.setVisible(bool(self.adjust))
         what = f"Скидка: −{money(self.adjust)}" if self.adjust > 0 else f"Наценка: +{money(-self.adjust)}"
         self.adjust_label.setText(f"<span style='color:{C.green if self.adjust > 0 else C.orange}'>{what}</span>"
-                                  + (f" ({100 * abs(self.adjust) / gross:.0f} %)" if gross else ""))
+                                  + (f" ({100 * abs(self.adjust) / gross:.0f} %)" if gross else "")
+                                  + (f" — {html.escape(self.adjust_note)}" if self.adjust_note else ""))
         for widget in (self.adjust_label, self.adjust_clear):
             widget.setVisible(bool(self.adjust))
         self.total_label.setText(f"<span style='font-size:20pt; font-weight:bold'>{money(total)}</span>")
@@ -1013,13 +1034,15 @@ class StockWindow(QDialog):
         lines = self.cart_lines()
         try:
             sale_id = self.db.add_sale(lines, payment, self.user_id, self.main.sale_shift_id(), datetime.now(),
-                                       discount=self.adjust)
+                                       discount=self.adjust, adjust_note=self.adjust_note)
         except UserError as e:
             QMessageBox.warning(self, "Продажа", str(e))
             return
         total = sum(line.amount for line in lines) - self.adjust
+        adjust = ("скидка" if self.adjust > 0 else "наценка") + f" {money(abs(self.adjust))} — {self.adjust_note}"
         self.main.audit("Продажа", f"№{sale_id}: {money(total)}, {PAYMENTS[payment]} — "
-                        + ", ".join(f"{x.title} × {qty_text(x.qty)}" for x in lines))
+                        + ", ".join(f"{x.title} × {qty_text(x.qty)}" for x in lines)
+                        + (f"; {adjust}" if self.adjust else ""))
         self._clear_cart()
         self._refresh_chips()
         self._refresh_catalog()
@@ -1031,8 +1054,7 @@ class StockWindow(QDialog):
         self.today_table.setRowCount(len(sales))
         total = count = 0
         for i, s in enumerate(sales):
-            extra = (f" (скидка {money(s.discount)})" if s.discount > 0
-                     else f" (наценка {money(-s.discount)})" if s.discount < 0 else "")
+            extra = f" ({s.adjust_text})" if s.discount else ""
             cells = [f"{s.at:%H:%M}", s.what + extra, money(s.total), PAYMENTS.get(s.payment, s.payment),
                      s.user_name or "бот"]
             for col, text in enumerate(cells):
@@ -1043,8 +1065,8 @@ class StockWindow(QDialog):
                     item.setFont(font)
                     item.setForeground(QColor(C.gray))
                     item.setToolTip(f"Отменена {s.cancelled_at:%H:%M}: {s.cancel_reason or 'без причины'}")
-                elif s.note:
-                    item.setToolTip(s.note)
+                elif col == 1 or s.note:  # «Что» обрезается — полностью во всплывающей подсказке
+                    item.setToolTip("\n".join(x for x in (cells[1] if col == 1 else "", s.note) if x))
                 self.today_table.setItem(i, col, item)
             if not s.cancelled_at:
                 total += s.total
@@ -1419,8 +1441,8 @@ class StockWindow(QDialog):
                 self.people_table.setItem(i, col, _item(text, align_right=col > 0))
         rows = [(PAYMENTS.get(k, k), v) for k, v in sorted(now.by_payment.items(), key=lambda x: -x[1])]
         rows += [(f"🗑 {reason}", amount) for reason, amount in writeoffs.items()]
-        if now.discount:
-            rows.append(("Скидки", now.discount))
+        rows += [(f"{'％' if key.startswith('Скидка') else '💸'} {key}", amount)
+                 for key, amount in sorted(now.adjust_notes.items(), key=lambda x: -x[1])]
         self.money_table.setRowCount(len(rows))
         for i, (title, amount) in enumerate(rows):
             self.money_table.setItem(i, 0, _item(title))
