@@ -13,6 +13,7 @@ from PySide6.QtCore import QObject, QSettings, QTimer, Signal
 from . import telegram
 
 BEAT_EVERY_MS = 2 * 60_000
+REPIN_EVERY = timedelta(hours=1)  # закрепить заново, если сообщение открепили
 OFFLINE_AFTER = timedelta(minutes=10)
 PAUSED_MARK = "⏸"  # по этому значку сторож понимает, что слежение выключили нарочно
 
@@ -72,9 +73,14 @@ class Heartbeat(QObject):
             return  # выключено и сторожу уже сказано
         self.busy = True
         text = status_text(datetime.now()) if enabled else paused_text(datetime.now())
-        threading.Thread(target=self._send, args=(cfg["token"], chat, message_id, text), daemon=True).start()
+        try:
+            pinned_at = datetime.fromisoformat(str(s.value("tg_status_pinned", "")))
+        except ValueError:
+            pinned_at = None
+        repin = pinned_at is None or datetime.now() - pinned_at >= REPIN_EVERY  # вдруг открепили вручную
+        threading.Thread(target=self._send, args=(cfg["token"], chat, message_id, text, repin), daemon=True).start()
 
-    def _send(self, token: str, chat: str, message_id: int, text: str):
+    def _send(self, token: str, chat: str, message_id: int, text: str, repin: bool = False):
         try:
             if message_id:
                 try:
@@ -85,18 +91,27 @@ class Heartbeat(QObject):
                     message_id = 0  # сообщение удалили — пришлём новое
             if not message_id:
                 message_id = telegram.send_message(token, chat, text)
-                telegram.pin_message(token, chat, message_id)
-            self.beaten.emit(chat, message_id, "")
+                repin = True
+            pinned = False
+            if repin:
+                try:
+                    telegram.pin_message(token, chat, message_id)
+                    pinned = True
+                except telegram.TelegramError:
+                    pass  # не закрепилось — попробуем в следующий раз, а сообщение уже есть: новое не шлём
+            self.beaten.emit(chat, message_id, "pinned" if pinned else "")
         except telegram.TelegramError as e:
-            self.beaten.emit(chat, message_id, str(e))
+            self.beaten.emit(chat, message_id, f"error: {e}")
 
-    def _done(self, chat: str, message_id: int, error: str):
+    def _done(self, chat: str, message_id: int, result: str):
         self.busy = False
-        if error or not message_id:
+        if result.startswith("error") or not message_id:
             return
         s, now = _settings(), datetime.now()
         s.setValue("tg_status_chat", chat)
         s.setValue("tg_status_msg", message_id)
+        if result == "pinned":
+            s.setValue("tg_status_pinned", now.isoformat(timespec="seconds"))
         s.setValue("tg_status_paused", "false" if watch_enabled() else "true")
         try:
             last = datetime.fromisoformat(str(s.value("tg_last_beat", "")))

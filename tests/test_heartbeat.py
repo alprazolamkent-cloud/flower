@@ -101,7 +101,40 @@ def test_back_online_after_gap(store):
     assert got and "снова на связи" in got[0]
     hb._done("111", 77, "")  # сразу ещё раз — перерыва не было
     assert len(got) == 1
-    hb._done("111", 77, "нет связи")  # ошибка — время не обновляем
+    hb._done("111", 77, "error: нет связи")  # ошибка — время не обновляем
     assert len(got) == 1
+    hb.timer.stop()
+    hb.deleteLater()
+
+
+def test_heartbeat_repins_and_survives_pin_failure(store, monkeypatch):
+    QApplication.instance() or QApplication(sys.argv)
+    calls = []
+    monkeypatch.setattr(telegram, "send_message", lambda t, c, text: calls.append("send") or 77)
+    monkeypatch.setattr(telegram, "edit_message", lambda t, c, m, text: calls.append("edit"))
+
+    def no_pin(*a):
+        calls.append("pin")
+        raise telegram.TelegramError("not enough rights", permanent=True)
+    monkeypatch.setattr(telegram, "pin_message", no_pin)
+    hb = heartbeat.Heartbeat()
+    hb._send("x", "111", 0, heartbeat.status_text(NOW))
+    assert calls == ["send", "pin"] and store["tg_status_msg"] == 77  # сообщение запомнили, хоть и не закрепилось
+    assert "tg_status_pinned" not in store
+    calls.clear()
+    hb.busy = False
+    sent = []
+    monkeypatch.setattr(heartbeat.threading, "Thread",
+                        lambda target, args, daemon: type("T", (), {"start": lambda self: sent.append(args)})())
+    hb.beat()  # не закрепилось — пробуем закрепить снова, но новое сообщение не шлём
+    assert sent[-1][2] == 77 and sent[-1][4] is True
+    store["tg_status_pinned"] = datetime.now().isoformat(timespec="seconds")
+    hb.busy = False
+    hb.beat()  # закреплено недавно — только правим
+    assert sent[-1][4] is False
+    store["tg_status_pinned"] = (datetime.now() - timedelta(hours=2)).isoformat(timespec="seconds")
+    hb.busy = False
+    hb.beat()  # час прошёл — закрепить заново (вдруг открепили вручную)
+    assert sent[-1][4] is True
     hb.timer.stop()
     hb.deleteLater()
