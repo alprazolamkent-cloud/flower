@@ -42,6 +42,9 @@ MENU = [
     ("writeoffs", "Списания: сколько и по каким причинам"),
     ("rating", "Рейтинг месяца: лучшая смена и средний приход"),
     ("backup", "Сделать резервную копию"),
+    ("sales", "Продажи: сегодня, вчера, неделя, месяц — выручка, чек, топ"),
+    ("stock", "Остатки: что заканчивается; /stock Кения — сколько осталось"),
+    ("order", "Что заказать поставщику"),
 ]
 ALIASES = {
     "помощь": "help", "start": "help", "старт": "help", "команды": "help",
@@ -64,6 +67,8 @@ ALIASES = {
     "удалить": "del", "оставить": "keep",
     "списания": "writeoffs", "списание": "writeoffs", "рейтинг": "rating",
     "санкция": "sanction", "санкции": "penalties", "штрафы": "penalties", "fines": "penalties",
+    "продажи": "sales", "продажа": "sales", "остатки": "stock", "склад": "stock", "остаток": "stock",
+    "заказать": "order", "заказ": "order",
     "да": "yes", "yes": "yes", "ок": "yes", "нет": "no", "no": "no", "отмена": "no", "cancel": "no",
 }
 ADJUSTMENTS = {"advance": ("Аванс", -1, "аванс"), "bonus": ("Премия", 1, "премия"), "fine": ("Штраф", -1, "штраф")}
@@ -278,6 +283,72 @@ def revenue_text(ctx: BotContext, first: date, last: date, title: str) -> str:
     if len(shifts) > len(closed):
         lines.append("Несданные смены в сумму не входят.")
     return "\n".join(lines)
+
+
+def _sales_range(ctx: BotContext, first: date, last: date) -> tuple[datetime, datetime]:
+    """Дни смен → время: с начала первой смены до конца последней (ночные продажи — в свою смену)."""
+    return window(first, ctx.change)[0], window(last, ctx.change)[1]
+
+
+def cmd_sales(ctx: BotContext, args: str) -> str:
+    return sales_text(ctx, *_period(args, ctx.now, ctx.change))
+
+
+def sales_text(ctx: BotContext, first: date, last: date, title: str) -> str:
+    """Продажи из «🛒 Продажи»: сколько, на сколько, средний чек, прибыль, оплаты, топ, скидки."""
+    from .stock import PAYMENTS, qty_text
+    report = ctx.db.sales_report(*_sales_range(ctx, first, last), top=5)
+    if not report.count:
+        return f"🛒 Продажи {title}: продаж не было."
+    lines = [f"🛒 Продажи {title}: {report.count} на {money(report.revenue)}",
+             f"Средний чек: {money(report.average)} · прибыль {money(report.profit)} ({report.margin:.0f} %)",
+             " · ".join(f"{PAYMENTS.get(k, k)}: {money(v)}" for k, v in sorted(report.by_payment.items(),
+                                                                              key=lambda x: -x[1]))]
+    if report.top:
+        lines.append("Топ: " + ", ".join(f"{t} × {qty_text(q)}" for t, q, _ in report.top))
+    if report.adjust_notes:
+        parts = []
+        for key, amount in report.adjust_notes.items():  # «Скидка: Постоянный клиент» → скидка «Постоянный клиент»
+            kind, _, note = key.partition(": ")
+            parts.append(f"{kind.lower()} " + (f"«{note}» " if note else "") + money(amount))
+        lines.append("Скидки и наценки: " + ", ".join(parts))
+    return "\n".join(lines)
+
+
+def low_stock_text(ctx: BotContext, limit: int = 12) -> str:
+    from .stock import qty_text
+    low = [p for p in ctx.db.products() if p.low]
+    if not low:
+        return "📦 Склад: всего хватает."
+    shown = ", ".join(f"{p.name} {qty_text(p.stock)} {p.unit}" for p in low[:limit])
+    return f"📦 Заканчивается ({len(low)}): {shown}" + (" …" if len(low) > limit else "") + "\nЧто заказать: /заказать"
+
+
+def cmd_stock(ctx: BotContext, args: str) -> str:
+    """/остатки — что заканчивается и сколько всего на складе; /остатки кения — найти товар."""
+    from .stock import qty_text
+    query = args.strip().casefold()
+    if not query:
+        ready = [r for r in ctx.db.recipes() if r.ready > 0]
+        lines = [low_stock_text(ctx), f"На складе на {money(ctx.db.stock_value())} (по себестоимости)"]
+        if ready:
+            lines.append("💐 Собрано на витрине: " + ", ".join(f"{r.title} × {qty_text(r.ready)}" for r in ready))
+        return "\n".join(lines)
+    found = [p for p in ctx.db.products() if query in p.name.casefold()]
+    if not found:
+        return f"Не нашёл товар «{args.strip()}». Напишите часть названия: /остатки роза"
+    lines = [f"{'❗ ' if p.low else ''}{p.name}: {qty_text(p.stock)} {p.unit}, цена {money(p.price)}"
+             + (f", себестоимость {money(round(p.avg_cost))}" if p.avg_cost else "") for p in found[:MAX_LIST]]
+    if len(found) > MAX_LIST:
+        lines.append(f"…и ещё {len(found) - MAX_LIST}, уточните название")
+    return "\n".join(lines)
+
+
+def cmd_order(ctx: BotContext, args: str) -> str:
+    from .stock import reorder_text
+    text = reorder_text(ctx.db.reorder(ctx.now), business_day(ctx.now, ctx.change) + timedelta(days=1))
+    return text + "\n\n(по расходу за 2 недели, на 3 дня — можно переслать поставщику)" if text \
+        else "🛒 Заказывать нечего — всего хватает."
 
 
 def cmd_today(ctx: BotContext, args: str) -> str:
@@ -758,7 +829,7 @@ COMMANDS: dict[str, Callable[[BotContext, str], str]] = {
     "help": cmd_help, "shift": cmd_shift, "cash": cmd_cash, "revenue": cmd_revenue, "today": cmd_today,
     "shifts": cmd_shifts, "staff": cmd_staff, "salary": cmd_salary, "problems": cmd_problems,
     "deliveries": cmd_deliveries, "water": cmd_water, "duties": cmd_duties, "ann": cmd_ann,
-    "status": cmd_status, "backup": cmd_backup,
+    "status": cmd_status, "backup": cmd_backup, "sales": cmd_sales, "stock": cmd_stock, "order": cmd_order,
     "week": lambda ctx, args: cmd_revenue(ctx, "неделя"),
     "month": lambda ctx, args: cmd_revenue(ctx, "месяц"),
 }

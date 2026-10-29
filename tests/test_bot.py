@@ -400,3 +400,36 @@ def test_chat_picker_selection(db):
     old = ChatPicker(None, [("222", "Игорь")], ["111", "222"])  # в настройках есть чат, который давно не писал
     assert old.selected() == ["222", "111"]  # он не пропадает из списка и остаётся отмеченным
     assert app is not None
+
+
+def test_sales_stock_and_order_commands(db):
+    from app.stock import CartLine, Product
+    handler = BotHandler()
+    ctx = make_ctx(db)
+    assert "продаж не было" in handler.handle("/продажи", ctx)
+    assert "всего хватает" in handler.handle("/остатки", ctx)
+    rose = db.save_product(Product(0, "Кения", "Цветы", price=250, min_stock=20))
+    db.add_supply("База", [(rose, 30, 80)], None, NOW - timedelta(days=3))
+    db.add_sale([CartLine("Кения", 15, 250, product_id=rose)], "card", None, None, NOW - timedelta(hours=1))
+    db.add_sale([CartLine("Кения", 1, 250, product_id=rose)], "cash", None, None, NOW - timedelta(hours=1),
+                discount=50, adjust_note="Постоянный клиент")
+    text = handler.handle("/продажи", ctx)
+    assert "2 на 3 950 ₽" in text and "Терминал: 3 750 ₽" in text and "Кения × 16" in text
+    assert "скидка «Постоянный клиент» 50 ₽" in text
+    assert "Кения 14 шт" in handler.handle("/остатки", ctx) and "На складе на 1 120 ₽" in handler.handle("/остатки", ctx)
+    assert "❗ Кения: 14 шт, цена 250 ₽, себестоимость 80 ₽" == handler.handle("/остатки кен", ctx)
+    assert "Не нашёл" in handler.handle("/остатки пион", ctx)
+    order = handler.handle("/заказать", ctx)
+    assert order.startswith("Заказ на 21.10") and "• Кения — 26 шт" in order  # до двух минимумов (40)
+
+
+def test_morning_report_has_sales_when_stock_is_used(db):
+    from app.reports import Report, report_text
+    from app.stock import CartLine, Product
+    ctx = make_ctx(db)
+    report = Report("k", "morning", date(2026, 10, 19), date(2026, 10, 19), "за вчерашнюю смену")
+    assert "Продажи" not in report_text(report, ctx)  # склад не ведут — как раньше
+    rose = db.save_product(Product(0, "Кения", "Цветы", price=250, min_stock=5))
+    db.add_sale([CartLine("Кения", 2, 250, product_id=rose)], "cash", None, None, datetime(2026, 10, 19, 15, 0))
+    text = report_text(report, ctx)
+    assert "🛒 Продажи за вчерашнюю смену: 1 на 500 ₽" in text and "Заканчивается (1): Кения −2 шт" in text

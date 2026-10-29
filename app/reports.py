@@ -6,8 +6,8 @@ from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 
 from .bot_commands import (
-    MONTHS, BotContext, cmd_deliveries, penalties_text, ranking_text, revenue_text, salary_overview,
-    staff_text, writeoff_text,
+    MONTHS, BotContext, cmd_deliveries, low_stock_text, penalties_text, ranking_text, revenue_text, sales_text,
+    salary_overview, staff_text, writeoff_text,
 )
 from .shifts import business_day, window
 
@@ -58,17 +58,24 @@ def report_text(report: Report, ctx: BotContext) -> str:
     if report.kind == "morning":
         parts = [f"☀ Доброе утро! Итоги {title}", revenue_text(ctx, first, last, title),
                  writeoff_text(ctx, first, last, title)]
+        if ctx.db.products() or ctx.db.sales_report(*(ctx.now - timedelta(days=2), ctx.now)).count:
+            parts += [sales_text(ctx, first, last, title), low_stock_text(ctx)]  # если склад ведут в программе
         deliveries = cmd_deliveries(ctx, "")
         if deliveries:
             parts.append(deliveries)
         return "\n\n".join(parts)
     if report.kind == "weekly":
-        return "\n\n".join([f"📅 Отчёт {title} ({first:%d.%m}–{last:%d.%m})", revenue_text(ctx, first, last, title),
-                            staff_text(ctx, first, last, title), writeoff_text(ctx, first, last, title)])
+        parts = [f"📅 Отчёт {title} ({first:%d.%m}–{last:%d.%m})", revenue_text(ctx, first, last, title),
+                 staff_text(ctx, first, last, title), writeoff_text(ctx, first, last, title)]
+        if ctx.db.products():
+            parts.append(sales_text(ctx, first, last, title))
+        return "\n\n".join(parts)
     last_day = calendar.monthrange(first.year, first.month)[1]
     parts = [f"🗓 Отчёт {title} {first.year}", revenue_text(ctx, first, last, title),
              staff_text(ctx, first, last, title), salary_overview(ctx, first, first.replace(day=last_day)),
              writeoff_text(ctx, first, last, title), ranking_text(ctx, first, last, title)]
+    if ctx.db.products():
+        parts.append(sales_text(ctx, first, last, title))
     penalties = penalties_text(ctx, first, last)
     if "Пока никого" not in penalties:
         parts.append(penalties)
