@@ -277,7 +277,7 @@ class CloseShiftDialog(QDialog):
             self.terminal_box.setValue(self.sold.card)
             self.qr_box.setValue(self.sold.qr)
             self.sales_box.setValue(self.sold.cash)
-            sales.setTitle(f"Выручка за смену — {self.sold.count} продаж из «🛒 Продажи»")
+            sales.setTitle(f"Выручка за смену · продаж: {self.sold.count}")  # подставлено из «🛒 Продажи»
         for reason, amount in self.sold.writeoffs.items():
             box = self.writeoff_boxes.get(reason) or self.writeoff_boxes[WRITEOFF_REASONS[-1]]
             box.setValue(box.value() + amount)
