@@ -4,16 +4,18 @@
 """
 
 import html
+import os
 from datetime import date, datetime, timedelta
 
 from PySide6.QtCore import QRectF, Qt
 from PySide6.QtGui import QColor, QFont, QKeySequence, QPainter, QPixmap, QShortcut
 from PySide6.QtWidgets import (
-    QAbstractItemView, QButtonGroup, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFormLayout,
-    QFrame, QGridLayout, QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit, QMenu, QMessageBox, QPushButton,
-    QScrollArea, QSpinBox, QTableWidget, QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget,
+    QAbstractItemView, QButtonGroup, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFileDialog,
+    QFormLayout, QFrame, QGridLayout, QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit, QMenu, QMessageBox,
+    QPushButton, QRadioButton, QScrollArea, QSpinBox, QTableWidget, QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget,
 )
 
+from . import stock_import
 from .db import UserError
 from .delivery_dialog import money, money_box
 from .icon import flower_icon
@@ -23,7 +25,8 @@ from .stock import CATEGORIES, PAYMENTS, CartLine, Product, Recipe, day_range, q
 from .theme import C
 
 MOVE_KINDS = {"supply": "Поставка", "sale": "Продажа", "writeoff": "Списание", "count": "Инвентаризация",
-              "return": "Возврат"}
+              "return": "Возврат", "assembly": "Собрали букет", "disassembly": "Разобрали букет",
+              "assemble": "Собрали", "disassemble": "Разобрали"}
 PERIODS = ("Сегодня", "Вчера", "7 дней", "30 дней", "Этот месяц", "Прошлый месяц")
 MONTHS = ["январь", "февраль", "март", "апрель", "май", "июнь", "июль", "август", "сентябрь", "октябрь",
           "ноябрь", "декабрь"]
@@ -565,9 +568,17 @@ class LinesEditor(QWidget):
                 box = self.table.cellWidget(row, 1)
                 box.setValue(box.value() + qty)
                 return
-        row = self.table.rowCount()
+        order = {c: i for i, c in enumerate(CATEGORIES)}
+        rank = order.get(p.category, len(order))
+        row = self.table.rowCount()  # по разделам: цветы, зелень, упаковка…
+        for r in range(self.table.rowCount()):
+            other = self._product(self.table.item(r, 0).data(Qt.UserRole))
+            if other is not None and order.get(other.category, len(order)) > rank:
+                row = r
+                break
         self.table.insertRow(row)
-        self.table.setItem(row, 0, _item(p.name, pid))
+        name = _item(f"{p.name}  ·  {p.category.lower()}", pid)
+        self.table.setItem(row, 0, name)
         box = qty_box(p.unit)
         box.setValue(qty)
         box.valueChanged.connect(self._update)
@@ -667,7 +678,12 @@ class RecipeDialog(QDialog):
         form.addRow("Цена продажи:", self.price_box)
         self.photo = PhotoPicker(db.photo_of("recipe", recipe.id) if recipe.id else None)
         form.addRow("Фото:", self.photo)
+        self.in_bot = QCheckBox("Собранные показывать в витрине ботов (Telegram и MAX)")
+        self.in_bot.setChecked(recipe.in_bot)
+        form.addRow(self.in_bot)
         layout.addLayout(form)
+        layout.addWidget(_gray("Состав до последнего стебля: основной цветок, заполнители, зелень и расходники "
+                               "(бумага, лента, анкерная лента, аквапак). Можно дробно: 1,5 м ленты."))
         self.lines = LinesEditor(db.products(active_only=False), with_cost=False)
         for pid, qty in recipe.items:
             self.lines.add(pid, qty)
@@ -696,6 +712,7 @@ class RecipeDialog(QDialog):
     def accept(self):
         r = self.recipe
         r.title, r.price, r.items = self.title_edit.text(), self.price_box.value(), self.lines.lines()
+        r.in_bot = self.in_bot.isChecked()
         try:
             self.db.save_recipe(r)
         except UserError as e:
@@ -719,6 +736,186 @@ class WriteOffDialog(QDialog):
         form.addRow("Причина:", self.reason_box)
         form.addRow(_gray("Сумма по себестоимости сама попадёт в «Списано» при сдаче смены."))
         form.addRow(_buttons(self, "Списать"))
+
+
+class AssembleDialog(QDialog):
+    """Собрать букет(ы) по техкарте: что и сколько уйдёт со склада, хватает ли."""
+
+    def __init__(self, parent, db, recipe: Recipe):
+        super().__init__(parent)
+        self.db, self.recipe = db, recipe
+        self.setWindowTitle(f"Собрать — {recipe.title}")
+        self.resize(560, 420)
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+        self.qty_box = QSpinBox()
+        self.qty_box.setRange(1, 100)
+        self.qty_box.setSuffix(" шт")
+        form.addRow("Сколько букетов собрали:", self.qty_box)
+        layout.addLayout(form)
+        self.table = _table(["Со склада", "На букет", "Нужно", "Есть на складе"])
+        layout.addWidget(self.table, 1)
+        self.short = QLabel()
+        self.short.setWordWrap(True)
+        layout.addWidget(self.short)
+        layout.addWidget(_gray("Цветы и упаковка спишутся со склада сейчас. Букет появится на витрине "
+                               + ("и в ботах." if recipe.in_bot else "(в ботах не показывается — так в техкарте).")))
+        layout.addWidget(_buttons(self, "💐 Собрал"))
+        self.qty_box.valueChanged.connect(self._show)
+        self._show()
+
+    def _show(self):
+        n = self.qty_box.value()
+        names = {p.id: p for p in self.db.products(active_only=False)}
+        self.table.setRowCount(len(self.recipe.items))
+        short = []
+        for i, (pid, q) in enumerate(self.recipe.items):
+            p = names.get(pid)
+            need, have = q * n, p.stock if p else 0
+            unit = f" {p.unit}" if p else ""
+            for col, text in enumerate((p.name if p else "?", qty_text(q) + unit, qty_text(need) + unit,
+                                        qty_text(have) + unit)):
+                item = _item(text, align_right=col > 0)
+                if col == 3 and have < need:
+                    item.setForeground(QColor(C.red))
+                self.table.setItem(i, col, item)
+            if have < need and p:
+                short.append(f"{p.name} (не хватает {qty_text(need - have)}{unit})")
+        self.short.setText(f"<span style='color:{C.orange}'>⚠ По программе не хватает: {html.escape(', '.join(short))}. "
+                           "Если на самом деле есть — значит, поставку не внесли; собрать всё равно можно.</span>"
+                           if short else "")
+
+
+class ReadyWriteOffDialog(QDialog):
+    def __init__(self, parent, recipe: Recipe):
+        super().__init__(parent)
+        self.setWindowTitle("Списать с витрины")
+        form = QFormLayout(self)
+        form.addRow(QLabel(f"<b>{html.escape(recipe.title)}</b> · на витрине {qty_text(recipe.ready)} шт"))
+        self.qty_box = QSpinBox()
+        self.qty_box.setRange(1, max(int(recipe.ready), 1))
+        self.qty_box.setSuffix(" шт")
+        form.addRow("Сколько списать:", self.qty_box)
+        self.reason_box = QComboBox()
+        self.reason_box.addItems(WRITEOFF_REASONS)
+        form.addRow("Причина:", self.reason_box)
+        form.addRow(_gray("Списывается весь букет по себестоимости сборки — сумма попадёт в сдачу смены. "
+                          "Часть цветов ещё живая? Тогда лучше «🔧 Разобрать»."))
+        form.addRow(_buttons(self, "Списать"))
+
+
+class DisassembleDialog(QDialog):
+    """Разобрать готовый букет: что выкинули — в списание, остальное на склад; можно сразу пересобрать."""
+
+    def __init__(self, parent, db, recipe: Recipe):
+        super().__init__(parent)
+        self.db, self.recipe = db, recipe
+        self.setWindowTitle(f"Разобрать — {recipe.title}")
+        self.resize(620, 520)
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+        self.qty_box = QSpinBox()
+        self.qty_box.setRange(1, max(int(recipe.ready), 1))
+        self.qty_box.setSuffix(f" шт (на витрине {qty_text(recipe.ready)})")
+        form.addRow("Сколько букетов разобрали:", self.qty_box)
+        layout.addLayout(form)
+        layout.addWidget(QLabel("Что выкинули (завяло, сломалось) — остальное вернётся на склад:"))
+        names = {p.id: p for p in db.products(active_only=False)}
+        self.table = _table(["Товар", "В букетах", "Выкинули", "Вернётся на склад"])
+        self.table.setRowCount(len(recipe.items))
+        self.broken_boxes: list[tuple[int, float, QDoubleSpinBox]] = []
+        for i, (pid, q) in enumerate(recipe.items):
+            p = names.get(pid)
+            self.table.setItem(i, 0, _item(p.name if p else "?"))
+            self.table.setItem(i, 1, _item("", align_right=True))
+            box = qty_box(p.unit if p else "")
+            box.setValue(0)
+            box.valueChanged.connect(self._show)
+            self.table.setCellWidget(i, 2, box)
+            self.table.setItem(i, 3, _item("", align_right=True))
+            self.broken_boxes.append((pid, q, box))
+        layout.addWidget(self.table, 1)
+        reason = QFormLayout()
+        self.reason_box = QComboBox()
+        self.reason_box.addItems(WRITEOFF_REASONS)
+        reason.addRow("Причина списания:", self.reason_box)
+        layout.addLayout(reason)
+        self.to_stock = QRadioButton("Всё целое — вернуть на склад")
+        self.to_stock.setChecked(True)
+        self.rebuild = QRadioButton("Пересобрать в:")
+        row = QHBoxLayout()
+        row.addWidget(self.rebuild)
+        self.target_box = QComboBox()
+        for other in db.recipes():
+            if other.id != recipe.id:
+                self.target_box.addItem(other.title, other.id)
+        row.addWidget(self.target_box, 1)
+        self.target_qty = QSpinBox()
+        self.target_qty.setRange(1, 100)
+        self.target_qty.setSuffix(" шт")
+        row.addWidget(self.target_qty)
+        layout.addWidget(self.to_stock)
+        layout.addLayout(row)
+        self.rebuild.setEnabled(self.target_box.count() > 0)
+        layout.addWidget(_gray("Пересобрать: целое из разобранного пойдёт в новый букет, чего не хватит — "
+                               "возьмётся со склада, лишнее останется на складе."))
+        layout.addWidget(_buttons(self, "🔧 Разобрал"))
+        self.qty_box.valueChanged.connect(self._show)
+        self._show()
+
+    def broken(self) -> dict[int, float]:
+        return {pid: box.value() for pid, _, box in self.broken_boxes if box.value() > 0}
+
+    def target(self) -> tuple[int, int] | None:
+        if self.rebuild.isChecked() and self.target_box.currentData() is not None:
+            return self.target_box.currentData(), self.target_qty.value()
+        return None
+
+    def _show(self):
+        n = self.qty_box.value()
+        for i, (pid, q, box) in enumerate(self.broken_boxes):
+            total = q * n
+            box.setMaximum(total)
+            self.table.item(i, 1).setText(qty_text(total))
+            self.table.item(i, 3).setText(qty_text(max(total - box.value(), 0)))
+
+
+class ImportDialog(QDialog):
+    """Предпросмотр загрузки из таблицы: что добавится, что обновится, что не так."""
+
+    def __init__(self, parent, rows: list, problems: list[str], file_name: str):
+        super().__init__(parent)
+        self.setWindowTitle("Загрузить товары из таблицы")
+        self.resize(900, 560)
+        layout = QVBoxLayout(self)
+        new = sum(r.existing is None for r in rows)
+        layout.addWidget(QLabel(f"<b>{html.escape(file_name)}</b>: товаров {len(rows)} — добавить {new}, "
+                                f"обновить {len(rows) - new}"))
+        table = _table(["Что сделать", "Название", "Раздел", "Ед.", "Цена", "Закупка", "Остаток", "Мало ≤"], stretch=1)
+        table.setRowCount(len(rows))
+        for i, r in enumerate(rows):
+            cells = [r.action, r.name, r.category or "—", r.unit or "—",
+                     money(r.price) if r.price is not None else "—",
+                     f"{r.cost:g} ₽".replace(".", ",") if r.cost is not None else "—",
+                     qty_text(r.stock) if r.stock is not None else "—",
+                     qty_text(r.min_stock) if r.min_stock is not None else "—"]
+            for col, text in enumerate(cells):
+                item = _item(text, align_right=col >= 4)
+                if col == 0:
+                    item.setForeground(QColor(C.blue if r.existing else C.green))
+                table.setItem(i, col, item)
+        layout.addWidget(table, 1)
+        if problems:
+            warn = QLabel("<br>".join(f"⚠ {html.escape(p)}" for p in problems[:12])
+                          + ("<br>…" if len(problems) > 12 else ""))
+            warn.setWordWrap(True)
+            warn.setStyleSheet(f"color: {C.orange}")
+            layout.addWidget(warn)
+        layout.addWidget(_gray("Остатки новых товаров занесутся поставкой «Загрузка из таблицы» с закупочными ценами, "
+                               "у уже заведённых — инвентаризацией (станет ровно как в таблице)."))
+        buttons = _buttons(self, f"📥 Загрузить ({len(rows)})")
+        buttons.button(QDialogButtonBox.Ok).setEnabled(bool(rows))
+        layout.addWidget(buttons)
 
 
 # ----- окно -----
@@ -755,7 +952,7 @@ class StockWindow(QDialog):
 
     def refresh(self):
         self.tabs.setTabVisible(self.analytics_index, self.admin)
-        for widget in (self.add_product_btn, self.edit_product_btn, self.count_btn, self.archive_btn,
+        for widget in (self.add_product_btn, self.edit_product_btn, self.count_btn, self.archive_btn, self.import_btn,
                        self.add_recipe_btn, self.edit_recipe_btn, self.archive_recipe_btn):
             widget.setVisible(self.admin)
         page = self.tabs.currentIndex()
@@ -931,7 +1128,8 @@ class StockWindow(QDialog):
             title = item.title if kind == "recipe" else item.name
             if query and query not in title.lower() and (kind == "recipe" or query not in item.category.lower()):
                 continue
-            stock = "" if kind == "recipe" else f"{qty_text(item.stock)} {item.unit}"
+            stock = (f"готово: {qty_text(item.ready)}" if item.ready > 0 else "") if kind == "recipe" else \
+                f"{qty_text(item.stock)} {item.unit}"
             tiles.append((kind, ident, title, item.price, stock, kind == "product" and item.low,
                           self._photo(kind, ident) if item.has_photo else None))
         self.grid.set_tiles(tiles)
@@ -1133,8 +1331,11 @@ class StockWindow(QDialog):
         self.archive_btn = QPushButton("📁 В архив")
         self.archive_btn.setToolTip("Больше не возим — скрыть из списков (история останется)")
         self.archive_btn.clicked.connect(self._archive_product)
+        self.import_btn = QPushButton("📥 Загрузить из таблицы")
+        self.import_btn.setToolTip("Excel (.xlsx) или CSV: шаблон программы или выгрузка из Hoog")
+        self.import_btn.clicked.connect(self._import)
         for b in (self.add_product_btn, self.edit_product_btn, writeoff_btn, self.count_btn, history_btn,
-                  self.archive_btn):
+                  self.archive_btn, self.import_btn):
             b.setMinimumHeight(30)
             buttons.addWidget(b)
         buttons.addStretch(1)
@@ -1254,6 +1455,29 @@ class StockWindow(QDialog):
         self.main.audit("Товар в архиве", p.name)
         self._refresh_stock()
 
+    def _import(self, path: str = ""):
+        if not path:
+            path, _ = QFileDialog.getOpenFileName(self, "Таблица с товарами", "",
+                                                  "Таблицы (*.xlsx *.xlsm *.csv);;Все файлы (*)")
+        if not path:
+            return
+        try:
+            rows, problems = stock_import.parse(self.db, stock_import.read_table(path))
+        except UserError as e:
+            QMessageBox.warning(self, "Загрузка из таблицы", str(e))
+            return
+        if ImportDialog(self, rows, problems, os.path.basename(path)).exec() != QDialog.Accepted:
+            return
+        try:
+            added, updated = stock_import.apply(self.db, rows, self.user_id, datetime.now())
+        except UserError as e:
+            QMessageBox.warning(self, "Загрузка из таблицы", str(e))
+            return
+        self.main.audit("Товары загружены из таблицы", f"{os.path.basename(path)}: добавлено {added}, "
+                        f"обновлено {updated}")
+        QMessageBox.information(self, "Загрузка из таблицы", f"Готово: добавлено {added}, обновлено {updated}.")
+        self._refresh_stock()
+
     # ----- поставки -----
 
     def _supplies_tab(self) -> QWidget:
@@ -1303,49 +1527,73 @@ class StockWindow(QDialog):
     def _recipes_tab(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
-        layout.addWidget(_gray("Техкарта — из чего собирается букет. При продаже букета цветы и упаковка "
-                               "спишутся со склада сами."))
-        self.recipes_table = _table(["Букет", "Состав", "Цена", "Себестоимость", "Наценка"], stretch=1)
+        layout.addWidget(_gray("Техкарта — из чего собирается букет. «💐 Собрать» — цветы и упаковка списываются "
+                               "со склада сразу, букет встаёт на витрину (и в боты). Продали — со склада второй раз "
+                               "не списывается. Не собирали заранее — спишется при продаже."))
+        self.recipes_table = _table(["Букет", "Состав", "Цена", "На витрине", "Себестоимость", "Наценка"], stretch=1)
         self.recipes_table.setWordWrap(True)
         self.recipes_table.itemDoubleClicked.connect(lambda _: self._edit_recipe() if self.admin else None)
         layout.addWidget(self.recipes_table, 1)
         buttons = QHBoxLayout()
+        assemble_btn = QPushButton("💐 Собрать на витрину")
+        assemble_btn.clicked.connect(self._assemble)
+        disassemble_btn = QPushButton("🔧 Разобрать / пересобрать")
+        disassemble_btn.clicked.connect(self._disassemble)
+        writeoff_btn = QPushButton("🗑 Списать с витрины")
+        writeoff_btn.setToolTip("Готовый букет завял или сломался — списать целиком")
+        writeoff_btn.clicked.connect(self._write_off_ready)
+        history_btn = QPushButton("📜 История")
+        history_btn.clicked.connect(self._recipe_history)
         self.add_recipe_btn = QPushButton("➕ Техкарта")
         self.add_recipe_btn.clicked.connect(lambda: self._edit_recipe(new=True))
         self.edit_recipe_btn = QPushButton("✏️ Изменить")
         self.edit_recipe_btn.clicked.connect(self._edit_recipe)
         self.archive_recipe_btn = QPushButton("📁 В архив")
         self.archive_recipe_btn.clicked.connect(self._archive_recipe)
-        for b in (self.add_recipe_btn, self.edit_recipe_btn, self.archive_recipe_btn):
-            b.setMinimumHeight(30)
+        for b in (assemble_btn, disassemble_btn, writeoff_btn, history_btn):
+            b.setMinimumHeight(32)
             buttons.addWidget(b)
         buttons.addStretch(1)
+        for b in (self.add_recipe_btn, self.edit_recipe_btn, self.archive_recipe_btn):
+            b.setMinimumHeight(32)
+            buttons.addWidget(b)
         layout.addLayout(buttons)
         return page
 
     def _refresh_recipes(self):
-        names = {p.id: p for p in self.db.products(active_only=False)}
+        selected = self._selected_recipe_id()
         recipes = self.db.recipes()
         self.recipes_table.setRowCount(len(recipes))
         for i, r in enumerate(recipes):
             cost = self.db.recipe_cost(r)
             margin = 100 * (r.price - cost) / r.price if r.price else 0
-            parts = ", ".join(f"{names[pid].name} × {qty_text(qty)}" for pid, qty in r.items if pid in names)
-            cells = [r.title, parts, money(r.price), money(round(cost)) if self.admin else "—",
-                     f"{margin:.0f} %" if self.admin else "—"]
+            parts = "\n".join(f"{group}: {', '.join(items)}" for group, items in self.db.composition(r))
+            reserved = self.db.reserved_of(r.id)
+            ready = qty_text(r.ready) + (f" (заказано в боте: {reserved})" if reserved else "") if r.ready else "—"
+            cells = [r.title + ("" if r.in_bot else "\n(не в боте)"), parts, money(r.price), ready,
+                     money(round(cost)) if self.admin else "—", f"{margin:.0f} %" if self.admin else "—"]
             for col, text in enumerate(cells):
                 item = _item(text, r.id, align_right=col >= 2)
-                if col == 4 and self.admin:
+                if col == 3 and r.ready:
+                    item.setForeground(QColor(C.green))
+                if col == 5 and self.admin:
                     item.setForeground(QColor(C.green if margin >= 50 else C.orange if margin >= 30 else C.red))
                 self.recipes_table.setItem(i, col, item)
+            if r.id == selected:
+                self.recipes_table.selectRow(i)
         self.recipes_table.resizeRowsToContents()
 
-    def _selected_recipe(self) -> Recipe | None:
+    def _selected_recipe_id(self) -> int | None:
         row = self.recipes_table.currentRow()
-        if row < 0:
+        item = self.recipes_table.item(row, 0) if row >= 0 else None
+        return item.data(Qt.UserRole) if item else None
+
+    def _selected_recipe(self) -> Recipe | None:
+        rid = self._selected_recipe_id()
+        if rid is None:
             QMessageBox.information(self, "Техкарты", "Выберите техкарту в списке.")
             return None
-        return self.db.get_recipe(self.recipes_table.item(row, 0).data(Qt.UserRole))
+        return self.db.get_recipe(rid)
 
     def _edit_recipe(self, new: bool = False):
         if new and not self.db.products():
@@ -1367,6 +1615,96 @@ class StockWindow(QDialog):
             self.db.archive_recipe(r.id)
             self.main.audit("Техкарта в архиве", r.title)
             self._refresh_recipes()
+
+    def _assemble(self):
+        r = self._selected_recipe()
+        if r is None:
+            return
+        dialog = AssembleDialog(self, self.db, r)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        qty = dialog.qty_box.value()
+        try:
+            self.db.assemble(r.id, qty, self.user_id, self.main.sale_shift_id(), datetime.now())
+        except UserError as e:
+            QMessageBox.warning(self, "Собрать", str(e))
+            return
+        self.main.audit("Букет собран на витрину", f"{r.title} × {qty}")
+        self._showcase_changed()
+
+    def _write_off_ready(self):
+        r = self._selected_recipe()
+        if r is None:
+            return
+        if r.ready <= 0:
+            QMessageBox.information(self, "Списать с витрины", f"Собранных «{r.title}» на витрине нет.")
+            return
+        dialog = ReadyWriteOffDialog(self, r)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        qty, reason = dialog.qty_box.value(), dialog.reason_box.currentText()
+        try:
+            self.db.write_off_ready(r.id, qty, reason, self.user_id, self.main.sale_shift_id(), datetime.now())
+        except UserError as e:
+            QMessageBox.warning(self, "Списать с витрины", str(e))
+            return
+        self.main.audit("Букет списан с витрины", f"{r.title} × {qty} — {reason}")
+        self._showcase_changed()
+
+    def _disassemble(self):
+        r = self._selected_recipe()
+        if r is None:
+            return
+        if r.ready <= 0:
+            QMessageBox.information(self, "Разобрать", f"Собранных «{r.title}» на витрине нет.")
+            return
+        dialog = DisassembleDialog(self, self.db, r)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        qty, now, shift_id = dialog.qty_box.value(), datetime.now(), self.main.sale_shift_id()
+        try:
+            self.db.disassemble(r.id, qty, dialog.broken(), dialog.reason_box.currentText(), self.user_id, shift_id, now)
+            target = dialog.target()
+            if target:
+                self.db.assemble(target[0], target[1], self.user_id, shift_id, now)
+        except UserError as e:
+            QMessageBox.warning(self, "Разобрать", str(e))
+            self._showcase_changed()
+            return
+        broken = ", ".join(f"{self.db.get_product(pid).name} × {qty_text(q)}" for pid, q in dialog.broken().items() if q)
+        then = (f" → пересобрали в «{self.db.get_recipe(target[0]).title}» × {target[1]}" if target
+                else " → на склад")
+        self.main.audit("Букет разобран", f"{r.title} × {qty}{then}" + (f"; выкинули: {broken}" if broken else ""))
+        self._showcase_changed()
+
+    def _recipe_history(self):
+        r = self._selected_recipe()
+        if r is None:
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"Витрина — {r.title}")
+        dialog.resize(560, 420)
+        layout = QVBoxLayout(dialog)
+        table = _table(["Когда", "Что", "Сколько", "Причина"], stretch=3)
+        moves = self.db.ready_moves_of(r.id)
+        table.setRowCount(len(moves))
+        for i, (at, kind, qty, reason) in enumerate(moves):
+            for col, text in enumerate((f"{at:%d.%m %H:%M}", MOVE_KINDS.get(kind, kind),
+                                        ("+" if qty > 0 else "") + qty_text(qty), reason)):
+                item = _item(text, align_right=col == 2)
+                if col == 2:
+                    item.setForeground(QColor(C.green if qty > 0 else C.red))
+                table.setItem(i, col, item)
+        layout.addWidget(table)
+        layout.addWidget(QLabel(f"Сейчас на витрине: <b>{qty_text(r.ready)}</b>"))
+        dialog.exec()
+
+    def _showcase_changed(self):
+        """Собрали / продали / разобрали — обновить здесь и витрину в «🛍 Клиенты» (боты читают базу сами)."""
+        self._refresh_recipes()
+        center = getattr(self.main, "client_center", None)
+        if center is not None and center.isVisible():
+            center.refresh_showcase()
 
     # ----- аналитика -----
 

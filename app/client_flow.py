@@ -377,9 +377,10 @@ class ClientFlow:
                 res.say("Нажмите «✅ Отправить заказ» или «↩ Начать заново».")
                 return res
             item = self.db.get_showcase_item(data["showcase_id"]) if data.get("showcase_id") else None
-            if item is not None and item.single and not item.active:  # пока оформляли, его заказал другой
+            if item is not None and ((item.single and not item.active)  # пока оформляли, его заказал другой
+                                     or (item.stock is not None and item.stock <= 0)):  # собранные разобрали
                 go("", {})
-                res.say("Ох, этот букет только что заказали 😔 Он был в одном экземпляре. Посмотрите другие "
+                res.say("Ох, этот букет только что заказали 😔 Готовых больше нет. Посмотрите другие "
                         "на витрине или опишите свой — соберём похожий.", self.MENU)
                 return res
             order = self.db.add_client_order(
@@ -555,7 +556,12 @@ class ClientFlow:
         if offset == 0:
             res.say(f"На витрине: {len(items)}. Кнопки под букетом — наличие, изменить, удалить.", STAFF_MENU)
         for item in items[offset:offset + STAFF_LIST_MAX]:
-            if item.single:
+            if item.stock is not None:  # собирается по техкарте в программе — наличие считается само
+                state = (f"💐 собран: в наличии {max(item.stock, 0)}" if item.stock > 0 else "💐 собранных нет (скрыт)")
+                if not item.active:
+                    state += ", 🚫 скрыт вручную"
+                toggle = "🚫 Скрыть" if item.active else "✅ Вернуть"
+            elif item.single:
                 state = "1️⃣ один экземпляр, " + ("✅ на витрине" if item.active else "🔒 продан / заказан (скрыт)")
                 toggle = "🔒 Продан" if item.active else "✅ Вернуть"
             else:
@@ -641,7 +647,7 @@ class ClientFlow:
         kind, _, value = msg.callback.partition(":")
         if kind == "pick" and value.isdigit():
             item = self.db.get_showcase_item(int(value))
-            if item is None or not item.active:
+            if item is None or not item.visible:
                 res.say("Этого букета уже нет на витрине 😔 Посмотрите другие или опишите свой.", self.MENU)
                 return
             chosen = {"items": f"{item.title} — {money(item.price)}", "showcase_id": item.id}
@@ -695,7 +701,9 @@ class ClientFlow:
         page = items[offset:offset + SHOWCASE_PAGE]
         for item in page:
             caption = (f"{item.title} — {money(item.price)}" + (f"\n{item.description}" if item.description else "")
-                       + ("\n✨ В одном экземпляре — готов прямо сейчас" if item.single else ""))
+                       + ("\n✨ В одном экземпляре — готов прямо сейчас" if item.single else "")
+                       + (("\n✨ Готов прямо сейчас" + (f" — в наличии {item.stock}" if item.stock > 1 else ""))
+                          if item.stock is not None else ""))
             button = inline(("🛒 Заказать", f"pick:{item.id}"))
             if item.photo or item.file_id:
                 res.say(caption, button, photo=None if item.file_id else item.photo, file_id=item.file_id,

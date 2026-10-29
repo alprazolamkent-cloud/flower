@@ -539,3 +539,17 @@ def test_preorder_for_holiday(db):
     assert "25.10 — во сколько" in texts(say(flow, "Белые розы"))
     # без праздника меню обычное
     assert ClientFlow(db, "").handle(Incoming("1", "/start"), NOW).replies[0].markup["keyboard"][0][0]["text"] == SHOWCASE
+
+
+def test_showcase_from_assembled_bouquets(db):
+    from app.stock import Product, Recipe
+    rose = db.save_product(Product(0, "Роза", "Цветы", price=250))
+    recipe = db.save_recipe(Recipe(0, "Классика", 3500, items=[(rose, 9)]))
+    db.assemble(recipe, 2, None, None, NOW)
+    flow = ClientFlow(db, "Страна Чудес")
+    say(flow, "/start")
+    shown = texts(say(flow, SHOWCASE))
+    assert "Классика — 3 500 ₽" in shown and "Готов прямо сейчас — в наличии 2" in shown
+    item = db.showcase()[0]
+    db.write_off_ready(recipe, 2, "Завяло", None, None, NOW)  # завяли — с витрины бота пропал
+    assert "Этого букета уже нет" in texts(say(flow, callback=f"pick:{item.id}"))

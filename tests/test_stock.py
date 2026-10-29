@@ -125,3 +125,85 @@ def test_markup_note_in_report(shop):
     assert (report.revenue, report.discount, report.markup) == (1050 + 400, 100, 300)
     assert report.adjust_notes == {"Наценка: Срочно, за 30 минут": 300, "Скидка: Постоянный клиент": 100}
     assert db.sales_of_shift(shift.id)[1].adjust_text == "наценка 300 ₽ — Срочно, за 30 минут"
+
+
+def test_assemble_sell_from_showcase_and_bot_sync(shop):
+    db, user, shift, rose, eucalyptus, paper = shop
+    recipe_id = db.save_recipe(Recipe(0, "Классика", 3500, items=[(rose, 11), (eucalyptus, 3), (paper, 1.5)]))
+    assert db.showcase() == []  # пока не собран — в боте его нет
+    db.assemble(recipe_id, 2, user.id, shift.id, NOW)
+    assert (db.stock_of(rose), db.stock_of(eucalyptus), db.stock_of(paper)) == (28, 14, 7)  # списалось сразу
+    assert db.get_recipe(recipe_id).ready == 2
+    item = db.showcase(only_active=True)[0]  # сам появился в боте
+    assert (item.title, item.price, item.recipe_id, item.stock) == ("Классика", 3500, recipe_id, 2)
+    assert "Роза красная × 11" in item.description and "Крафт" not in item.description
+
+    # продажа в магазине берёт собранный — цветы второй раз не списываются
+    db.add_sale([CartLine("Классика", 1, 3500, recipe_id=recipe_id)], "card", user.id, shift.id, NOW)
+    assert db.stock_of(rose) == 28 and db.ready_of(recipe_id) == 1
+    assert db.sales_of_shift(shift.id)[0].cost == 11 * 80 + 3 * 30 + 1.5 * 20
+    assert db.showcase(only_active=True)[0].stock == 1
+
+    # заказ из бота бронирует последний — для остальных пропал
+    db.touch_client("42", "Иван", "", NOW)
+    order = db.add_client_order("42", NOW, NOW.date(), "15:00", "Классика", "Ленина, 1", "Маша", "", "", item.id)
+    assert db.showcase(only_active=True) == [] and db.get_showcase_item(item.id).stock == 0
+    db.set_client_order_status(order.id, "rejected", NOW)  # отказ — снова в наличии
+    assert db.showcase(only_active=True)[0].stock == 1
+    order = db.add_client_order("42", NOW, NOW.date(), "15:00", "Классика", "Ленина, 1", "Маша", "", "", item.id)
+    db.price_client_order(order.id, 4000, 500, NOW)
+    db.confirm_client_order(order.id, user.id, NOW, shift.id)  # продажа с витрины, без нового списания
+    assert db.ready_of(recipe_id) == 0 and db.stock_of(rose) == 28 and db.showcase(only_active=True) == []
+
+    # без собранных продажа списывает по техкарте, как раньше
+    db.add_sale([CartLine("Классика", 1, 3500, recipe_id=recipe_id)], "cash", user.id, shift.id, NOW)
+    assert db.stock_of(rose) == 17 and db.ready_of(recipe_id) == 0
+    db.assemble(recipe_id, 1, user.id, shift.id, NOW)
+    assert db.showcase(only_active=True)[0].id == item.id  # тот же пункт витрины, не дубль
+
+
+def test_cancel_returns_bouquet_to_showcase(shop):
+    db, user, shift, rose, *_ = shop
+    recipe_id = db.save_recipe(Recipe(0, "Моно", 2900, items=[(rose, 9)]))
+    db.assemble(recipe_id, 1, user.id, shift.id, NOW)
+    sale = db.add_sale([CartLine("Моно", 1, 2900, recipe_id=recipe_id)], "cash", user.id, shift.id, NOW)
+    db.cancel_sale(sale, "Ошиблись", user.id, NOW)
+    assert db.ready_of(recipe_id) == 1 and db.stock_of(rose) == 41
+
+
+def test_write_off_and_disassemble_ready(shop):
+    db, user, shift, rose, eucalyptus, paper = shop
+    recipe_id = db.save_recipe(Recipe(0, "Классика", 3500, items=[(rose, 10), (eucalyptus, 2), (paper, 1)]))
+    db.assemble(recipe_id, 3, user.id, shift.id, NOW)
+    with pytest.raises(UserError, match="только 3"):
+        db.write_off_ready(recipe_id, 4, "Завяло", user.id, shift.id, NOW)
+    db.write_off_ready(recipe_id, 1, "Завяло", user.id, shift.id, NOW)  # завял на витрине — целиком
+    assert db.shift_sales(shift.id).writeoffs == {"Завяло": 10 * 80 + 2 * 30 + 20}
+    # разобрали один: 2 розы сломаны — в списание, остальное обратно на склад
+    db.disassemble(recipe_id, 1, {rose: 2}, "Разбито", user.id, shift.id, NOW)
+    assert db.ready_of(recipe_id) == 1
+    assert (db.stock_of(rose), db.stock_of(eucalyptus), db.stock_of(paper)) == (50 - 30 + 10 - 2, 20 - 6 + 2, 10 - 3 + 1)
+    assert db.shift_sales(shift.id).writeoffs["Разбито"] == 160
+    # пересобрать: разобрать и собрать по другой техкарте — недостающее со склада, лишнее остаётся там
+    small = db.save_recipe(Recipe(0, "Мини", 1500, items=[(rose, 5), (paper, 1)]))
+    db.disassemble(recipe_id, 1, {}, "", user.id, shift.id, NOW)
+    db.assemble(small, 2, user.id, shift.id, NOW)
+    assert (db.ready_of(recipe_id), db.ready_of(small)) == (0, 2)
+    assert db.stock_of(rose) == 28 + 10 - 10 and db.stock_of(paper) == 8 + 1 - 2
+    assert [k for _, k, _, _ in db.ready_moves_of(recipe_id)][:2] == ["disassemble", "disassemble"]
+    assert db.stock_value() == round(db.stock_of(rose) * 80 + db.stock_of(eucalyptus) * 30 + db.stock_of(paper) * 20
+                                     + 2 * (5 * 80 + 20))
+
+
+def test_recipe_composition_and_hidden_from_bot(shop):
+    db, user, shift, rose, eucalyptus, paper = shop
+    r = Recipe(0, "Для своих", 1000, items=[(paper, 1.5), (eucalyptus, 2), (rose, 7)], in_bot=False)
+    db.save_recipe(r)
+    assert db.composition(db.get_recipe(r.id)) == [("Цветы", ["Роза красная × 7"]), ("Зелень", ["Эвкалипт × 2 ветка"]),
+                                                   ("Упаковка", ["Крафт × 1,5 лист"])]
+    db.assemble(r.id, 1, user.id, shift.id, NOW)
+    assert db.showcase() == []  # «не показывать в боте»
+    shown = db.save_recipe(Recipe(0, "В бот", 2000, items=[(rose, 5)]))
+    db.assemble(shown, 1, user.id, shift.id, NOW)
+    db.archive_recipe(shown)
+    assert db.showcase(only_active=True) == []  # в архиве — из бота убрали

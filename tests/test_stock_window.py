@@ -151,3 +151,59 @@ def test_markup_and_change_total(main, db, monkeypatch):
     w._refresh_catalog()
     dlg.deleteLater()
     w.deleteLater()
+
+
+def test_assemble_disassemble_from_window(main, db, monkeypatch):
+    from app.stock_window import AssembleDialog, DisassembleDialog, ReadyWriteOffDialog
+    monkeypatch.setattr(QDialog, "exec", lambda self: QDialog.Accepted)
+    w = StockWindow(main)
+    w.tabs.setCurrentIndex(3)
+    w.recipes_table.selectRow(0)
+    recipe = db.recipes()[0]
+    rose = db.products()[1]
+    monkeypatch.setattr(AssembleDialog, "exec", lambda self: (self.qty_box.setValue(2), QDialog.Accepted)[1])
+    w._assemble()
+    assert db.ready_of(recipe.id) == 2 and db.stock_of(rose.id) == 30 - 18
+    assert w.recipes_table.item(0, 3).text() == "2" and main.log[-1] == ("Букет собран на витрину",
+                                                                          "Букет из 9 роз × 2")
+    assert "Цветы: Роза × 9" in w.recipes_table.item(0, 1).text()
+    shown = db.showcase(only_active=True)
+    assert len(shown) == 1 and shown[0].stock == 2  # и в боте
+
+    other = db.save_recipe(Recipe(0, "Мини", 1500, items=[(rose.id, 5)]))
+
+    def disassemble(self):
+        self.broken_boxes[0][2].setValue(1)  # одна роза сломана
+        self.rebuild.setChecked(True)
+        self.target_box.setCurrentIndex(self.target_box.findData(other))
+        return QDialog.Accepted
+    monkeypatch.setattr(DisassembleDialog, "exec", disassemble)
+    w._disassemble()
+    assert db.ready_of(recipe.id) == 1 and db.ready_of(other) == 1
+    assert db.stock_of(rose.id) == 12 + 9 - 1 - 5
+    assert "пересобрали в «Мини»" in main.log[-1][1] and "Роза × 1" in main.log[-1][1]
+
+    monkeypatch.setattr(ReadyWriteOffDialog, "exec", lambda self: QDialog.Accepted)
+    w._write_off_ready()
+    assert db.ready_of(recipe.id) == 0 and main.log[-1][0] == "Букет списан с витрины"
+    w.tabs.setCurrentIndex(0)
+    tile = next(t for t in w.grid.tiles if t.key == ("recipe", other))
+    assert any("готово: 1" in lbl.text() for lbl in tile.findChildren(type(w.adjust_label)))
+    w.deleteLater()
+
+
+def test_import_button(main, db, tmp_path, monkeypatch):
+    from app.stock_window import ImportDialog
+    path = tmp_path / "t.csv"
+    path.write_text("Название;Раздел;Цена;Закупочная цена;Остаток\nАстильба;Цветы;350;120;12\nРоза;Цветы;260;;\n",
+                    encoding="utf-8")
+    seen = []
+    monkeypatch.setattr(ImportDialog, "exec", lambda self: seen.append(self.windowTitle()) or QDialog.Accepted)
+    monkeypatch.setattr(QMessageBox, "information", lambda *a: seen.append(a[2]))
+    w = StockWindow(main)
+    w._import(str(path))
+    assert seen[-1] == "Готово: добавлено 1, обновлено 1."
+    assert next(p for p in db.products() if p.name == "Астильба").stock == 12
+    assert next(p for p in db.products() if p.name == "Роза").price == 260
+    assert main.log[-1][0] == "Товары загружены из таблицы"
+    w.deleteLater()

@@ -222,7 +222,8 @@ CREATE TABLE IF NOT EXISTS showcase (
     file_id     TEXT    NOT NULL DEFAULT '',
     active      INTEGER NOT NULL DEFAULT 1,
     position    INTEGER NOT NULL DEFAULT 0,
-    single      INTEGER NOT NULL DEFAULT 0
+    single      INTEGER NOT NULL DEFAULT 0,
+    recipe_id   INTEGER
 );
 CREATE TABLE IF NOT EXISTS client_chats (
     chat_id   TEXT PRIMARY KEY,
@@ -300,6 +301,7 @@ SHIFT_MIGRATIONS = {
 
 SHOWCASE_MIGRATIONS = {
     "single": "ALTER TABLE showcase ADD COLUMN single INTEGER NOT NULL DEFAULT 0",
+    "recipe_id": "ALTER TABLE showcase ADD COLUMN recipe_id INTEGER",
 }
 
 PENALTY_MIGRATIONS = {
@@ -428,6 +430,13 @@ class ShowcaseItem:
     active: bool = True
     position: int = 0
     single: bool = False  # готовый букет в одном экземпляре: заказали — прячется с витрины сам
+    recipe_id: int | None = None  # собирается по техкарте: показывается, пока есть собранные
+    stock: int | None = None  # собрано минус забронировано заказами (только у букетов по техкарте)
+
+    @property
+    def visible(self) -> bool:
+        """Видят ли клиенты: включён и (если по техкарте) есть в наличии."""
+        return self.active and (self.stock is None or self.stock > 0)
 
 
 @dataclass
@@ -499,11 +508,15 @@ class ClientStore:
     # --- витрина ---
 
     def showcase(self, only_active: bool = False) -> list[ShowcaseItem]:
-        sql = "SELECT id, title, description, price, photo, file_id, active, position, single FROM showcase"
-        if only_active:
-            sql += " WHERE active = 1"
-        rows = self.conn.execute(sql + " ORDER BY position, id").fetchall()
-        return [ShowcaseItem(r[0], r[1], r[2], r[3], r[4], r[5], bool(r[6]), r[7], bool(r[8])) for r in rows]
+        sql = ("SELECT s.id, s.title, s.description, s.price, s.photo, s.file_id, s.active, s.position, s.single,"
+               " s.recipe_id, CASE WHEN s.recipe_id IS NULL THEN NULL ELSE"
+               " COALESCE((SELECT SUM(m.qty) FROM ready_moves m WHERE m.recipe_id = s.recipe_id), 0)"
+               " - (SELECT COUNT(*) FROM client_orders o WHERE o.showcase_id = s.id"
+               "    AND o.status IN ('new', 'priced', 'paid_claimed')) END FROM showcase s")
+        rows = self.conn.execute(sql + " ORDER BY s.position, s.id").fetchall()
+        items = [ShowcaseItem(r[0], r[1], r[2], r[3], r[4], r[5], bool(r[6]), r[7], bool(r[8]), r[9],
+                              None if r[10] is None else int(r[10])) for r in rows]
+        return [i for i in items if i.visible] if only_active else items
 
     def get_showcase_item(self, item_id: int) -> ShowcaseItem | None:
         return next((i for i in self.showcase() if i.id == item_id), None)
@@ -692,9 +705,11 @@ class ClientStore:
                           (d.id, _ts(now), order_id))
         self.conn.commit()
         bouquet = order.amount - order.delivery_fee
+        item = self.get_showcase_item(order.showcase_id) if order.showcase_id else None
+        recipe_id = item.recipe_id if item else None  # собранный букет с витрины — продаётся с витрины, без списания
         if bouquet > 0:
-            self.add_sale([CartLine(order.items.splitlines()[0] if order.items else "Букет", 1, bouquet)], "qr",
-                          user_id, shift_id, now, note=f"Заказ из бота №{order_id}", flowers=True)
+            self.add_sale([CartLine(order.items.splitlines()[0] if order.items else "Букет", 1, bouquet, recipe_id)],
+                          "qr", user_id, shift_id, now, note=f"Заказ из бота №{order_id}", flowers=True)
         return d
 
     def order_for_delivery(self, delivery_id: int) -> ClientOrder | None:

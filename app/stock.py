@@ -48,8 +48,23 @@ CREATE TABLE IF NOT EXISTS recipes (
     title  TEXT    NOT NULL,
     price  INTEGER NOT NULL DEFAULT 0,
     active INTEGER NOT NULL DEFAULT 1,
-    photo  BLOB
+    photo  BLOB,
+    ready_cost REAL NOT NULL DEFAULT 0,
+    in_bot INTEGER NOT NULL DEFAULT 1
 );
+CREATE TABLE IF NOT EXISTS ready_moves (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    recipe_id  INTEGER NOT NULL,
+    at         TEXT    NOT NULL,
+    qty        REAL    NOT NULL,
+    kind       TEXT    NOT NULL,
+    cost       REAL    NOT NULL DEFAULT 0,
+    ref        INTEGER,
+    reason     TEXT    NOT NULL DEFAULT '',
+    shift_id   INTEGER,
+    user_id    INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_ready_moves_recipe ON ready_moves(recipe_id);
 CREATE TABLE IF NOT EXISTS recipe_items (
     recipe_id  INTEGER NOT NULL,
     product_id INTEGER NOT NULL,
@@ -89,11 +104,19 @@ STOCK_MIGRATIONS = {  # (таблица, столбец) → как добави
     ("products", "photo"): "ALTER TABLE products ADD COLUMN photo BLOB",
     ("recipes", "photo"): "ALTER TABLE recipes ADD COLUMN photo BLOB",
     ("sales", "adjust_note"): "ALTER TABLE sales ADD COLUMN adjust_note TEXT NOT NULL DEFAULT ''",
+    ("recipes", "ready_cost"): "ALTER TABLE recipes ADD COLUMN ready_cost REAL NOT NULL DEFAULT 0",
+    ("recipes", "in_bot"): "ALTER TABLE recipes ADD COLUMN in_bot INTEGER NOT NULL DEFAULT 1",
 }
+OPEN_ORDER = "('new', 'priced', 'paid_claimed')"  # заказ из бота ещё не принят — букет забронирован
 
 CATEGORIES = ("Цветы", "Зелень", "Упаковка", "Горшечные", "Сопутствующие")
 FLOWER_CATEGORIES = ("Цветы", "Зелень")  # что считается «цветами» в выручке смены
 PAYMENTS = {"cash": "Наличные", "card": "Терминал", "qr": "QR / перевод"}
+
+
+# списания и товаров, и готовых букетов с витрины
+WRITEOFFS = ("SELECT at, qty, cost, reason, shift_id FROM stock_moves WHERE kind='writeoff'"
+             " UNION ALL SELECT at, qty, cost, reason, shift_id FROM ready_moves WHERE kind='writeoff'")
 
 
 class StockError(Exception):
@@ -135,6 +158,8 @@ class Recipe:
     active: bool = True
     items: list[tuple[int, float]] = field(default_factory=list)  # (товар, сколько)
     has_photo: bool = False
+    ready: float = 0  # собрано и стоит на витрине
+    in_bot: bool = True  # собранные показывать в витрине ботов
 
 
 @dataclass
@@ -373,13 +398,15 @@ class StockStore:
     # ----- техкарты -----
 
     def recipes(self, active_only: bool = True) -> list[Recipe]:
-        sql = ("SELECT id, title, price, active, photo IS NOT NULL FROM recipes"
-               + (" WHERE active = 1" if active_only else ""))
+        sql = ("SELECT r.id, r.title, r.price, r.active, r.photo IS NOT NULL, r.in_bot,"
+               " COALESCE((SELECT SUM(m.qty) FROM ready_moves m WHERE m.recipe_id = r.id), 0) FROM recipes r"
+               + (" WHERE r.active = 1" if active_only else ""))
         result = []
         for r in self.conn.execute(sql + " ORDER BY title COLLATE NOCASE").fetchall():
             items = self.conn.execute("SELECT product_id, qty FROM recipe_items WHERE recipe_id=? ORDER BY rowid",
                                       (r[0],)).fetchall()
-            result.append(Recipe(r[0], r[1], r[2], bool(r[3]), [tuple(x) for x in items], bool(r[4])))
+            result.append(Recipe(r[0], r[1], r[2], bool(r[3]), [tuple(x) for x in items], bool(r[4]),
+                                 round(r[6], 3), bool(r[5])))
         return result
 
     def get_recipe(self, recipe_id: int) -> Recipe | None:
@@ -395,12 +422,15 @@ class StockStore:
         if not items:
             raise StockError("Добавьте в техкарту хотя бы один цветок или упаковку.")
         if r.id:
-            self.conn.execute("UPDATE recipes SET title=?, price=?, active=? WHERE id=?",
-                              (title, r.price, int(r.active), r.id))
+            self.conn.execute("UPDATE recipes SET title=?, price=?, active=?, in_bot=? WHERE id=?",
+                              (title, r.price, int(r.active), int(r.in_bot), r.id))
             self.conn.execute("DELETE FROM recipe_items WHERE recipe_id=?", (r.id,))
+            self.conn.execute("UPDATE showcase SET price=? WHERE recipe_id=?", (r.price, r.id))  # цена и в боте
+            if not r.in_bot:
+                self.conn.execute("UPDATE showcase SET active=0 WHERE recipe_id=?", (r.id,))
         else:
-            r.id = self.conn.execute("INSERT INTO recipes (title, price, active) VALUES (?, ?, ?)",
-                                     (title, r.price, int(r.active))).lastrowid
+            r.id = self.conn.execute("INSERT INTO recipes (title, price, active, in_bot) VALUES (?, ?, ?, ?)",
+                                     (title, r.price, int(r.active), int(r.in_bot))).lastrowid
         self.conn.executemany("INSERT INTO recipe_items (recipe_id, product_id, qty) VALUES (?, ?, ?)",
                               [(r.id, pid, qty) for pid, qty in items])
         self.conn.commit()
@@ -408,7 +438,116 @@ class StockStore:
 
     def archive_recipe(self, recipe_id: int):
         self.conn.execute("UPDATE recipes SET active=0 WHERE id=?", (recipe_id,))
+        self.conn.execute("UPDATE showcase SET active=0 WHERE recipe_id=?", (recipe_id,))
         self.conn.commit()
+
+    def composition(self, recipe: Recipe, flowers_only: bool = False) -> list[tuple[str, list[str]]]:
+        """Состав по разделам: [(«Цветы», [«Роза пионовидная × 7», …]), («Зелень», …), …]."""
+        names = {p.id: p for p in self.products(active_only=False)}
+        groups: dict[str, list[str]] = {}
+        for pid, qty in recipe.items:
+            p = names.get(pid)
+            if p is None or (flowers_only and p.category not in FLOWER_CATEGORIES):
+                continue
+            unit = f" {p.unit}" if p.unit != "шт" and not flowers_only else ""  # клиентам в боте — без «ветка», «м»
+            groups.setdefault(p.category, []).append(f"{p.name} × {qty_text(qty)}{unit}")
+        order = {c: i for i, c in enumerate(CATEGORIES)}
+        return sorted(groups.items(), key=lambda g: order.get(g[0], len(order)))
+
+    # ----- готовые букеты на витрине: собрать, продать, списать, разобрать -----
+
+    def ready_of(self, recipe_id: int) -> float:
+        return self.conn.execute("SELECT COALESCE(SUM(qty), 0) FROM ready_moves WHERE recipe_id=?",
+                                 (recipe_id,)).fetchone()[0]
+
+    def _ready_move(self, recipe_id: int, qty: float, kind: str, cost: float, now: datetime, ref: int | None = None,
+                    reason: str = "", shift_id: int | None = None, user_id: int | None = None):
+        self.conn.execute("INSERT INTO ready_moves (recipe_id, at, qty, kind, cost, ref, reason, shift_id, user_id)"
+                          " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                          (recipe_id, _ts(now), qty, kind, cost, ref, reason, shift_id, user_id))
+
+    def _ready_cost(self, recipe_id: int) -> float:
+        r = self.conn.execute("SELECT ready_cost FROM recipes WHERE id=?", (recipe_id,)).fetchone()
+        return r[0] if r else 0
+
+    def assemble(self, recipe_id: int, qty: int, user_id: int | None, shift_id: int | None, now: datetime) -> float:
+        """Собрали букет(ы) по техкарте на витрину: цветы и упаковка списываются со склада сразу,
+        на витрине +qty готовых (и в ботах). Возвращает себестоимость одного букета."""
+        recipe = self.get_recipe(recipe_id)
+        if recipe is None or not recipe.items:
+            raise StockError("Такой техкарты нет.")
+        if qty <= 0:
+            raise StockError("Сколько собрали? Укажите больше нуля.")
+        unit = self.recipe_cost(recipe)
+        for pid, q in recipe.items:
+            self._move(pid, -q * qty, "assembly", self._avg_cost(pid), now, ref=recipe_id, shift_id=shift_id,
+                       user_id=user_id)
+        have = max(self.ready_of(recipe_id), 0)
+        avg = (have * self._ready_cost(recipe_id) + qty * unit) / (have + qty)
+        self.conn.execute("UPDATE recipes SET ready_cost=? WHERE id=?", (avg, recipe_id))
+        self._ready_move(recipe_id, qty, "assemble", unit, now, shift_id=shift_id, user_id=user_id)
+        self._publish(recipe)
+        self.conn.commit()
+        return unit
+
+    def _publish(self, recipe: Recipe):
+        """Собранный букет — на витрину ботов: свой пункт витрины (создаётся один раз) снова показывается."""
+        if not recipe.in_bot:
+            return
+        row = self.conn.execute("SELECT id FROM showcase WHERE recipe_id=?", (recipe.id,)).fetchone()
+        if row:
+            self.conn.execute("UPDATE showcase SET active=1 WHERE id=?", (row[0],))
+            return
+        parts = self.composition(recipe, flowers_only=True)
+        description = ("Состав: " + ", ".join(x for _, items in parts for x in items)) if parts else ""
+        position = self.conn.execute("SELECT COALESCE(MAX(position), 0) + 1 FROM showcase").fetchone()[0]
+        self.conn.execute("INSERT INTO showcase (title, description, price, photo, active, position, single, recipe_id)"
+                          " VALUES (?, ?, ?, ?, 1, ?, 0, ?)",
+                          (recipe.title, description, recipe.price, self.photo_of("recipe", recipe.id), position,
+                           recipe.id))
+
+    def reserved_of(self, recipe_id: int) -> int:
+        """Сколько собранных забронировано заказами из бота (ещё не принятыми)."""
+        return self.conn.execute(
+            "SELECT COUNT(*) FROM client_orders o JOIN showcase s ON s.id = o.showcase_id"
+            f" WHERE s.recipe_id=? AND o.status IN {OPEN_ORDER}", (recipe_id,)).fetchone()[0]
+
+    def _check_ready(self, recipe_id: int, qty: float):
+        ready = self.ready_of(recipe_id)
+        if qty <= 0:
+            raise StockError("Укажите, сколько букетов.")
+        if qty > ready:
+            raise StockError(f"На витрине только {qty_text(max(ready, 0))} шт.")
+
+    def write_off_ready(self, recipe_id: int, qty: float, reason: str, user_id: int | None, shift_id: int | None,
+                        now: datetime):
+        """Готовый букет завял / сломался на витрине — списать целиком (по себестоимости сборки)."""
+        self._check_ready(recipe_id, qty)
+        self._ready_move(recipe_id, -qty, "writeoff", self._ready_cost(recipe_id), now, reason=reason or "Другое",
+                         shift_id=shift_id, user_id=user_id)
+        self.conn.commit()
+
+    def disassemble(self, recipe_id: int, qty: float, broken: dict[int, float], reason: str, user_id: int | None,
+                    shift_id: int | None, now: datetime):
+        """Разобрали готовый букет: всё из него возвращается на склад, а то, что выкинули (broken: товар →
+        сколько), сразу списывается с причиной. Пересобрать — после этого просто собрать другой букет."""
+        self._check_ready(recipe_id, qty)
+        recipe = self.get_recipe(recipe_id)
+        self._ready_move(recipe_id, -qty, "disassemble", self._ready_cost(recipe_id), now, shift_id=shift_id,
+                         user_id=user_id)
+        for pid, q in recipe.items:
+            self._move(pid, q * qty, "disassembly", self._avg_cost(pid), now, ref=recipe_id, shift_id=shift_id,
+                       user_id=user_id)
+        for pid, q in broken.items():
+            if q > 0:
+                self._move(pid, -q, "writeoff", self._avg_cost(pid), now, reason=reason or "Другое",
+                           shift_id=shift_id, user_id=user_id)
+        self.conn.commit()
+
+    def ready_moves_of(self, recipe_id: int, limit: int = 100) -> list[tuple[datetime, str, float, str]]:
+        rows = self.conn.execute("SELECT at, kind, qty, reason FROM ready_moves WHERE recipe_id=? ORDER BY id DESC"
+                                 " LIMIT ?", (recipe_id, limit)).fetchall()
+        return [(datetime.fromisoformat(r[0]), r[1], r[2], r[3]) for r in rows]
 
     def recipe_cost(self, recipe: Recipe) -> float:
         """Себестоимость букета по средним закупочным ценам."""
@@ -449,10 +588,17 @@ class StockStore:
             if line.recipe_id is not None:
                 recipe = self.get_recipe(line.recipe_id)
                 title = title or (recipe.title if recipe else "")
-                for pid, qty in recipe.items if recipe else []:
+                ready = min(max(self.ready_of(line.recipe_id), 0), line.qty)  # сначала — собранные с витрины
+                if ready:
+                    unit = self._ready_cost(line.recipe_id)
+                    cost += ready * unit
+                    self._ready_move(line.recipe_id, -ready, "sale", unit, now, ref=sale_id, shift_id=shift_id,
+                                     user_id=user_id)
+                rest = line.qty - ready  # не было собранных — цветы списываются по техкарте сейчас
+                for pid, qty in recipe.items if recipe and rest else []:
                     unit = self._avg_cost(pid)
-                    cost += qty * line.qty * unit
-                    self._move(pid, -qty * line.qty, "sale", unit, now, ref=sale_id, shift_id=shift_id, user_id=user_id)
+                    cost += qty * rest * unit
+                    self._move(pid, -qty * rest, "sale", unit, now, ref=sale_id, shift_id=shift_id, user_id=user_id)
                 flowers_gross += line.amount  # букет — продажа цветов
             elif line.product_id is not None:
                 unit = self._avg_cost(line.product_id)
@@ -485,6 +631,9 @@ class StockStore:
         for pid, qty, cost in self.conn.execute(
                 "SELECT product_id, qty, cost FROM stock_moves WHERE kind='sale' AND ref=?", (sale_id,)).fetchall():
             self._move(pid, -qty, "return", cost, now, ref=sale_id, reason=reason, shift_id=r[1], user_id=user_id)
+        for rid, qty, cost in self.conn.execute(  # проданный с витрины букет — обратно на витрину
+                "SELECT recipe_id, qty, cost FROM ready_moves WHERE kind='sale' AND ref=?", (sale_id,)).fetchall():
+            self._ready_move(rid, -qty, "return", cost, now, ref=sale_id, reason=reason, shift_id=r[1], user_id=user_id)
         self.conn.execute("UPDATE sales SET cancelled_at=?, cancel_reason=? WHERE id=?", (_ts(now), reason.strip(), sale_id))
         self.conn.commit()
 
@@ -521,14 +670,14 @@ class StockStore:
             result.flowers += s.flowers
             setattr(result, s.payment, getattr(result, s.payment) + s.total)
         for reason, amount in self.conn.execute(
-                "SELECT reason, SUM(-qty * cost) FROM stock_moves WHERE shift_id=? AND kind='writeoff' GROUP BY reason",
+                f"SELECT reason, SUM(-qty * cost) FROM ({WRITEOFFS}) WHERE shift_id=? GROUP BY reason",
                 (shift_id,)).fetchall():
             result.writeoffs[reason] = round(amount)
         return result
 
     def writeoffs_between(self, start: datetime, end: datetime) -> dict[str, int]:
         return {reason: round(amount) for reason, amount in self.conn.execute(
-            "SELECT reason, SUM(-qty * cost) FROM stock_moves WHERE kind='writeoff' AND at >= ? AND at < ?"
+            f"SELECT reason, SUM(-qty * cost) FROM ({WRITEOFFS}) WHERE at >= ? AND at < ?"
             " GROUP BY reason ORDER BY 2 DESC", (_ts(start), _ts(end))).fetchall()}
 
     def supplies_total(self, start: datetime, end: datetime) -> int:
@@ -560,8 +709,9 @@ class StockStore:
         return report
 
     def stock_value(self) -> int:
-        """Сколько стоит всё, что лежит на складе (по средней закупочной цене)."""
-        return round(sum(p.stock * p.avg_cost for p in self.products() if p.stock > 0))
+        """Сколько стоит всё, что лежит на складе и на витрине (по себестоимости)."""
+        goods = sum(p.stock * p.avg_cost for p in self.products() if p.stock > 0)
+        return round(goods + sum(r.ready * self._ready_cost(r.id) for r in self.recipes() if r.ready > 0))
 
     def stock_moves_of(self, product_id: int, limit: int = 100) -> list[tuple[datetime, str, float, str]]:
         """История товара: (когда, что, сколько, причина)."""

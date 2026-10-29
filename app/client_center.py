@@ -630,11 +630,15 @@ class ClientCenter(QDialog):
         self.show_list.blockSignals(True)
         self.show_list.clear()
         for x in self.db.showcase():
-            text = (f"{x.title} — {money(x.price)}" + (" · 1️⃣" if x.single else "")
-                    + ("" if x.active else ("\nпродан / заказан (скрыт)" if x.single else "\nнет в наличии (скрыт)")))
+            if x.stock is not None:  # собирается по техкарте — наличие из «🛒 Продажи и склад»
+                state = (f"\n💐 собрано: {x.stock}" if x.stock > 0 else "\n💐 собранных нет (скрыт)") + (
+                    "" if x.active else ", скрыт вручную")
+            else:
+                state = "" if x.active else ("\nпродан / заказан (скрыт)" if x.single else "\nнет в наличии (скрыт)")
+            text = f"{x.title} — {money(x.price)}" + (" · 1️⃣" if x.single else "") + state
             item = QListWidgetItem(QIcon(pixmap(x.photo, 112)) if x.photo else QIcon(), text)
             item.setData(Qt.UserRole, x.id)
-            if not x.active:
+            if not x.visible:
                 item.setForeground(self._color("gray"))
             self.show_list.addItem(item)
             if x.id == current:
@@ -654,6 +658,10 @@ class ClientCenter(QDialog):
         self.item_price.setValue(self._item.price)
         self.active_check.setChecked(self._item.active)
         self.single_check.setChecked(self._item.single)
+        linked = self._item.recipe_id is not None
+        self.single_check.setEnabled(not linked)  # у собранных по техкарте наличие считается само
+        self.single_check.setToolTip("Собирается по техкарте: в боте видно, пока есть собранные "
+                                     "(«🛒 Продажи» → «📋 Техкарты» → «💐 Собрать»)" if linked else "")
         self._set_item_photo(self._item.photo)
         self.delete_item_btn.setEnabled(bool(self._item.id))
         self.save_item_btn.setText("💾 Сохранить" if self._item.id else "💾 Добавить на витрину")
@@ -681,7 +689,7 @@ class ClientCenter(QDialog):
     def _save_item(self):
         x = ShowcaseItem(self._item.id, self.title_edit.text(), self.desc_edit.toPlainText(), self.item_price.value(),
                          self._photo, self._item.file_id, self.active_check.isChecked(),
-                         single=self.single_check.isChecked())
+                         single=self.single_check.isChecked() and self._item.recipe_id is None)
         try:
             item_id = self.db.save_showcase_item(x)
         except UserError as e:
