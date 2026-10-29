@@ -74,3 +74,44 @@ def test_bad_files(db, tmp_path):
     (tmp_path / "broken.xlsx").write_bytes(b"not a zip")
     with pytest.raises(UserError, match="Не получается открыть"):
         stock_import.read_table(str(tmp_path / "broken.xlsx"))
+
+
+def test_hoog_stock_export(db, tmp_path):
+    """Выгрузка остатков Hoog: ID, Магазин, «Товар (номер)», Количество строкой; цен и разделов нет."""
+    book = Workbook()
+    sheet = book.active
+    sheet.append(["ID\n(Click to sort ascending)", "Магазин\n(Click to clear sorting)", "Товар\n(Click to clear sorting)",
+                  "Количество\n(Click to clear sorting)", None])
+    for row in ([1, "Страна Чудес (6827)", "Кения (565001)", "301.00"],
+                [2, "Страна Чудес (6827)", "Матиола (565285)", "30.00"],
+                [3, "Страна Чудес (6827)", "Матиола (380111)", "2.00"],  # то же имя, другой товар Hoog — сложить
+                [4, "Страна Чудес (6827)", "Букет 20 (567164)", "1.00"],  # собранный в Hoog — не товар
+                [5, "Страна Чудес (6827)", "Пинк Лола (380394)", "0.00"],  # закончился
+                [6, "Страна Чудес (6827)", "Фольгированные Шары н1 (400001)", "2.00"],
+                [7, "Страна Чудес (6827)", "Банты н3 (400002)", "40.00"],
+                [8, "Страна Чудес (6827)", "Мыльный бокс н301 (400003)", "1.00"],
+                [9, "Страна Чудес (6827)", "Эвкалипт (400004)", "9.00"],
+                [10, "Страна Чудес (6827)", "Гипсофила (400005)", "17.60"]):
+        sheet.append(row)
+    path = str(tmp_path / "Остатки на складах.xlsx")
+    book.save(path)
+    rows, problems = stock_import.parse(db, stock_import.read_table(path))
+    got = {r.name: (r.category, r.stock) for r in rows}
+    assert got == {"Кения": ("Цветы", 301), "Матиола": ("Цветы", 32), "Фольгированные Шары н1": ("Сопутствующие", 2),
+                   "Банты н3": ("Упаковка", 40), "Мыльный бокс н301": ("Сопутствующие", 1),
+                   "Эвкалипт": ("Зелень", 9), "Гипсофила": ("Цветы", 17.6)}
+    text = " ".join(problems)
+    assert "нулевым остатком — 1" in text and "Собранных букетов из Hoog" in text and "— 1: остатки сложил" in text
+    assert "Цен в таблице нет" in text
+    assert stock_import.apply(db, rows, None, NOW) == (7, 0)
+    stock_flower = next(p for p in db.products() if p.name == "Матиола")
+    stock_flower.category = "Сухоцветы"  # поправили раздел руками
+    db.save_product(stock_flower)
+    # следом — прайс с ценами: цены обновятся, остатки и поправленный раздел не тронутся
+    prices = tmp_path / "цены.csv"
+    prices.write_text("Товар;Цена\nКения (565001);250\nМатиола;180\n", encoding="utf-8")
+    rows, _ = stock_import.parse(db, stock_import.read_table(str(prices)))
+    assert stock_import.apply(db, rows, None, NOW) == (0, 2)
+    kenya = next(p for p in db.products() if p.name == "Кения")
+    assert (kenya.price, kenya.stock, kenya.category) == (250, 301, "Цветы")
+    assert next(p for p in db.products() if p.name == "Матиола").category == "Сухоцветы"

@@ -24,6 +24,30 @@ COLUMNS = {
 }
 
 
+HOOG_ID = re.compile(r"\s*\((\d{3,})\)\s*$")  # «Кения (565123)» — номер товара в Hoog
+READY_BOUQUET = re.compile(r"(?i)^(букет|бокс|композиция|корзина)\s*№?\s*\d+$")  # «Букет 20» — собранный в Hoog
+
+# раздел по названию, если в таблице его нет (выгрузка остатков Hoog): первое совпадение
+# («Мыльный бокс» — подарок, а не упаковка, поэтому сопутствующие проверяются раньше)
+GUESS = (
+    ("Зелень", ("эвкалипт", "рускус", "самшит", "зелень", "паникум", "салал", "питтоспорум", "аспидистра",
+                "папоротник")),
+    ("Сопутствующие", ("шар", "гелий", "открытк", "свеч", "конфет", "подар", "игрушк", "брелок", "бижутер",
+                       "благовон", "гирлянд", "диплом", "занавес", "картин", "тарелк", "часы", "хлопушк",
+                       "бигуди", "мыльн", "топпер", "ваза", "кашпо")),
+    ("Упаковка", ("банты", "бант ", "пакет", "сумочк", "тишью", "фоамиран", "оазис", "лента", "бумага", "плёнк",
+                  "пленк", "фетр", "сетка", "коробк", "конверт", "крафт", "аквапак", "корзин", " бокс")),
+)
+
+
+def guess_category(name: str) -> str:
+    low = f" {name.casefold()} "
+    for category, words in GUESS:
+        if any(w in low for w in words):
+            return category
+    return "Цветы"
+
+
 @dataclass
 class ImportRow:
     line: int  # строка в таблице (для понятных ошибок)
@@ -35,6 +59,8 @@ class ImportRow:
     stock: float | None = None
     min_stock: float | None = None
     existing: Product | None = None
+    hoog_id: str = ""
+    guessed: bool = False  # раздел угадан по названию — уже заведённым не менять
 
     @property
     def action(self) -> str:
@@ -114,6 +140,7 @@ def parse(db, rows: list[list]) -> tuple[list[ImportRow], list[str]]:
         problems.append("Нет столбцов «Цена» и «Остаток» — загрузятся только названия.")
     existing = {p.name.casefold(): p for p in db.products()}
     seen: dict[str, ImportRow] = {}
+    zero = ready = summed = 0
 
     def cell(row, key):
         i = columns.get(key)
@@ -121,21 +148,51 @@ def parse(db, rows: list[list]) -> tuple[list[ImportRow], list[str]]:
 
     for line, row in enumerate(rows[start + 1:], start=start + 2):
         name = str(cell(row, "name") or "").strip()
+        found = HOOG_ID.search(name)
+        hoog_id = found.group(1) if found else ""
+        name = HOOG_ID.sub("", name).strip()
         if not name:
             continue
         category = str(cell(row, "category") or "").strip() or None
         if category:
             category = next((c for c in CATEGORIES if c.casefold() == category.casefold()), category)
+        guessed = not category and "category" not in columns
+        if guessed:
+            category = guess_category(name)
         unit = str(cell(row, "unit") or "").strip() or None
         price, cost = number(cell(row, "price")), number(cell(row, "cost"))
         stock, low = number(cell(row, "stock")), number(cell(row, "min_stock"))
         if any(v is not None and v < 0 for v in (price, cost, low)):
             problems.append(f"Строка {line} «{name}»: отрицательная цена — пропустил.")
             continue
-        if name.casefold() in seen:
+        if "stock" in columns and not stock and "price" not in columns:  # одни остатки, а тут ноль — не нужен
+            zero += 1
+            continue
+        if READY_BOUQUET.match(name):  # собранный букет из Hoog: состава нет — соберите заново по техкарте
+            ready += 1
+            continue
+        before = seen.get(name.casefold())
+        if before and hoog_id and before.hoog_id and hoog_id != before.hoog_id:  # в Hoog два товара с одним именем
+            before.stock = (before.stock or 0) + (stock or 0)
+            summed += 1
+            continue
+        if before:
             problems.append(f"Строка {line}: «{name}» уже был выше — взял последнюю строку.")
         seen[name.casefold()] = ImportRow(line, name, category, unit, None if price is None else round(price), cost,
-                                          stock, low, existing.get(name.casefold()))
+                                          stock, low, existing.get(name.casefold()), hoog_id, guessed)
+    if zero:
+        problems.append(f"С нулевым остатком — {zero}: не загружаю (закончились или старые).")
+    if ready:
+        problems.append(f"Собранных букетов из Hoog («Букет 20», «Бокс 13») — {ready}: не загружаю, их состава нет. "
+                        "Продавайте их как «✏️ Своя позиция» или соберите заново через «📋 Техкарты».")
+    if summed:
+        problems.append(f"Одинаковых названий под разными номерами Hoog — {summed}: остатки сложил.")
+    if "category" not in columns and seen:
+        problems.append("Разделов в таблице нет — угадал по названию (шары, свечи — «Сопутствующие», пакеты, "
+                        "банты — «Упаковка», эвкалипт — «Зелень», остальное — «Цветы»). Поправить можно потом.")
+    if "price" not in columns and seen:
+        problems.append("Цен в таблице нет — товары загрузятся с ценой 0. Выгрузите из Hoog список товаров "
+                        "с ценами и загрузите его следом: цены обновятся, остатки не тронутся.")
     if not seen:
         problems.append("В таблице нет ни одного товара.")
     return list(seen.values()), problems
@@ -147,7 +204,7 @@ def apply(db, rows: list[ImportRow], user_id: int | None, now: datetime) -> tupl
     supply: list[tuple[int, float, float]] = []
     for r in rows:
         p = r.existing or Product(0, r.name)
-        if r.category:
+        if r.category and not (r.existing and r.guessed):
             p.category = r.category
         if r.unit:
             p.unit = r.unit
