@@ -5,10 +5,11 @@
 
 import html
 import os
+import tempfile
 from datetime import date, datetime, timedelta
 
-from PySide6.QtCore import QRectF, Qt, QTimer
-from PySide6.QtGui import QColor, QFont, QKeySequence, QPainter, QPixmap, QShortcut
+from PySide6.QtCore import QRectF, Qt, QTimer, QUrl
+from PySide6.QtGui import QColor, QDesktopServices, QFont, QKeySequence, QPainter, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QButtonGroup, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFileDialog,
     QFormLayout, QFrame, QGridLayout, QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit, QMenu, QMessageBox,
@@ -21,7 +22,10 @@ from .delivery_dialog import money, money_box
 from .icon import flower_icon
 from .photos import pick_photo, pixmap
 from .shifts import WRITEOFF_REASONS
-from .stock import CATEGORIES, PAYMENTS, CartLine, Product, Recipe, day_range, qty_text, reorder_text
+from .labels import LAYOUTS, Label, labels_html
+from .stock import (
+    CATEGORIES, PAYMENTS, CartLine, Product, Recipe, day_range, ean13_check, qty_text, reorder_text, split_codes,
+)
 from .theme import C, primary
 
 MOVE_KINDS = {"supply": "Поставка", "sale": "Продажа", "writeoff": "Списание", "count": "Инвентаризация",
@@ -468,6 +472,34 @@ def _buttons(dialog: QDialog, ok: str = "Сохранить") -> QDialogButtonBo
 
 # ----- диалоги -----
 
+class CodesEdit(QWidget):
+    """Штрихкоды товара или букета: свой (кнопка) и заводские (отсканировать / вписать), через запятую."""
+
+    def __init__(self, db, codes: str):
+        super().__init__()
+        self.db = db
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self.edit = QLineEdit(codes)
+        self.edit.setPlaceholderText("отсканируйте заводской или нажмите «Создать свой»; несколько — через запятую")
+        layout.addWidget(self.edit, 1)
+        own = QPushButton("🏷 Создать свой")
+        own.setToolTip("Свой штрихкод магазина (EAN-13 на 200…) — напечатать на этикетке")
+        own.clicked.connect(self._add_own)
+        layout.addWidget(own)
+
+    def _add_own(self):
+        codes = split_codes(self.edit.text())
+        mine = self.db.new_own_code()
+        while mine in codes:  # уже вписан, но ещё не сохранён — следующий
+            mine = mine[:3] + f"{int(mine[3:12]) + 1:09d}"
+            mine += ean13_check(mine)
+        self.edit.setText(", ".join([*codes, mine]))
+
+    def text(self) -> str:
+        return self.edit.text()
+
+
 class PhotoPicker(QWidget):
     """Фото товара или букета для плитки в продаже: выбрать с компьютера или убрать."""
 
@@ -533,9 +565,8 @@ class ProductDialog(QDialog):
         self.min_box = qty_box()
         self.min_box.setValue(product.min_stock)
         form.addRow("Мало, если остаток ≤:", self.min_box)
-        self.barcode_edit = QLineEdit(product.barcode)
-        self.barcode_edit.setPlaceholderText("отсканируйте сканером или впишите цифры (необязательно)")
-        form.addRow("Штрихкод:", self.barcode_edit)
+        self.barcode_edit = CodesEdit(parent.db, product.barcode)
+        form.addRow("Штрихкоды:", self.barcode_edit)
         self.photo = PhotoPicker(parent.db.photo_of("product", product.id) if product.id else None)
         form.addRow("Фото:", self.photo)
         form.addRow(_gray("Себестоимость считается сама — по ценам из поставок. 0 в «мало» — не следить."))
@@ -593,7 +624,7 @@ class LinesEditor(QWidget):
         if pid is None:
             text = self.pick.currentText().strip().lower()
             code = "".join(text.split())
-            pid = next((p.id for p in self.products if code and p.barcode == code), None)  # отсканировали
+            pid = next((p.id for p in self.products if code and code in split_codes(p.barcode)), None)  # сканер
             if pid is None:
                 pid = next((p.id for p in self.products if text and text in p.name.lower()), None)
         if pid is not None:
@@ -721,6 +752,8 @@ class RecipeDialog(QDialog):
         form.addRow("Цена продажи:", self.price_box)
         self.photo = PhotoPicker(db.photo_of("recipe", recipe.id) if recipe.id else None)
         form.addRow("Фото:", self.photo)
+        self.codes = CodesEdit(db, recipe.barcode)
+        form.addRow("Штрихкоды:", self.codes)
         self.in_bot = QCheckBox("Собранные показывать в витрине ботов (Telegram и MAX)")
         self.in_bot.setChecked(recipe.in_bot)
         form.addRow(self.in_bot)
@@ -763,6 +796,7 @@ class RecipeDialog(QDialog):
             return
         r.title, r.price, r.items = self.title_edit.text(), self.price_box.value(), items
         r.in_bot = self.in_bot.isChecked()
+        r.barcode = self.codes.text()
         try:
             self.db.save_recipe(r)
         except UserError as e:
@@ -929,6 +963,120 @@ class DisassembleDialog(QDialog):
             box.setMaximum(total)
             self.table.item(i, 1).setText(qty_text(total))
             self.table.item(i, 3).setText(qty_text(max(total - box.value(), 0)))
+
+
+class LabelsDialog(QDialog):
+    """Этикетки со штрихкодами: отметить товары и букеты, сколько штук, с ценой или без — печать из браузера."""
+
+    def __init__(self, parent, db, kind: str = "product", ident: int | None = None):
+        super().__init__(parent)
+        self.db, self.created = db, 0
+        self.setWindowTitle("Этикетки со штрихкодами")
+        self.resize(860, 640)
+        layout = QVBoxLayout(self)
+        layout.addWidget(_gray("Отметьте, на что нужны этикетки, и сколько штук. У кого штрихкода ещё нет — программа "
+                               "создаст свой (EAN-13 на 200…). Есть заводской — напечатается он. Клеите этикетку на "
+                               "ведро, упаковку или букет — и в продаже просто сканируете."))
+        top = QHBoxLayout()
+        self.search = QLineEdit()
+        self.search.setPlaceholderText("🔍 Найти…")
+        self.search.setClearButtonEnabled(True)
+        self.search.textChanged.connect(self._filter)
+        top.addWidget(self.search, 1)
+        self.only_marked = QCheckBox("Только отмеченные")
+        self.only_marked.toggled.connect(self._filter)
+        top.addWidget(self.only_marked)
+        layout.addLayout(top)
+        self.items = [("recipe", r.id, "💐 " + r.title, r.price, r.barcode) for r in db.recipes()]
+        self.items += [("product", p.id, p.name, p.price, p.barcode) for p in db.products()]
+        self.table = _table(["", "Что", "Цена", "Штрихкод", "Сколько этикеток"], stretch=1)
+        self.table.setRowCount(len(self.items))
+        self.checks, self.copies = [], []
+        for i, (k, item_id, title, price, codes) in enumerate(self.items):
+            check = QCheckBox()
+            check.setChecked(k == kind and item_id == ident)
+            check.toggled.connect(self._update)
+            self.table.setCellWidget(i, 0, check)
+            self.table.setItem(i, 1, _item(title))
+            self.table.setItem(i, 2, _item(money(price), align_right=True))
+            code = split_codes(codes)[0] if codes else ""
+            self.table.setItem(i, 3, _item(code or "— создастся свой", align_right=False))
+            if not code:
+                self.table.item(i, 3).setForeground(QColor(C.gray))
+            box = QSpinBox()
+            box.setRange(1, 500)
+            box.setSuffix(" шт")
+            box.valueChanged.connect(self._update)
+            self.table.setCellWidget(i, 4, box)
+            self.checks.append(check)
+            self.copies.append(box)
+        layout.addWidget(self.table, 1)
+        options = QHBoxLayout()
+        self.layout_box = QComboBox()
+        for key, title in LAYOUTS.items():
+            self.layout_box.addItem(title, key)
+        options.addWidget(QLabel("Печатать на:"))
+        options.addWidget(self.layout_box)
+        self.with_price = QCheckBox("С ценой")
+        self.with_price.setChecked(True)
+        options.addWidget(self.with_price)
+        options.addStretch(1)
+        self.summary = QLabel()
+        options.addWidget(self.summary)
+        layout.addLayout(options)
+        row = QHBoxLayout()
+        row.addStretch(1)
+        self.print_btn = QPushButton("🖨 Напечатать")
+        primary(self.print_btn)
+        self.print_btn.clicked.connect(self._print)
+        row.addWidget(self.print_btn)
+        close = QPushButton("Закрыть")
+        close.clicked.connect(self.reject)
+        row.addWidget(close)
+        layout.addLayout(row)
+        self._update()
+        for i, check in enumerate(self.checks):
+            if check.isChecked():
+                self.table.scrollToItem(self.table.item(i, 1))
+
+    def _filter(self):
+        query = self.search.text().strip().casefold()
+        for i, (_, _, title, _, codes) in enumerate(self.items):
+            hidden = (bool(query) and query not in title.casefold() and query not in codes) or \
+                (self.only_marked.isChecked() and not self.checks[i].isChecked())
+            self.table.setRowHidden(i, hidden)
+
+    def _update(self):
+        marked = [i for i, c in enumerate(self.checks) if c.isChecked()]
+        total = sum(self.copies[i].value() for i in marked)
+        self.summary.setText(f"Отмечено: <b>{len(marked)}</b>, этикеток: <b>{total}</b>" if marked else "")
+        self.print_btn.setEnabled(bool(marked))
+
+    def labels(self) -> list[Label]:
+        """Отмеченное — в этикетки; у кого нет штрихкода, создаётся свой."""
+        result = []
+        for i, check in enumerate(self.checks):
+            if not check.isChecked():
+                continue
+            kind, item_id, title, price, codes = self.items[i]
+            if not codes:
+                self.created += 1
+            code = self.db.ensure_code(kind, item_id)
+            result.append(Label(title.removeprefix("💐 "), code, price if self.with_price.isChecked() else None,
+                                self.copies[i].value()))
+        return result
+
+    def _print(self):
+        try:
+            page = labels_html(self.labels(), self.layout_box.currentData())
+        except ValueError as e:
+            QMessageBox.warning(self, "Этикетки", f"Не получилось нарисовать штрихкод: {e}.")
+            return
+        path = os.path.join(tempfile.gettempdir(), "AloFlorist-etiketki.html")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(page)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+        self.accept()
 
 
 class ReorderDialog(QDialog):
@@ -1336,16 +1484,16 @@ class StockWindow(QDialog):
 
     def _add_selected(self):
         """Enter в поиске — первая плитка в корзину; цифры штрихкода (сканер) — этот товар."""
-        code = "".join(self.search_edit.text().split())
-        if code.isdigit() and len(code) >= 6:
-            found = self.db.find_barcode(code)
-            if found is not None:
-                self._add_line(CartLine(found.name, 1, found.price, product_id=found.id), unit=found.unit)
-                self.search_edit.clear()
-                return
-            if not any(w.isalpha() for w in self.search_edit.text()):
-                self._unknown_barcode(code)
-                return
+        text = self.search_edit.text().strip()
+        found = self.db.find_code(text) if text and " " not in text else None
+        if found is not None:  # отсканировали свой или заводской штрихкод — товар или готовый букет
+            self._add_tile(*found)
+            self.search_edit.clear()
+            return
+        code = "".join(text.split())
+        if code.isdigit() and len(code) >= 6:  # цифры, но такого кода нет
+            self._unknown_barcode(code)
+            return
         if self._search_timer.isActive():  # нажали Enter, не дождавшись поиска
             self._search_timer.stop()
             self._refresh_catalog()
@@ -1564,11 +1712,14 @@ class StockWindow(QDialog):
         self.inventory_btn = QPushButton("📋 Инвентаризация списком")
         self.inventory_btn.setToolTip("Пересчитали склад — вписать всё сразу, видна недостача")
         self.inventory_btn.clicked.connect(self._inventory)
+        labels_btn = QPushButton("🏷 Этикетки")
+        labels_btn.setToolTip("Напечатать этикетки со штрихкодами (свои или заводские) — потом продавать сканером")
+        labels_btn.clicked.connect(lambda: self._labels("product", self._selected_product_id()))
         self.import_btn = QPushButton("📥 Загрузить из таблицы")
         self.import_btn.setToolTip("Excel (.xlsx) или CSV: шаблон программы или выгрузка из Hoog")
         self.import_btn.clicked.connect(self._import)
         for b in (self.add_product_btn, self.edit_product_btn, writeoff_btn, self.count_btn, history_btn,
-                  self.archive_btn, reorder_btn, self.inventory_btn, self.import_btn):
+                  self.archive_btn, reorder_btn, self.inventory_btn, labels_btn, self.import_btn):
             b.setMinimumHeight(30)
             buttons.addWidget(b)
         buttons.addStretch(1)
@@ -1717,6 +1868,13 @@ class StockWindow(QDialog):
         QMessageBox.information(self, "Загрузка из таблицы", f"Готово: добавлено {added}, обновлено {updated}.")
         self._refresh_stock()
 
+    def _labels(self, kind: str = "product", ident: int | None = None):
+        dialog = LabelsDialog(self, self.db, kind, ident)
+        dialog.exec()
+        if dialog.created:
+            self.main.audit("Свои штрихкоды созданы", f"для {dialog.created} товаров / букетов")
+            self.refresh()
+
     def _reorder(self):
         ReorderDialog(self, self.db.reorder(datetime.now())).exec()
 
@@ -1806,7 +1964,10 @@ class StockWindow(QDialog):
         self.edit_recipe_btn.clicked.connect(self._edit_recipe)
         self.archive_recipe_btn = QPushButton("📁 В архив")
         self.archive_recipe_btn.clicked.connect(self._archive_recipe)
-        for b in (assemble_btn, disassemble_btn, writeoff_btn, history_btn):
+        recipe_labels = QPushButton("🏷 Этикетки")
+        recipe_labels.setToolTip("Этикетка со штрихкодом на собранный букет — продать сканером")
+        recipe_labels.clicked.connect(lambda: self._labels("recipe", self._selected_recipe_id()))
+        for b in (assemble_btn, disassemble_btn, writeoff_btn, history_btn, recipe_labels):
             b.setMinimumHeight(32)
             buttons.addWidget(b)
         buttons.addStretch(1)

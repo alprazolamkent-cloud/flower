@@ -6,6 +6,7 @@
 """
 
 import math
+import re
 import sqlite3
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta
@@ -54,6 +55,12 @@ CREATE TABLE IF NOT EXISTS recipes (
     ready_cost REAL NOT NULL DEFAULT 0,
     in_bot INTEGER NOT NULL DEFAULT 1
 );
+CREATE TABLE IF NOT EXISTS barcodes (
+    code  TEXT    PRIMARY KEY,
+    kind  TEXT    NOT NULL,
+    ident INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_barcodes_item ON barcodes(kind, ident);
 CREATE TABLE IF NOT EXISTS ready_moves (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     recipe_id  INTEGER NOT NULL,
@@ -124,6 +131,30 @@ WRITEOFFS = ("SELECT at, qty, cost, reason, shift_id FROM stock_moves WHERE kind
              " UNION ALL SELECT at, qty, cost, reason, shift_id FROM ready_moves WHERE kind='writeoff'")
 
 
+OWN_PREFIX = "200"  # EAN-13, начинается на 2 — диапазон «для внутреннего пользования магазина», с заводскими не совпадёт
+
+
+def split_codes(text: str) -> list[str]:
+    """«4600…17, 2000…05» → список кодов (без повторов, порядок как вписали). Разделители — запятая,
+    точка с запятой, новая строка; пробелы внутри кода (вписали цифры группами) убираются."""
+    result = []
+    for part in re.split(r"[,;\n]+", text or ""):
+        code = "".join(part.split())
+        if code and code not in result:
+            result.append(code)
+    return result
+
+
+def ean13_check(body: str) -> str:
+    """Контрольная (13-я) цифра EAN-13 для первых 12."""
+    total = sum(int(d) * (3 if i % 2 else 1) for i, d in enumerate(body[:12]))
+    return str((10 - total % 10) % 10)
+
+
+def is_ean13(code: str) -> bool:
+    return len(code) == 13 and code.isdigit() and ean13_check(code) == code[12]
+
+
 class StockError(Exception):
     """Ошибка с понятным пользователю текстом (в db.py она же — UserError)."""
 
@@ -167,6 +198,7 @@ class Recipe:
     has_photo: bool = False
     ready: float = 0  # собрано и стоит на витрине
     in_bot: bool = True  # собранные показывать в витрине ботов
+    barcode: str = ""  # штрихкоды через запятую
 
 
 @dataclass
@@ -287,7 +319,8 @@ class StockStore:
     def products(self, active_only: bool = True) -> list[Product]:
         sql = ("SELECT p.id, p.name, p.category, p.unit, p.price, p.avg_cost, p.min_stock, p.active,"
                " COALESCE((SELECT SUM(m.qty) FROM stock_moves m WHERE m.product_id = p.id), 0),"
-               " p.photo IS NOT NULL, p.barcode FROM products p")
+               " p.photo IS NOT NULL, COALESCE((SELECT GROUP_CONCAT(b.code, ', ') FROM barcodes b"
+               " WHERE b.kind = 'product' AND b.ident = p.id), '') FROM products p")
         if active_only:
             sql += " WHERE p.active = 1"
         rows = self.conn.execute(sql + " ORDER BY p.category, p.name COLLATE NOCASE").fetchall()
@@ -307,31 +340,78 @@ class StockStore:
             "SELECT name FROM products WHERE id <> ? AND active = 1", (p.id or 0,)).fetchall())
         if same:
             raise StockError(f"Товар «{name}» уже есть.")
-        barcode = "".join(p.barcode.split())
-        if barcode:
-            other = self.conn.execute("SELECT name FROM products WHERE barcode=? AND id<>? AND active=1",
-                                      (barcode, p.id or 0)).fetchone()
-            if other:
-                raise StockError(f"Этот штрихкод уже у товара «{other[0]}».")
+        codes = self._check_codes("product", p.id, p.barcode)
         if p.id:
-            self.conn.execute("UPDATE products SET name=?, category=?, unit=?, price=?, min_stock=?, active=?, barcode=?"
+            self.conn.execute("UPDATE products SET name=?, category=?, unit=?, price=?, min_stock=?, active=?"
                               " WHERE id=?", (name, p.category, p.unit.strip() or "шт", p.price, p.min_stock,
-                                              int(p.active), barcode, p.id))
+                                              int(p.active), p.id))
         else:
             p.id = self.conn.execute(
-                "INSERT INTO products (name, category, unit, price, avg_cost, min_stock, active, barcode)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (name, p.category, p.unit.strip() or "шт", p.price, p.avg_cost,
-                                                     p.min_stock, int(p.active), barcode)).lastrowid
+                "INSERT INTO products (name, category, unit, price, avg_cost, min_stock, active)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?)", (name, p.category, p.unit.strip() or "шт", p.price, p.avg_cost,
+                                                  p.min_stock, int(p.active))).lastrowid
+        self._write_codes("product", p.id, codes)
         self.conn.commit()
         return p.id
 
+    # ----- штрихкоды: свои (EAN-13 на 200…) и чужие (заводские), у товара и букета может быть несколько -----
+
+    def _owner_name(self, kind: str, ident: int) -> tuple[str, bool]:
+        """(название, в работе ли — не в архиве)."""
+        table, column = ("products", "name") if kind == "product" else ("recipes", "title")
+        r = self.conn.execute(f"SELECT {column}, active FROM {table} WHERE id=?", (ident,)).fetchone()
+        return (r[0], bool(r[1])) if r else ("", False)
+
+    def _check_codes(self, kind: str, ident: int | None, text: str) -> list[str]:
+        codes = split_codes(text)
+        for code in codes:
+            if not 4 <= len(code) <= 48 or not code.isprintable():
+                raise StockError(f"Штрихкод «{code}» странный: нужно от 4 до 48 цифр или букв без пробелов.")
+            if len(code) == 13 and code.isdigit() and not is_ean13(code):
+                raise StockError(f"В штрихкоде {code} ошибка: не сходится последняя (контрольная) цифра. "
+                                 "Отсканируйте ещё раз или проверьте цифры.")
+            row = self.conn.execute("SELECT kind, ident FROM barcodes WHERE code=?", (code,)).fetchone()
+            if row and (row[0], row[1]) != (kind, ident):
+                name, active = self._owner_name(*row)
+                if active:
+                    what = "у товара" if row[0] == "product" else "у букета"
+                    raise StockError(f"Штрихкод {code} уже {what} «{name}».")
+        return codes
+
+    def _write_codes(self, kind: str, ident: int, codes: list[str]):
+        self.conn.execute("DELETE FROM barcodes WHERE kind=? AND ident=?", (kind, ident))
+        for code in codes:  # код товара из архива — переходит новому хозяину
+            self.conn.execute("INSERT OR REPLACE INTO barcodes (code, kind, ident) VALUES (?, ?, ?)", (code, kind, ident))
+
+    def new_own_code(self) -> str:
+        """Новый свой штрихкод EAN-13: 200 + номер по порядку + контрольная цифра."""
+        last = self.conn.execute("SELECT MAX(CAST(SUBSTR(code, 4, 9) AS INTEGER)) FROM barcodes"
+                                 " WHERE code LIKE ? AND LENGTH(code) = 13", (OWN_PREFIX + "%",)).fetchone()[0] or 0
+        body = f"{OWN_PREFIX}{last + 1:09d}"
+        return body + ean13_check(body)
+
+    def ensure_code(self, kind: str, ident: int) -> str:
+        """Первый штрихкод товара / букета; нет ни одного — создать свой."""
+        row = self.conn.execute("SELECT code FROM barcodes WHERE kind=? AND ident=? ORDER BY rowid LIMIT 1",
+                                (kind, ident)).fetchone()
+        if row:
+            return row[0]
+        code = self.new_own_code()
+        self.conn.execute("INSERT INTO barcodes (code, kind, ident) VALUES (?, ?, ?)", (code, kind, ident))
+        self.conn.commit()
+        return code
+
+    def find_code(self, code: str) -> tuple[str, int] | None:
+        """Что за штрихкод: ("product", номер) или ("recipe", номер) — только то, что не в архиве."""
+        row = self.conn.execute("SELECT kind, ident FROM barcodes WHERE code=?", ("".join(code.split()),)).fetchone()
+        if row is None or not self._owner_name(*row)[1]:
+            return None
+        return row[0], row[1]
+
     def find_barcode(self, code: str) -> Product | None:
         """Товар по штрихкоду (сканер «печатает» цифры и Enter)."""
-        code = "".join(code.split())
-        if not code:
-            return None
-        row = self.conn.execute("SELECT id FROM products WHERE barcode=? AND active=1", (code,)).fetchone()
-        return self.get_product(row[0]) if row else None
+        found = self.find_code(code)
+        return self.get_product(found[1]) if found and found[0] == "product" else None
 
     def stock_of(self, product_id: int) -> float:
         return self.conn.execute("SELECT COALESCE(SUM(qty), 0) FROM stock_moves WHERE product_id=?",
@@ -351,6 +431,10 @@ class StockStore:
         for (table, column), sql in STOCK_MIGRATIONS.items():
             if column not in {r[1] for r in self.conn.execute(f"PRAGMA table_info({table})")}:
                 self.conn.execute(sql)
+        # штрихкоды v1.47 жили в products.barcode — переносим в общую таблицу (там их может быть несколько)
+        self.conn.execute("INSERT OR IGNORE INTO barcodes (code, kind, ident) SELECT barcode, 'product', id"
+                          " FROM products WHERE barcode <> ''")
+        self.conn.execute("UPDATE products SET barcode = '' WHERE barcode <> ''")
 
     def photo_of(self, kind: str, ident: int) -> bytes | None:
         """Фото товара (kind="product") или букета по техкарте (kind="recipe")."""
@@ -438,14 +522,16 @@ class StockStore:
 
     def recipes(self, active_only: bool = True) -> list[Recipe]:
         sql = ("SELECT r.id, r.title, r.price, r.active, r.photo IS NOT NULL, r.in_bot,"
-               " COALESCE((SELECT SUM(m.qty) FROM ready_moves m WHERE m.recipe_id = r.id), 0) FROM recipes r"
+               " COALESCE((SELECT SUM(m.qty) FROM ready_moves m WHERE m.recipe_id = r.id), 0),"
+               " COALESCE((SELECT GROUP_CONCAT(b.code, ', ') FROM barcodes b WHERE b.kind = 'recipe'"
+               " AND b.ident = r.id), '') FROM recipes r"
                + (" WHERE r.active = 1" if active_only else ""))
         result = []
         for r in self.conn.execute(sql + " ORDER BY title COLLATE NOCASE").fetchall():
             items = self.conn.execute("SELECT product_id, qty FROM recipe_items WHERE recipe_id=? ORDER BY rowid",
                                       (r[0],)).fetchall()
             result.append(Recipe(r[0], r[1], r[2], bool(r[3]), [tuple(x) for x in items], bool(r[4]),
-                                 round(r[6], 3), bool(r[5])))
+                                 round(r[6], 3), bool(r[5]), r[7]))
         return result
 
     def get_recipe(self, recipe_id: int) -> Recipe | None:
@@ -460,6 +546,7 @@ class StockStore:
         items = [(pid, qty) for pid, qty in r.items if qty > 0]
         if not items:
             raise StockError("Добавьте в техкарту хотя бы один цветок или упаковку.")
+        codes = self._check_codes("recipe", r.id, r.barcode)
         if r.id:
             self.conn.execute("UPDATE recipes SET title=?, price=?, active=?, in_bot=? WHERE id=?",
                               (title, r.price, int(r.active), int(r.in_bot), r.id))
@@ -472,6 +559,7 @@ class StockStore:
                                      (title, r.price, int(r.active), int(r.in_bot))).lastrowid
         self.conn.executemany("INSERT INTO recipe_items (recipe_id, product_id, qty) VALUES (?, ?, ?)",
                               [(r.id, pid, qty) for pid, qty in items])
+        self._write_codes("recipe", r.id, codes)
         self.conn.commit()
         return r.id
 

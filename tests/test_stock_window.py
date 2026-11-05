@@ -275,10 +275,10 @@ def test_many_products_shown_by_pages(main, db):
 def test_barcode_reorder_inventory_and_time_charts(main, db, monkeypatch):
     from app.stock_window import InventoryDialog, ProductDialog, ReorderDialog
     paper = db.products()[0]
-    paper.barcode = "4600000000017"
+    paper.barcode = "4600000000015"
     db.save_product(paper)
     w = StockWindow(main)
-    w.search_edit.setText("4600000000017")  # сканер «напечатал» код и Enter
+    w.search_edit.setText("4600000000015")  # сканер «напечатал» код и Enter
     w._add_selected()
     assert len(w.rows) == 1 and w.rows[0].key[2] == paper.id and w.search_edit.text() == ""
 

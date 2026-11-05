@@ -211,10 +211,10 @@ def test_recipe_composition_and_hidden_from_bot(shop):
 
 def test_barcode(shop):
     db, *_ , paper = shop
-    card = db.save_product(Product(0, "Открытка", "Сопутствующие", price=100, barcode="4 600000 000017"))
-    assert db.find_barcode("4600000000017").id == card and db.find_barcode("123") is None
+    card = db.save_product(Product(0, "Открытка", "Сопутствующие", price=100, barcode="4 600000 000015"))
+    assert db.find_barcode("4600000000015").id == card and db.find_barcode("123") is None
     with pytest.raises(UserError, match="уже у товара «Открытка»"):
-        db.save_product(Product(0, "Шар", barcode="4600000000017"))
+        db.save_product(Product(0, "Шар", barcode="4600000000015"))
 
 
 def test_reorder_count_many_time_and_stale(shop):
