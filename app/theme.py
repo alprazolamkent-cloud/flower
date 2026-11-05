@@ -251,6 +251,26 @@ def primary(button: QPushButton, on: bool = True) -> QPushButton:
     return button
 
 
+def fit_to_screen(widget, width: int, height: int):
+    """Размер окна, но не больше экрана (ноутбук 1366×768, масштаб 125 % — всего ~1090×600)."""
+    from PySide6.QtGui import QGuiApplication
+    screen = QGuiApplication.primaryScreen()
+    if screen is not None:
+        area = screen.availableGeometry()
+        width, height = min(width, area.width() - 20), min(height, area.height() - 60)
+    widget.resize(width, height)
+
+
+def scrollable(widget):
+    """Вкладка в прокрутке: на маленьком экране низ не пропадает за краем."""
+    from PySide6.QtWidgets import QFrame, QScrollArea
+    area = QScrollArea()
+    area.setWidgetResizable(True)
+    area.setFrameShape(QFrame.NoFrame)
+    area.setWidget(widget)
+    return area
+
+
 def primary_ok(buttons: QDialogButtonBox) -> QDialogButtonBox:
     """«ОК» / «Сохранить» в окне — главная (зелёная) кнопка."""
     for button in buttons.buttons():

@@ -19,7 +19,7 @@ from .db import ORDER_STATUS, ClientOrder, ShowcaseItem, UserError
 from .delivery_dialog import money, money_box
 from .icon import flower_icon
 from .photos import PhotoViewer, pick_photo, pixmap
-from .theme import C, primary
+from .theme import C, fit_to_screen, primary
 
 STATUS_COLORS = {"new": "orange", "priced": "blue", "paid_claimed": "red", "confirmed": "green", "rejected": "gray"}
 NEEDS_ACTION = ("new", "paid_claimed")  # ждут флориста: назначить сумму / проверить оплату
@@ -78,7 +78,7 @@ class ClientCenter(QDialog):
         self.db = window.db
         self.setWindowTitle("Клиенты — бот «" + client_settings()["shop"] + "»")
         self.setWindowIcon(flower_icon())
-        self.resize(1000, 640)
+        fit_to_screen(self, 1000, 640)
         layout = QVBoxLayout(self)
         self.banner = QLabel()
         self.banner.setWordWrap(True)

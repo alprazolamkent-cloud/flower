@@ -17,7 +17,7 @@ from .holidays import holiday_name
 from .icon import flower_icon
 from .reminders import parse_start_time
 from .settings_dialog import holidays_text
-from .theme import C
+from .theme import C, fit_to_screen
 
 WEEKDAYS = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"]
 MONTHS = ["января", "февраля", "марта", "апреля", "мая", "июня", "июля", "августа", "сентября", "октября",
@@ -93,7 +93,7 @@ class FutureOrdersDialog(QDialog):
         self.main, self.db = window, window.db
         self.setWindowTitle("Заказы вперёд")
         self.setWindowIcon(flower_icon())
-        self.resize(1100, 640)
+        fit_to_screen(self, 1100, 640)
         self.items: list[Delivery] = []
         self.rows: list[Delivery | None] = []  # строка таблицы → доставка (None — заголовок дня)
         layout = QVBoxLayout(self)

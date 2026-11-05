@@ -10,7 +10,7 @@ from PySide6.QtWidgets import (
 )
 
 from .db import Announcement, Database, User
-from .theme import C
+from .theme import C, fit_to_screen
 
 
 def short(text: str, length: int = 60) -> str:
@@ -61,7 +61,7 @@ class HistoryDialog(QDialog):
         self.db, self.user = db, user
         self.items: list[Announcement] = []
         self.setWindowTitle("Объявления")
-        self.resize(820, 460)
+        fit_to_screen(self, 820, 460)
         layout = QVBoxLayout(self)
         hint = QLabel("Объявления пишет администратор: сообщением Telegram-боту, начиная с «!», "
                       "например «! С понедельника розы по 150 ₽».")

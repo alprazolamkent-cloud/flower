@@ -11,7 +11,7 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCalendarWidget, QDialog,
-    QGroupBox, QHBoxLayout, QHeaderView, QLabel, QMainWindow, QMenu, QMessageBox,
+    QGridLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel, QMainWindow, QMenu, QMessageBox,
     QPushButton, QSystemTrayIcon, QTableWidget, QTableWidgetItem,
     QVBoxLayout, QWidget,
 )
@@ -259,7 +259,7 @@ class MainWindow(QMainWindow):
         self.calendar.setFirstDayOfWeek(Qt.Monday)
         self.calendar.setGridVisible(True)
         self.calendar.setVerticalHeaderFormat(QCalendarWidget.NoVerticalHeader)
-        self.calendar.setMinimumSize(420, 300)
+        self.calendar.setMinimumSize(400, 220)  # чтобы окно помещалось на экран ноутбука 1366×768 и при 150 %
         self.calendar.selectionChanged.connect(self.refresh_day)
         self.calendar.currentPageChanged.connect(lambda *_: self.refresh_month())
         left.addWidget(self.calendar)
@@ -276,7 +276,7 @@ class MainWindow(QMainWindow):
         self.shift_label = QLabel()
         self.shift_label.setWordWrap(True)
         shift_layout.addWidget(self.shift_label)
-        shift_buttons = QHBoxLayout()
+        shift_buttons = QGridLayout()  # 2×2: в один ряд не помещались на экран ноутбука
         self.shift_btn = QPushButton()
         self.shift_btn.clicked.connect(self.toggle_shift)
         self.cash_btn = QPushButton("💸 Расход / изъятие")
@@ -288,8 +288,8 @@ class MainWindow(QMainWindow):
         self.plan_btn = QPushButton("📋 План")
         self.plan_btn.setToolTip("План на смену: что собрать и к какому времени, вода, обязанности")
         self.plan_btn.clicked.connect(self.open_plan)
-        for b in (self.shift_btn, self.cash_btn, self.plan_btn, cabinet_btn):
-            shift_buttons.addWidget(b)
+        for i, b in enumerate((self.shift_btn, self.cash_btn, self.plan_btn, cabinet_btn)):
+            shift_buttons.addWidget(b, i // 2, i % 2)
         shift_layout.addLayout(shift_buttons)
         water_row = QHBoxLayout()
         self.water_label = QLabel()
@@ -315,7 +315,7 @@ class MainWindow(QMainWindow):
         left.addStretch(1)
         self.sale_btn = QPushButton("🛒  Продажа   ·   F2")
         self.sale_btn.setToolTip("Продать букет или товар: F2 в любой момент — и сразу печатайте название")
-        self.sale_btn.setMinimumHeight(58)
+        self.sale_btn.setMinimumHeight(48)
         self.sale_btn.setStyleSheet("font-size: 15pt;")
         primary(self.sale_btn)
         self.sale_btn.clicked.connect(lambda: self.open_stock(sale=True))
@@ -360,7 +360,8 @@ class MainWindow(QMainWindow):
         right.addLayout(top)
 
         buttons = QHBoxLayout()
-        add_btn = QPushButton("➕ Добавить доставку")
+        add_btn = QPushButton("➕ Доставка")
+        add_btn.setToolTip("Добавить доставку (Ctrl+N)")
         primary(add_btn)
         add_btn.clicked.connect(self.add_delivery)
         self.edit_btn = QPushButton("✏️ Изменить")
@@ -370,7 +371,7 @@ class MainWindow(QMainWindow):
         self.keep_btn = QPushButton("↩ Оставить")
         self.keep_btn.setToolTip("Отклонить запрос сотрудника на удаление этой доставки")
         self.keep_btn.clicked.connect(self.keep_delivery)
-        self.write_btn = QPushButton("💬 Написать заказчику")
+        self.write_btn = QPushButton("💬 Заказчику")
         self.write_btn.setToolTip("Сообщение заказчику в его мессенджер")
         write_menu = QMenu(self.write_btn)
         for kind, title in KINDS.items():

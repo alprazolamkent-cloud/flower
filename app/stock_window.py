@@ -27,7 +27,7 @@ from .stock import (
     CATEGORIES, PAYMENTS, CartLine, Product, Recipe, day_range, ean13_check, qty_text, reorder_text, short_label,
     split_codes,
 )
-from .theme import C, primary
+from .theme import C, fit_to_screen, primary
 
 MOVE_KINDS = {"supply": "Поставка", "sale": "Продажа", "writeoff": "Списание", "count": "Инвентаризация",
               "return": "Возврат", "assembly": "Собрали букет", "disassembly": "Разобрали букет",
@@ -973,7 +973,7 @@ class LabelsDialog(QDialog):
         super().__init__(parent)
         self.db, self.created = db, 0
         self.setWindowTitle("Этикетки со штрихкодами")
-        self.resize(860, 640)
+        fit_to_screen(self, 860, 640)
         layout = QVBoxLayout(self)
         layout.addWidget(_gray("Отметьте, на что нужны этикетки, и сколько штук. У кого штрихкода ещё нет — программа "
                                "создаст свой (EAN-13 на 200…). Есть заводской — напечатается он. Клеите этикетку на "
@@ -1097,7 +1097,7 @@ class ReorderDialog(QDialog):
         super().__init__(parent)
         self.lines = lines
         self.setWindowTitle("Что заказать")
-        self.resize(760, 560)
+        fit_to_screen(self, 760, 560)
         layout = QVBoxLayout(self)
         layout.addWidget(_gray("Сколько заказать, чтобы хватило на 3 дня — по тому, сколько уходило за последние "
                                "две недели (продажи, сборка букетов, списания), и не меньше двух «минимальных остатков». "
@@ -1152,7 +1152,7 @@ class InventoryDialog(QDialog):
         super().__init__(parent)
         self.products = products
         self.setWindowTitle("Инвентаризация списком")
-        self.resize(820, 640)
+        fit_to_screen(self, 820, 640)
         layout = QVBoxLayout(self)
         top = QHBoxLayout()
         self.category = QComboBox()
@@ -1220,7 +1220,7 @@ class ImportDialog(QDialog):
     def __init__(self, parent, rows: list, problems: list[str], file_name: str):
         super().__init__(parent)
         self.setWindowTitle("Загрузить товары из таблицы")
-        self.resize(900, 560)
+        fit_to_screen(self, 900, 560)
         layout = QVBoxLayout(self)
         new = sum(r.existing is None for r in rows)
         layout.addWidget(QLabel(f"<b>{html.escape(file_name)}</b>: товаров {len(rows)} — добавить {new}, "
@@ -1262,7 +1262,7 @@ class StockWindow(QDialog):
         self.setWindowTitle("Продажи и склад")
         self.setWindowIcon(flower_icon())
         self._photos: dict[tuple[str, int], QPixmap] = {}
-        self.resize(1180, 720)
+        fit_to_screen(self, 1180, 720)
         layout = QVBoxLayout(self)
         self.tabs = QTabWidget()
         self.tabs.addTab(self._sale_tab(), "🛒 Продажа")
@@ -1729,14 +1729,22 @@ class StockWindow(QDialog):
         self.import_btn = QPushButton("📥 Загрузить из таблицы")
         self.import_btn.setToolTip("Excel (.xlsx) или CSV: шаблон программы или выгрузка из Hoog")
         self.import_btn.clicked.connect(self._import)
+        # в два ряда: в один десять кнопок растягивали окно шире экрана
         for b in (self.add_product_btn, self.edit_product_btn, writeoff_btn, self.count_btn, history_btn,
-                  self.archive_btn, reorder_btn, self.inventory_btn, labels_btn, self.import_btn):
+                  self.archive_btn):
             b.setMinimumHeight(30)
             buttons.addWidget(b)
         buttons.addStretch(1)
-        self.stock_summary = QLabel()
-        buttons.addWidget(self.stock_summary)
         layout.addLayout(buttons)
+        second = QHBoxLayout()
+        for b in (reorder_btn, labels_btn, self.inventory_btn, self.import_btn):
+            b.setMinimumHeight(30)
+            second.addWidget(b)
+        second.addStretch(1)
+        self.stock_summary = QLabel()
+        self.stock_summary.setWordWrap(True)
+        second.addWidget(self.stock_summary, 1)
+        layout.addLayout(second)
         return page
 
     def _refresh_stock(self):

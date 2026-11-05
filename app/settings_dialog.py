@@ -28,7 +28,7 @@ from .reports import parse_time
 from .salary_dialog import EmployeeTiersDialog, HolidaysDialog, PenaltyCatalogEditor, TiersEditor
 from .shifts import DEFAULT_CHANGE, DEFAULT_GRACE_MINUTES, WaterSchedule
 from .templates_dialog import TemplatesDialog
-from .theme import C, primary_ok
+from .theme import C, fit_to_screen, primary_ok, scrollable
 
 DEFAULT_LEAD_MINUTES = 20
 
@@ -269,7 +269,13 @@ class SettingsDialog(QDialog):
         self.tabs.addTab(self._reports_tab(), "Отчёты")
         self.tabs.addTab(self._backup_tab(), "Копии")
         self.tabs.addTab(self._program_tab(), "Программа")
+        for i in range(self.tabs.count()):  # каждая вкладка — в прокрутке: на маленьком экране низ не пропадает
+            title, page = self.tabs.tabText(i), self.tabs.widget(i)
+            self.tabs.removeTab(i)
+            self.tabs.insertTab(i, scrollable(page), title)
+        self.tabs.setCurrentIndex(0)
         layout.addWidget(self.tabs)
+        fit_to_screen(self, 900, 780)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
         primary_ok(buttons)
@@ -280,6 +286,13 @@ class SettingsDialog(QDialog):
         layout.addWidget(buttons)
 
     # ----- вкладки -----
+
+    def _show_tab_of(self, widget):
+        """Открыть вкладку, на которой лежит поле (страницы — внутри прокрутки)."""
+        for i in range(self.tabs.count()):
+            if self.tabs.widget(i).isAncestorOf(widget):
+                self.tabs.setCurrentIndex(i)
+                return
 
     def _main_tab(self) -> QWidget:
         page = QWidget()
@@ -1027,7 +1040,7 @@ class SettingsDialog(QDialog):
     def accept(self):
         client_token = self.client_token_edit.text().strip()
         if client_token and client_token == self.token_edit.text().strip():
-            self.tabs.setCurrentIndex(self.tabs.indexOf(self.client_token_edit.parentWidget()))
+            self._show_tab_of(self.client_token_edit)
             QMessageBox.warning(self, "Бот для клиентов", "Токен бота для клиентов совпадает с ботом администраторов. "
                                 "Нужен отдельный бот — иначе они будут мешать друг другу.")
             return

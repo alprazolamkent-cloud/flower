@@ -330,3 +330,28 @@ def test_big_sale_button_opens_sale(window):
     w.open_stock(sale=True)  # F2 ещё раз — снова на продажу
     assert w.stock_window.tabs.currentIndex() == 0
     w.stock_window.hide()
+
+
+def test_windows_fit_small_screen(window):
+    """Окна помещаются на экран ноутбука 1366×768 и на 1920×1080 при масштабе 150 % (≈1280×700):
+    в v1.47 десять кнопок в ряд растянули склад до 1677 точек — и он не влезал."""
+    from app.settings_dialog import SettingsDialog
+    w = window
+    w.set_user(w.db.add_user("boss", "Ольга", "1", is_admin=True))
+    w.show()
+    limit_w, limit_h = 1280, 700
+
+    def fits(name, widget):
+        hint = widget.minimumSizeHint()
+        assert hint.width() <= limit_w and hint.height() <= limit_h, f"{name}: {hint.width()}×{hint.height()}"
+
+    fits("главное окно", w)
+    w.open_stock()
+    for i in range(w.stock_window.tabs.count()):
+        w.stock_window.tabs.setCurrentIndex(i)
+        fits(f"склад: {w.stock_window.tabs.tabText(i)}", w.stock_window)
+    w.open_clients()
+    fits("клиенты", w.client_center)
+    fits("настройки", SettingsDialog(w))
+    w.stock_window.hide()
+    w.client_center.hide()

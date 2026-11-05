@@ -9,7 +9,7 @@ from PySide6.QtWidgets import (
 )
 
 from .db import Database
-from .theme import C
+from .theme import C, fit_to_screen
 
 PERIODS = (("За сутки", 1), ("За неделю", 7), ("За месяц", 30), ("За всё время (до 180 дней)", 180))
 
@@ -19,7 +19,7 @@ class AuditDialog(QDialog):
         super().__init__(parent)
         self.db = db
         self.setWindowTitle("Журнал действий")
-        self.resize(980, 520)
+        fit_to_screen(self, 980, 520)
         layout = QVBoxLayout(self)
 
         top = QHBoxLayout()
