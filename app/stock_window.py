@@ -1325,10 +1325,13 @@ class ReorderDialog(QDialog):
 class InventoryDialog(QDialog):
     """Инвентаризация списком: «по программе» и «на самом деле» для всех товаров, недостача в рублях."""
 
-    def __init__(self, parent, products: list, scan_only: bool = False):
+    def __init__(self, parent, products: list, scan_only: bool = False, weekly: bool = False):
         super().__init__(parent)
-        self.products, self.scan_only = products, scan_only
-        self.setWindowTitle("Инвентаризация списком")
+        scan_only = scan_only or weekly  # еженедельная — всегда только сканером
+        self.products, self.scan_only, self.weekly = products, scan_only, weekly
+        self.history: list[int] = []  # строки по порядку сканов — чтобы убрать ошибочный
+        self.missing: list[int] = []  # еженедельная: не нашли — запишутся в ноль
+        self.setWindowTitle("Инвентаризация недели" if weekly else "Инвентаризация списком")
         fit_to_screen(self, 820, 640)
         layout = QVBoxLayout(self)
         top = QHBoxLayout()
@@ -1343,11 +1346,18 @@ class InventoryDialog(QDialog):
         layout.addLayout(top)
         if scan_only:
             self.scan_edit = ScanEdit()
-            self.scan_edit.setPlaceholderText("🔒 Сканируйте штрихкод: каждый скан — +1, количество можно поправить")
+            self.scan_edit.setPlaceholderText("🔒 Сканируйте штрихкод каждой штуки: один скан — одна штука")
             self.scan_edit.returnPressed.connect(self._scanned)
-            layout.addWidget(self.scan_edit)
-            self.scan_note = QLabel(f"<b style='color:{C.pink}'>🔒 Инвентаризация только сканером</b> — "
-                                    "без штрихкода товар не пересчитывается.")
+            scan_row = QHBoxLayout()
+            scan_row.addWidget(self.scan_edit, 1)
+            self.undo_btn = QPushButton("↩ Убрать последний скан")
+            self.undo_btn.clicked.connect(self._undo)
+            self.undo_btn.setEnabled(False)
+            scan_row.addWidget(self.undo_btn)
+            layout.addLayout(scan_row)
+            self.scan_note = QLabel(f"<b style='color:{C.pink}'>🔒 Только сканером</b> — вписать количество нельзя: "
+                                    "сколько раз отсканировали, столько и есть."
+                                    + (" Что не отсканируете — запишется недостачей." if weekly else ""))
             self.scan_note.setWordWrap(True)
             layout.addWidget(self.scan_note)
             QTimer.singleShot(0, self.scan_edit.setFocus)
@@ -1368,8 +1378,10 @@ class InventoryDialog(QDialog):
             box.setValue(-1)
             box.setSuffix(f" {p.unit}")
             box.valueChanged.connect(self._update)
-            if scan_only:  # поле откроется после скана
-                box.setEnabled(False)
+            if scan_only:  # количество — только сканами, вписать руками нельзя
+                box.setReadOnly(True)
+                box.setProperty("small", True)  # без стрелок (NoButtons под стилем схлопывает поле)
+                box.setFocusPolicy(Qt.NoFocus)
                 box.setSpecialValueText("— сканируйте" if p.barcode else "— нет штрихкода")
             self.table.setCellWidget(i, 3, box)
             self.table.setItem(i, 4, _item("", align_right=True))
@@ -1377,8 +1389,42 @@ class InventoryDialog(QDialog):
         layout.addWidget(self.table, 1)
         self.total = QLabel()
         layout.addWidget(self.total)
+        if weekly:  # сколько «должно быть» не показываем — считают то, что есть на самом деле
+            self.table.setColumnHidden(2, True)
+            self.table.setColumnHidden(4, True)
+            bare = sum(1 for p in products if not p.barcode and p.stock > 0)
+            if bare:
+                layout.addWidget(_gray(f"⚠ Без штрихкода: {bare} — их не проверить. Напечатайте им этикетки "
+                                       "(«🏷 Этикетки» → «Только без штрихкода»)."))
         layout.addWidget(_buttons(self, "Записать пересчёт"))
         self._update()
+
+    def _undo(self):
+        if not self.history:
+            return
+        i = self.history.pop()
+        box = self.boxes[i]
+        box.setValue(box.value() - 1 if box.value() > 1 else -1)
+        self.undo_btn.setEnabled(bool(self.history))
+        p = self.products[i]
+        self.scan_note.setText(f"↩ Убрала один скан: {html.escape(p.name)} — "
+                               + (f"{qty_text(box.value())} {p.unit}" if box.value() >= 0 else "не пересчитан"))
+        self.scan_edit.setFocus()
+
+    def accept(self):
+        if self.weekly:
+            gone = [i for i, (p, box) in enumerate(zip(self.products, self.boxes))
+                    if box.value() < 0 and p.barcode and p.stock > 0]
+            if gone:
+                names = [f"{self.products[i].name} ({qty_text(self.products[i].stock)} {self.products[i].unit})"
+                         for i in gone]
+                if not _confirm(self, "Инвентаризация", f"Не отсканировано: {len(gone)}.\n• "
+                                + "\n• ".join(names[:15]) + ("\n…" if len(names) > 15 else "")
+                                + "\n\nИх нет на месте? Они запишутся недостачей (в ноль), администраторы "
+                                "увидят. «Нет» — вернуться и досканировать."):
+                    return
+            self.missing = [self.products[i].id for i in gone]
+        super().accept()
 
     def _scanned(self):
         code = "".join(self.scan_edit.text().split())
@@ -1390,8 +1436,9 @@ class InventoryDialog(QDialog):
                                        "товара.</b>")
             return
         p, box = self.products[i], self.boxes[i]
-        box.setEnabled(True)
         box.setValue(1 if box.value() < 0 else box.value() + 1)
+        self.history.append(i)
+        self.undo_btn.setEnabled(True)
         self.table.setRowHidden(i, False)
         self.table.selectRow(i)
         self.table.scrollToItem(self.table.item(i, 0))
@@ -1419,6 +1466,10 @@ class InventoryDialog(QDialog):
             money_diff += diff * p.avg_cost
             item.setText(("+" if diff > 0 else "") + qty_text(diff) if diff else "сошлось")
             item.setForeground(QColor(C.green if diff >= 0 else C.red))
+        if self.weekly:
+            self.total.setText(f"Отсканировано товаров: <b>{counted}</b> из "
+                               f"{sum(1 for p in self.products if p.barcode)}")
+            return
         word = "недостача" if money_diff < 0 else "излишек"
         self.total.setText(f"Пересчитано: <b>{counted}</b> из {len(self.products)}"
                            + (f" · {word} <b style='color:{C.red if money_diff < 0 else C.green}'>"

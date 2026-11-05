@@ -27,3 +27,18 @@ def label_printer() -> str:
 
 def set_label_printer(name: str):
     _settings().setValue("label_printer", name)
+
+
+WEEKDAYS = ("понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье")
+
+
+def weekly_count_day() -> int:
+    """День недели еженедельной инвентаризации (0 — понедельник), −1 — выключена."""
+    try:
+        return int(_settings().value("weekly_count_day", -1))
+    except (TypeError, ValueError):
+        return -1
+
+
+def set_weekly_count_day(day: int):
+    _settings().setValue("weekly_count_day", day)

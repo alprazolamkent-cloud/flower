@@ -361,3 +361,33 @@ def test_windows_fit_small_screen(window):
     fits("настройки", SettingsDialog(w))
     w.stock_window.hide()
     w.client_center.hide()
+
+
+def test_weekly_count_falls_on_someone_on_shift(window, monkeypatch):
+    """Раз в неделю инвентаризация выпадает тому, кто на смене; итог и недостача — администраторам."""
+    from app.stock import Product, week_key
+    w, db = window, window.db
+    now = datetime.now()
+    rose = db.save_product(Product(0, "Кения", "Цветы", price=250, barcode="4600000000015"))
+    db.add_supply("База", [(rose, 5, 80)], None, now)
+    w.shift = db.open_shift(w.user.id, 0, now, mw.shift_change())
+    w.store["weekly_count_day"] = 0  # понедельник — значит, на этой неделе день уже наступил (или сегодня)
+    monkeypatch.setattr(w, "_people_on_shift", lambda: [w.user])
+    w._check_weekly_count(now)
+    week = week_key(mw.business_day(now, mw.shift_change()))
+    assert db.weekly_count(week).user_id == w.user.id and w.count_btn.isVisibleTo(w)
+    assert any("выпала на Анна" in text for text, _ in w.queued)
+
+    class Done:  # отсканировали 4 из 5 роз
+        def __init__(self, parent, products, weekly):
+            self.products, self.missing = products, []
+
+        def exec(self):
+            return mw.QDialog.Accepted
+
+        def actual(self):
+            return {rose: 4}
+    monkeypatch.setattr(mw, "InventoryDialog", Done)
+    w.open_weekly_count()
+    assert db.weekly_count(week).done_at is not None and db.stock_of(rose) == 4 and not w.count_btn.isVisibleTo(w)
+    assert any("недостача 80" in text for text, _ in w.queued)

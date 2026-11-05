@@ -28,10 +28,15 @@ from .reports import parse_time
 from .salary_dialog import EmployeeTiersDialog, HolidaysDialog, PenaltyCatalogEditor, TiersEditor
 from .shifts import DEFAULT_CHANGE, DEFAULT_GRACE_MINUTES, WaterSchedule
 from .templates_dialog import TemplatesDialog
-from .stock_settings import SCAN_ACTIONS, scan_required, set_scan_required
+from .stock_settings import (WEEKDAYS, SCAN_ACTIONS, scan_required, set_scan_required, set_weekly_count_day,
+                             weekly_count_day)
 from .theme import C, fit_to_screen, primary_ok, scrollable
 
 DEFAULT_LEAD_MINUTES = 20
+
+
+def _weekday_name(day: int) -> str:
+    return WEEKDAYS[day] if 0 <= day < len(WEEKDAYS) else "выкл"
 
 
 def _settings() -> QSettings:
@@ -835,9 +840,9 @@ class SettingsDialog(QDialog):
         box = QGroupBox("Только сканером")
         form = QVBoxLayout(box)
         hint = _gray_label("Включено — товар попадает в действие только по отсканированному штрихкоду: щелчок по "
-                             "плитке, поиск по названию и ручной выбор не добавляют. Количество после скана можно "
-                             "поправить (100 роз — один скан и «100»). В инвентаризации поле «на самом деле» "
-                             "открывается только после скана товара. Списание с телефона флориста при этом "
+                             "плитке, поиск по названию и ручной выбор не добавляют. В продаже и поставке количество "
+                             "после скана можно поправить (100 роз — один скан и «100»). В инвентаризации вписать "
+                             "количество нельзя: сколько раз отсканировали — столько и есть. Списание с телефона флориста при этом "
                              "отключается — только сканером на компьютере.")
         hint.setWordWrap(True)
         form.addWidget(hint)
@@ -855,6 +860,26 @@ class SettingsDialog(QDialog):
         note.setStyleSheet(f"color: {C.orange if without else C.green}")
         form.addWidget(note)
         layout.addWidget(box)
+        weekly = QGroupBox("Инвентаризация раз в неделю")
+        weekly_form = QVBoxLayout(weekly)
+        text = _gray_label("В выбранный день инвентаризация выпадает одному из сотрудников на смене — по очереди, "
+                           "тому, кто дольше всех не пересчитывал. Он сканирует штрихкод каждого товара: вписать "
+                           "количество нельзя, сколько раз отсканировал — столько и есть. Что не отсканировал — "
+                           "запишется недостачей. Итог и недостача в рублях — администраторам в Telegram. Не сделал "
+                           "до конца недели — тоже придёт сообщение.")
+        text.setWordWrap(True)
+        weekly_form.addWidget(text)
+        row = QHBoxLayout()
+        row.addWidget(QLabel("День:"))
+        self.weekly_box = QComboBox()
+        self.weekly_box.addItem("выключено", -1)
+        for i, name in enumerate(WEEKDAYS):
+            self.weekly_box.addItem(name, i)
+        self.weekly_box.setCurrentIndex(max(self.weekly_box.findData(weekly_count_day()), 0))
+        row.addWidget(self.weekly_box)
+        row.addStretch(1)
+        weekly_form.addLayout(row)
+        layout.addWidget(weekly)
         layout.addStretch(1)
         return page
 
@@ -1027,6 +1052,8 @@ class SettingsDialog(QDialog):
             ("копия в Telegram", backup_to_telegram(), self.tg_backup_check.isChecked(), False),
             *((f"только сканером: {title.lower()}", scan_required(action), self.scan_checks[action].isChecked(), False)
               for action, title in SCAN_ACTIONS.items()),
+            ("инвентаризация раз в неделю", _weekday_name(weekly_count_day()),
+             _weekday_name(self.weekly_box.currentData()), False),
             ("напоминание накануне праздника", holiday_eve_time().strftime("%H:%M") if holiday_eve_time() else "выкл",
              self.eve_edit.time().toString("HH:mm") if self.eve_check.isChecked() else "выкл", False),
             ("пересменка", shift_change().strftime("%H:%M"), self.change_edit.time().toString("HH:mm"), False),
@@ -1109,6 +1136,7 @@ class SettingsDialog(QDialog):
         settings.setValue("backup_to_telegram", _bool(self.tg_backup_check.isChecked()))
         for action, check in self.scan_checks.items():
             set_scan_required(action, check.isChecked())
+        set_weekly_count_day(self.weekly_box.currentData())
         settings.setValue("holiday_eve_time", self.eve_edit.time().toString("HH:mm") if self.eve_check.isChecked()
                           else "off")
         settings.setValue("shift_change", self.change_edit.time().toString("HH:mm"))

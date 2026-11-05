@@ -135,11 +135,11 @@ def test_inventory_only_by_scanner(db):
     db.save_product(Product(0, "Пион", "Цветы", price=300))
     db.add_supply("База", [(rose, 20, 80)], None, NOW)
     dialog = stock_window.InventoryDialog(None, db.products(), scan_only=True)
-    assert not any(box.isEnabled() for box in dialog.boxes)
-    dialog.scan_edit.setText("4600000000015")
-    dialog._scanned()
-    dialog.scan_edit.setText("4600000000015")
-    dialog._scanned()
+    assert all(box.isReadOnly() for box in dialog.boxes)  # вписать количество нельзя — только сканы
+    for _ in range(3):
+        dialog.scan_edit.setText("4600000000015")
+        dialog._scanned()
+    dialog._undo()  # пиканули лишний раз
     assert dialog.actual() == {rose: 2}
     dialog.scan_edit.setText("123456789")
     dialog._scanned()
@@ -173,3 +173,34 @@ def test_phone_writeoff_refused_when_scan_only(db):
     flow.scan_writeoff = True
     res = flow.handle(Incoming("555", "", name="Иван", callback="kw:"), NOW)
     assert "только сканером" in res.replies[0].text and "555" not in flow.staff_state
+
+
+def test_weekly_count_rotation_and_shortage(db, monkeypatch):
+    from datetime import timedelta
+    from app.stock import week_key
+    anna, olga = db.add_user("anna", "Анна", "1").id, db.add_user("olga", "Ольга", "1").id
+    rose = db.save_product(Product(0, "Кения", "Цветы", price=250, barcode="4600000000015"))
+    tape = db.save_product(Product(0, "Лента", "Упаковка", price=50, barcode="4600000000022"))
+    bare = db.save_product(Product(0, "Без кода", "Цветы", price=50))
+    db.add_supply("База", [(rose, 20, 80), (tape, 5, 10), (bare, 3, 10)], None, NOW)
+    week = week_key(NOW.date())
+    first = db.assign_weekly_count(week, [anna, olga], NOW)
+    assert first.user_id == anna and db.assign_weekly_count(week, [olga], NOW).user_id == anna  # уже назначена
+    nxt = week_key(NOW.date() + timedelta(days=7))
+    assert db.assign_weekly_count(nxt, [anna, olga], NOW + timedelta(days=7)).user_id == olga  # по очереди
+
+    dialog = stock_window.InventoryDialog(None, db.products(), weekly=True)
+    assert dialog.scan_only and dialog.table.isColumnHidden(2)  # «по программе» не видно
+    for _ in range(18):
+        dialog.scan_edit.setText("4600000000015")
+        dialog._scanned()
+    asked = []
+    monkeypatch.setattr(stock_window, "_confirm", lambda parent, title, text: asked.append(text) or False)
+    dialog.accept()  # ленту не отсканировали — переспросили, «Нет» — назад досканировать
+    assert "Лента" in asked[0] and "Без кода" not in asked[0] and dialog.result() == 0
+    monkeypatch.setattr(stock_window, "_confirm", lambda *args: True)
+    dialog.accept()
+    assert dialog.missing == [tape]
+    done = db.finish_weekly_count(week, dialog.actual(), dialog.missing, anna, NOW)
+    assert (done.scanned, done.missing, round(done.money)) == (1, 1, -(2 * 80 + 5 * 10))
+    assert db.stock_of(rose) == 18 and db.stock_of(tape) == 0 and db.stock_of(bare) == 3

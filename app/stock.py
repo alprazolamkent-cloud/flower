@@ -107,6 +107,16 @@ CREATE TABLE IF NOT EXISTS sale_lines (
     cost       REAL    NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_sale_lines_sale ON sale_lines(sale_id);
+CREATE TABLE IF NOT EXISTS weekly_counts (
+    week        TEXT    PRIMARY KEY,
+    user_id     INTEGER NOT NULL,
+    assigned_at TEXT    NOT NULL,
+    done_at     TEXT,
+    scanned     INTEGER NOT NULL DEFAULT 0,
+    missing     INTEGER NOT NULL DEFAULT 0,
+    money       REAL    NOT NULL DEFAULT 0,
+    reported    INTEGER NOT NULL DEFAULT 0
+);
 """
 
 STOCK_MIGRATIONS = {  # (таблица, столбец) → как добавить в базу прошлой версии
@@ -308,6 +318,25 @@ class SalesReport:
     def margin(self) -> float:
         """Доля валовой прибыли в выручке, %."""
         return 100 * self.profit / self.revenue if self.revenue else 0
+
+
+def week_key(day: date) -> str:
+    """Неделя для еженедельной инвентаризации: «2026-W45»."""
+    year, week, _ = day.isocalendar()
+    return f"{year}-W{week:02d}"
+
+
+@dataclass
+class WeeklyCount:
+    """Еженедельная инвентаризация: на кого выпала, сделана ли и что нашли."""
+    week: str
+    user_id: int
+    assigned_at: datetime
+    done_at: datetime | None = None
+    scanned: int = 0  # сколько товаров отсканировали
+    missing: int = 0  # сколько товаров не нашли (записаны в ноль)
+    money: float = 0  # на сколько рублей изменился склад: минус — недостача
+    reported: bool = False  # администраторам сказали, что не сделана
 
 
 @dataclass
@@ -924,6 +953,42 @@ class StockStore:
                 money_diff += diff * self._avg_cost(pid)
         self.conn.commit()
         return changed, money_diff
+
+    # ----- еженедельная инвентаризация -----
+
+    def weekly_count(self, week: str) -> WeeklyCount | None:
+        r = self.conn.execute("SELECT week, user_id, assigned_at, done_at, scanned, missing, money, reported"
+                              " FROM weekly_counts WHERE week = ?", (week,)).fetchone()
+        if r is None:
+            return None
+        return WeeklyCount(r[0], r[1], datetime.fromisoformat(r[2]), datetime.fromisoformat(r[3]) if r[3] else None,
+                           r[4], r[5], r[6], bool(r[7]))
+
+    def assign_weekly_count(self, week: str, candidates: list[int], now: datetime) -> WeeklyCount | None:
+        """Выпадает по очереди: тому из кандидатов (кто на смене), кто дольше всех не пересчитывал."""
+        if not candidates or self.weekly_count(week) is not None:
+            return self.weekly_count(week)
+        last = dict(self.conn.execute("SELECT user_id, MAX(assigned_at) FROM weekly_counts GROUP BY user_id"))
+        user_id = min(candidates, key=lambda uid: (last.get(uid) or "", candidates.index(uid)))
+        self.conn.execute("INSERT INTO weekly_counts (week, user_id, assigned_at) VALUES (?, ?, ?)",
+                          (week, user_id, _ts(now)))
+        self.conn.commit()
+        return self.weekly_count(week)
+
+    def finish_weekly_count(self, week: str, actual: dict[int, float], missing: list[int], user_id: int | None,
+                            now: datetime) -> WeeklyCount:
+        """Записать: отсканированное — столько, сколько насканировали; не найденное — в ноль (недостача)."""
+        counts = dict(actual)
+        counts.update({pid: 0 for pid in missing})
+        _, money_diff = self.count_many(counts, user_id, now)
+        self.conn.execute("UPDATE weekly_counts SET done_at = ?, scanned = ?, missing = ?, money = ? WHERE week = ?",
+                          (_ts(now), len(actual), len(missing), round(money_diff, 2), week))
+        self.conn.commit()
+        return self.weekly_count(week)
+
+    def mark_weekly_reported(self, week: str):
+        self.conn.execute("UPDATE weekly_counts SET reported = 1 WHERE week = ?", (week,))
+        self.conn.commit()
 
     def sales_by_time(self, start: datetime, end: datetime) -> tuple[list[int], list[int]]:
         """Выручка по часам (0–23) и по дням недели (пн–вс) — когда больше всего продают."""

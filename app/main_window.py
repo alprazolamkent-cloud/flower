@@ -39,7 +39,7 @@ from .shifts import (
     PROBLEM_STATUSES, REMIND_BEFORE_MINUTES, Shift, business_day, opening_business_day, short_name, window,
 )
 from .templates_dialog import load_templates
-from .stock_settings import scan_required
+from .stock_settings import scan_required, weekly_count_day
 from .theme import C, primary
 from .update_ui import UpdateController
 from .assembly_dialog import SNOOZE, AssemblyReminder
@@ -50,8 +50,8 @@ from .client_flow import inline, order_summary
 from .photos import PhotoViewer
 from .flow_layout import FlowLayout, flow_policy
 from .future_orders import FutureOrdersDialog
-from .stock import CartLine, qty_text
-from .stock_window import StockWindow
+from .stock import CartLine, qty_text, week_key
+from .stock_window import InventoryDialog, StockWindow
 from .holidays import holiday_name
 from .heartbeat import Heartbeat
 from .reminders import assembly_due, assembly_escalations, due_reminders, overdue_deliveries, reminder_key
@@ -307,6 +307,12 @@ class MainWindow(QMainWindow):
         self.duties_btn.clicked.connect(self.open_checklist)
         water_row.addWidget(self.duties_btn)
         shift_layout.addLayout(water_row)
+        self.count_btn = QPushButton("📦 Инвентаризация недели — на вас")
+        self.count_btn.setToolTip("Отсканировать штрихкод каждого товара на складе")
+        primary(self.count_btn)
+        self.count_btn.clicked.connect(self.open_weekly_count)
+        self.count_btn.setVisible(False)
+        shift_layout.addWidget(self.count_btn)
         left.addWidget(self.shift_box)
 
         self.month_box = QGroupBox()
@@ -550,6 +556,7 @@ class MainWindow(QMainWindow):
             return False
         self.shift = dlg.shift
         self._after_shift_started(self.shift)
+        self._check_weekly_count(datetime.now())
         QTimer.singleShot(0, self.open_plan)  # сразу показать, что сегодня сделать
         return True
 
@@ -581,6 +588,7 @@ class MainWindow(QMainWindow):
 
     def update_shift_box(self):
         self._update_water_row()
+        self._update_count_btn()
         self.duties_btn.setVisible(False)
         self.plan_btn.setVisible(self.user is not None and (self.shift is not None or bool(self.active_shifts())))
         if self.user is None:
@@ -681,7 +689,94 @@ class MainWindow(QMainWindow):
             self.refresh_month()
             self.open_plan()
 
+    # ----- инвентаризация раз в неделю -----
+
+    def _weekly_count_now(self, now: datetime):
+        """(неделя, запись) — если инвентаризация включена и на этой неделе уже наступил её день."""
+        day_set = weekly_count_day()
+        if day_set < 0:
+            return None, None
+        today = business_day(now, shift_change())
+        if today.weekday() < day_set:
+            return None, None
+        week = week_key(today)
+        return week, self.db.weekly_count(week)
+
+    def _check_weekly_count(self, now: datetime):
+        """В день инвентаризации — выпадает по очереди одному из тех, кто на смене; прошлая не сделана — сказать."""
+        if weekly_count_day() < 0:
+            return
+        today = business_day(now, shift_change())
+        prev_week = week_key(today - timedelta(days=7))
+        prev = self.db.weekly_count(prev_week)
+        if prev is not None and prev.done_at is None and not prev.reported:
+            self.db.mark_weekly_reported(prev_week)
+            self.telegram.queue(f"⚠ Инвентаризация прошлой недели не сделана — была на {self._user_name(prev.user_id)}.",
+                                key=f"weekly_missed:{prev_week}")
+        week, count = self._weekly_count_now(now)
+        if week is not None and count is None:
+            people = self._people_on_shift()
+            staff = [u.id for u in people if not u.is_admin] or [u.id for u in people]
+            count = self.db.assign_weekly_count(week, staff, now)
+            if count is not None:
+                name = self._user_name(count.user_id)
+                self.telegram.queue(f"📦 Инвентаризация этой недели выпала на {name}: отсканировать каждый товар.",
+                                    key=f"weekly_assigned:{week}")
+                self.tray.showMessage("Инвентаризация недели", f"Сегодня инвентаризация на: {name}. Кнопка "
+                                      "«📦 Инвентаризация недели» — отсканируйте каждый товар.",
+                                      QSystemTrayIcon.Information, 60_000)
+        self._update_count_btn()
+
+    def _user_name(self, user_id: int) -> str:
+        return next((u.name or u.login for u in self.db.users() if u.id == user_id), "сотрудника")
+
+    def _my_weekly_count(self):
+        if self.user is None or self.shift is None:
+            return None, None
+        week, count = self._weekly_count_now(datetime.now())
+        if count is None or count.done_at is not None or count.user_id != self.user.id:
+            return None, None
+        return week, count
+
+    def _update_count_btn(self):
+        self.count_btn.setVisible(self._my_weekly_count()[0] is not None)
+
+    def open_weekly_count(self):
+        week, _ = self._my_weekly_count()
+        if week is None:
+            return
+        dialog = InventoryDialog(self, self.db.products(), weekly=True)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        names = {p.id: p for p in dialog.products}
+        missing = [f"{names[pid].name} ({qty_text(names[pid].stock)} {names[pid].unit})" for pid in dialog.missing]
+        try:
+            count = self.db.finish_weekly_count(week, dialog.actual(), dialog.missing, self.user.id, datetime.now())
+        except UserError as e:
+            QMessageBox.warning(self, "Инвентаризация", str(e))
+            return
+        result = (f"недостача {money(round(-count.money))}" if round(count.money) < 0 else
+                  f"излишек {money(round(count.money))}" if round(count.money) > 0 else "всё сошлось")
+        details = f"отсканировано товаров {count.scanned}, не нашли {count.missing}, {result}"
+        self.audit("Инвентаризация недели", details)
+        self.telegram.queue(f"📦 Инвентаризация недели — {self.user.name or self.user.login}: {details}"
+                            + ("\nНе нашли:\n• " + "\n• ".join(missing[:20]) + ("\n…" if len(missing) > 20 else "")
+                               if missing else ""), key=f"weekly_done:{week}")
+        self._update_count_btn()
+        if self.stock_window is not None and self.stock_window.isVisible():
+            self.stock_window.refresh()
+        QMessageBox.information(self, "Инвентаризация", f"Записано: {details}. Спасибо!")
+
     def close_shift(self):
+        week, _ = self._my_weekly_count()
+        if week is not None:
+            if QMessageBox.question(self, "Сдача смены", "На этой неделе инвентаризация на вас, и она ещё не сделана."
+                                    "\n\nСделать сейчас?", QMessageBox.Yes | QMessageBox.No,
+                                    QMessageBox.Yes) == QMessageBox.Yes:
+                self.open_weekly_count()
+            if self._my_weekly_count()[0] is not None:
+                self.telegram.queue(f"⚠ {self.user.name or self.user.login} сдаёт смену, а инвентаризацию недели "
+                                    "не сделал(а).", key=f"weekly_skip:{week}:{self.shift.id}")
         change, grace = shift_change(), grace_minutes()
         if not self.shift.can_close(datetime.now(), change, grace):
             QMessageBox.warning(self, "Сдача смены", "Время на сдачу этой смены уже вышло.")
@@ -750,6 +845,7 @@ class MainWindow(QMainWindow):
             if deadline <= now < deadline + timedelta(days=1):  # не сдана — сообщить администратору один раз
                 self.telegram.queue(telegram.not_closed_text(s), key=f"not_closed:{s.id}")
 
+        self._check_weekly_count(now)
         day = business_day(now, change)
         if active and now >= window(day, change)[0] + WATER_REMIND_AFTER and day not in self._water_reminded \
                 and water_schedule().is_water_day(day) and not self.db.water_change(day):
