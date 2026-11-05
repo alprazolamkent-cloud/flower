@@ -27,7 +27,7 @@ from .labels import LAYOUTS, Label, barcode_modules, labels_html, print_labels, 
 from .stock_settings import SCAN_ONLY, label_printer, scan_required, set_label_printer
 from .stock import (
     CATEGORIES, PAYMENTS, CartLine, Product, Recipe, day_range, ean13_check, qty_text, reorder_text, short_label,
-    split_codes,
+    code_in, split_codes,
 )
 from .theme import C, fit_to_screen, primary, scrollable
 
@@ -642,7 +642,7 @@ class LinesEditor(QWidget):
         if pid is None:
             text = self.pick.currentText().strip().lower()
             code = "".join(text.split())
-            pid = next((p.id for p in self.products if code and code in split_codes(p.barcode)), None)  # сканер
+            pid = next((p.id for p in self.products if code_in(code, p.barcode)), None)  # сканер
             if pid is None:
                 pid = next((p.id for p in self.products if text and text in p.name.lower()), None)
             if pid is None and code.isdigit() and len(code) >= 6 and self.on_unknown:
@@ -659,7 +659,7 @@ class LinesEditor(QWidget):
         code = "".join(self.pick.currentText().split())
         self.pick.setCurrentIndex(-1)
         self.pick.clearEditText()
-        pid = next((p.id for p in self.products if code and code in split_codes(p.barcode)), None)
+        pid = next((p.id for p in self.products if code_in(code, p.barcode)), None)
         if pid is not None:
             self.add(pid, 1, self._product(pid).avg_cost)
             self.scan_note.setText(f"<b style='color:{C.green}'>✓ {html.escape(self._product(pid).name)}</b>")
@@ -913,7 +913,7 @@ class ScanGate(QWidget):
     def _check(self):
         code = "".join(self.edit.text().split())
         self.edit.clear()
-        self.ok = bool(code) and code in self.codes
+        self.ok = code_in(code, self.codes)
         self.button.setEnabled(self.ok)
         self.status.setText(f"<b style='color:{C.green}'>✓ Штрихкод совпал</b>" if self.ok else
                             f"<b style='color:{C.red}'>✕ Это не тот штрихкод ({html.escape(code)})</b>")
@@ -1429,7 +1429,7 @@ class InventoryDialog(QDialog):
     def _scanned(self):
         code = "".join(self.scan_edit.text().split())
         self.scan_edit.clear()
-        i = next((i for i, p in enumerate(self.products) if code and code in split_codes(p.barcode)), None)
+        i = next((i for i, p in enumerate(self.products) if code_in(code, p.barcode)), None)
         if i is None:
             if code:
                 self.scan_note.setText(f"<b style='color:{C.red}'>✕ Штрихкода {html.escape(code)} нет ни у одного "

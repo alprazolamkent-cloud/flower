@@ -146,6 +146,25 @@ WRITEOFFS = ("SELECT at, qty, cost, reason, shift_id FROM stock_moves WHERE kind
 OWN_PREFIX = "200"  # EAN-13, начинается на 2 — диапазон «для внутреннего пользования магазина», с заводскими не совпадёт
 
 
+_RU = "йцукенгшщзхъфывапролджэячсмитьбю.ЙЦУКЕНГШЩЗХЪФЫВАПРОЛДЖЭЯЧСМИТЬБЮ,ё\"№;:?Ё"
+_EN = "qwertyuiop[]asdfghjkl;'zxcvbnm,./QWERTYUIOP{}ASDFGHJKL:\"ZXCVBNM<>?`@#$^&~"
+_TO_LATIN = str.maketrans(_RU, _EN)
+
+
+def scan_variants(code: str) -> list[str]:
+    """Что отсканировали — и то же самое, если в Windows была русская раскладка (сканер «печатает»
+    как клавиатура: заводской «AB-12» приходит как «ФИ-12»). Цифры от раскладки не зависят."""
+    code = "".join(code.split())
+    latin = code.translate(_TO_LATIN)
+    return [code, latin] if latin != code else [code]
+
+
+def code_in(code: str, codes: str | list[str]) -> bool:
+    """Отсканированный код — один из кодов товара (с учётом раскладки)."""
+    codes = split_codes(codes) if isinstance(codes, str) else codes
+    return bool(code.strip()) and any(v in codes for v in scan_variants(code))
+
+
 def split_codes(text: str) -> list[str]:
     """«4600…17, 2000…05» → список кодов (без повторов, порядок как вписали). Разделители — запятая,
     точка с запятой, новая строка; пробелы внутри кода (вписали цифры группами) убираются."""
@@ -448,7 +467,11 @@ class StockStore:
 
     def find_code(self, code: str) -> tuple[str, int] | None:
         """Что за штрихкод: ("product", номер) или ("recipe", номер) — только то, что не в архиве."""
-        row = self.conn.execute("SELECT kind, ident FROM barcodes WHERE code=?", ("".join(code.split()),)).fetchone()
+        row = None
+        for variant in scan_variants(code):
+            row = self.conn.execute("SELECT kind, ident FROM barcodes WHERE code=?", (variant,)).fetchone()
+            if row is not None:
+                break
         if row is None or not self._owner_name(*row)[1]:
             return None
         return row[0], row[1]

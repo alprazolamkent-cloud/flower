@@ -204,3 +204,15 @@ def test_weekly_count_rotation_and_shortage(db, monkeypatch):
     done = db.finish_weekly_count(week, dialog.actual(), dialog.missing, anna, NOW)
     assert (done.scanned, done.missing, round(done.money)) == (1, 1, -(2 * 80 + 5 * 10))
     assert db.stock_of(rose) == 18 and db.stock_of(tape) == 0 and db.stock_of(bare) == 3
+
+
+def test_scan_in_russian_layout(db):
+    """Сканер «печатает» как клавиатура: при русской раскладке заводской «AB-12» приходит как «ФИ-12»."""
+    from app.stock import code_in
+    box = db.save_product(Product(0, "Коробка", "Упаковка", price=300, barcode="AB-12"))
+    assert db.find_code("ФИ-12") == ("product", box) and db.find_code("AB-12") == ("product", box)
+    assert code_in("ФИ-12", "AB-12") and not code_in("ФИ-13", "AB-12") and not code_in("", "AB-12")
+    editor = stock_window.LinesEditor(db.products(), with_cost=False, scan_only=True)
+    editor.pick.setEditText("ФИ-12")
+    editor._add_picked()
+    assert editor.lines() == [(box, 1)]
