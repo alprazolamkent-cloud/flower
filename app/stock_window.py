@@ -592,9 +592,10 @@ class ProductDialog(QDialog):
 class LinesEditor(QWidget):
     """Таблица «товар — сколько [— цена]» для поставки и техкарты."""
 
-    def __init__(self, products: list[Product], with_cost: bool):
+    def __init__(self, products: list[Product], with_cost: bool, on_unknown=None):
         super().__init__()
         self.products, self.with_cost = products, with_cost
+        self.on_unknown = on_unknown  # отсканировали код, которого нет ни у одного товара
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         add = QHBoxLayout()
@@ -629,10 +630,21 @@ class LinesEditor(QWidget):
             pid = next((p.id for p in self.products if code and code in split_codes(p.barcode)), None)  # сканер
             if pid is None:
                 pid = next((p.id for p in self.products if text and text in p.name.lower()), None)
+            if pid is None and code.isdigit() and len(code) >= 6 and self.on_unknown:
+                self.pick.setCurrentIndex(-1)
+                self.pick.clearEditText()
+                self.on_unknown(code)
+                return
         if pid is not None:
             self.add(pid, 1, self._product(pid).avg_cost)
             self.pick.setCurrentIndex(-1)
             self.pick.clearEditText()
+
+    def add_product(self, p: Product):
+        """Новый товар (завели прямо отсюда) — в список выбора и сразу строкой."""
+        self.products.append(p)
+        self.pick.addItem(f"{p.name} · {p.category}", p.id)
+        self.add(p.id, 1, 0)
 
     def add(self, pid: int, qty: float, cost: float = 0):
         p = self._product(pid)
@@ -655,6 +667,7 @@ class LinesEditor(QWidget):
         name = _item(f"{p.name}  ·  {p.category.lower()}", pid)
         self.table.setItem(row, 0, name)
         box = qty_box(p.unit)
+        box.setDecimals(0 if p.unit == "шт" else 2)  # «100 шт», а «1,5 м» — дробно
         box.setValue(qty)
         box.valueChanged.connect(self._update)
         self.table.setCellWidget(row, 1, box)
@@ -705,9 +718,9 @@ class LinesEditor(QWidget):
 
 
 class SupplyDialog(QDialog):
-    def __init__(self, parent, db, user_id: int | None):
+    def __init__(self, parent, db, user_id: int | None, admin: bool = False):
         super().__init__(parent)
-        self.db, self.user_id = db, user_id
+        self.db, self.user_id, self.admin = db, user_id, admin
         self.setWindowTitle("Новая поставка")
         self.resize(720, 520)
         layout = QVBoxLayout(self)
@@ -722,11 +735,33 @@ class SupplyDialog(QDialog):
         self.note_edit.setPlaceholderText("Номер накладной, что не довезли…")
         form.addRow("Заметка:", self.note_edit)
         layout.addLayout(form)
-        self.lines = LinesEditor(db.products(), with_cost=True)
+        self.lines = LinesEditor(db.products(), with_cost=True, on_unknown=self._unknown_code)
         layout.addWidget(self.lines, 1)
-        layout.addWidget(_gray("Нет товара в списке — сначала добавьте его в «📦 Остатки» (администратор). "
-                               "Цена закупки — за одну штуку / ветку; себестоимость пересчитается сама."))
+        row = QHBoxLayout()
+        row.addWidget(_gray("Печатайте название и Enter или сканируйте заводской штрихкод. Цена закупки — за одну "
+                            "штуку / ветку (подставлена прошлая); себестоимость пересчитается сама."), 1)
+        new_btn = QPushButton("➕ Новый товар")
+        new_btn.setToolTip("Приехал товар, которого ещё нет в программе — завести и сразу добавить в поставку")
+        new_btn.clicked.connect(lambda: self._new_product(""))
+        new_btn.setVisible(admin)
+        row.addWidget(new_btn)
+        layout.addLayout(row)
+        if not admin:
+            layout.addWidget(_gray("Нет товара в списке — попросите администратора завести его."))
         layout.addWidget(_buttons(self, "Принять поставку"))
+
+    def _unknown_code(self, code: str):
+        if not self.admin:
+            QMessageBox.information(self, "Поставка", f"Товара со штрихкодом {code} нет в программе. Попросите "
+                                    "администратора завести его.")
+        elif _confirm(self, "Поставка", f"Товара со штрихкодом {code} ещё нет. Завести новый товар?"):
+            self._new_product(code)
+
+    def _new_product(self, code: str):
+        p = Product(0, "", "Цветы", barcode=code)
+        if ProductDialog(self, p).exec() == QDialog.Accepted:
+            self.lines.add_product(self.db.get_product(p.id))
+            self.created = getattr(self, "created", []) + [p.name]
 
     def accept(self):
         try:
@@ -1943,12 +1978,15 @@ class StockWindow(QDialog):
                                       f"<b>{money(self.db.supplies_total(*day_range(month, date.today())))}</b>")
 
     def _add_supply(self):
-        if not self.db.products():
-            QMessageBox.information(self, "Поставка", "Сначала заведите товары во вкладке «📦 Остатки» "
-                                    "(кнопка «➕ Товар», нужен администратор).")
+        if not self.db.products() and not self.admin:
+            QMessageBox.information(self, "Поставка", "Товаров в программе ещё нет — их заводит администратор "
+                                    "(«📦 Остатки» → «➕ Товар» или прямо в окне поставки).")
             return
-        dialog = SupplyDialog(self, self.db, self.user_id)
-        if dialog.exec() == QDialog.Accepted:
+        dialog = SupplyDialog(self, self.db, self.user_id, admin=self.admin)
+        accepted = dialog.exec() == QDialog.Accepted
+        for name in getattr(dialog, "created", []):
+            self.main.audit("Товар добавлен", f"{name} (при приёмке поставки)")
+        if accepted:
             s = self.db.supplies(1)[0]
             self.main.audit("Поставка", f"№{s.id} от {s.supplier or '—'} на {money(s.total)}")
             self._refresh_supplies()

@@ -317,3 +317,39 @@ def test_barcode_reorder_inventory_and_time_charts(main, db, monkeypatch):
     for d in (dialog, inv):
         d.deleteLater()
     w.deleteLater()
+
+
+def test_supply_with_new_product_and_scanned_code(main, db, monkeypatch):
+    from app.stock_window import ProductDialog, SupplyDialog
+    rose = db.products()[1]
+    rose.barcode = "4600000000015"
+    db.save_product(rose)
+    dlg = SupplyDialog(None, db, main.user.id, admin=True)
+    dlg.lines.pick.setEditText("4600000000015")  # сканер на заводской пачке
+    dlg.lines._add_picked()
+    assert dlg.lines.lines() == [(rose.id, 1, 90)]  # цена закупки — прошлая
+
+    def new_product(self):
+        assert self.barcode_edit.text() == "2000000000015"
+        self.name_edit.setText("Эвкалипт")
+        self.accept()
+        return QDialog.Accepted
+    monkeypatch.setattr(QMessageBox, "question", lambda *a, **k: QMessageBox.Yes)
+    monkeypatch.setattr(ProductDialog, "exec", new_product)
+    dlg.lines.pick.setEditText("2000000000015")  # незнакомый код — завести товар прямо здесь
+    dlg.lines._add_picked()
+    new = next(p for p in db.products() if p.name == "Эвкалипт")
+    assert [line[0] for line in dlg.lines.lines()] == [rose.id, new.id] and dlg.created == ["Эвкалипт"]
+    dlg.lines.table.cellWidget(1, 1).setValue(20)
+    dlg.lines.table.cellWidget(1, 2).setValue(35)
+    dlg.accept()
+    assert db.stock_of(new.id) == 20 and db.get_product(new.id).avg_cost == 35
+
+    staff = SupplyDialog(None, db, None, admin=False)
+    told = []
+    monkeypatch.setattr(QMessageBox, "information", lambda *a: told.append(a[2]))
+    staff.lines.pick.setEditText("4606060606063")
+    staff.lines._add_picked()
+    assert told and "администратора" in told[0] and staff.lines.lines() == []
+    dlg.deleteLater()
+    staff.deleteLater()
