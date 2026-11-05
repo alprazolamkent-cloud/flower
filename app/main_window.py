@@ -265,6 +265,7 @@ class MainWindow(QMainWindow):
         left.addWidget(self.calendar)
 
         self.legend = QLabel()
+        self.legend.setWordWrap(True)  # длинные надписи без переноса растягивали окно шире экрана в Windows
         left.addWidget(self.legend)
 
         today_btn = QPushButton("Сегодня")
@@ -293,6 +294,7 @@ class MainWindow(QMainWindow):
         shift_layout.addLayout(shift_buttons)
         water_row = QHBoxLayout()
         self.water_label = QLabel()
+        self.water_label.setWordWrap(True)
         self.water_btn = QPushButton("💧 Вода поменяна")
         self.water_btn.setToolTip("Отметить, что воду в вёдрах поменяли")
         self.water_btn.clicked.connect(self.mark_water)
@@ -419,11 +421,13 @@ class MainWindow(QMainWindow):
         right.addWidget(self.table, 1)
 
         self.day_totals = QLabel()
+        self.day_totals.setWordWrap(True)
         right.addWidget(self.day_totals)
 
         self.hint = QLabel("💐 — букет собран, ✓ — доставлено, 📷 — есть фото букета (двойной щелчок по 💐 — "
                            "посмотреть). Двойной щелчок по строке — изменить.")
         self.hint.setStyleSheet(f"color: {C.gray}")
+        self.hint.setWordWrap(True)
         right.addWidget(self.hint)
 
         QShortcut(QKeySequence.New, self, activated=self.add_delivery)

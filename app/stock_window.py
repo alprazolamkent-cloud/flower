@@ -1420,6 +1420,7 @@ class StockWindow(QDialog):
         right.addWidget(_gray("🧾 Чек пробейте на АТОЛ, как обычно — при сдаче смены суммы подставятся сами."))
         today_head = QHBoxLayout()
         self.today_total = QLabel()
+        self.today_total.setWordWrap(True)
         today_head.addWidget(self.today_total, 1)
         cancel_btn = QPushButton("↩ Отменить продажу")
         cancel_btn.setToolTip("Возврат или ошиблись: товар вернётся на склад, сумма уйдёт из выручки")
@@ -1923,6 +1924,7 @@ class StockWindow(QDialog):
         top.addWidget(add)
         top.addStretch(1)
         self.supplies_summary = QLabel()
+        self.supplies_summary.setWordWrap(True)
         top.addWidget(self.supplies_summary)
         layout.addLayout(top)
         self.supplies_table = _table(["Когда", "Поставщик", "Что привезли", "Сумма", "Принял(а)"], stretch=2)
@@ -2160,6 +2162,7 @@ class StockWindow(QDialog):
         self.period_box.currentIndexChanged.connect(self._refresh_analytics)
         top.addWidget(self.period_box)
         self.period_label = QLabel()
+        self.period_label.setWordWrap(True)
         self.period_label.setStyleSheet(f"color: {C.gray}")
         top.addWidget(self.period_label)
         top.addStretch(1)
@@ -2205,6 +2208,7 @@ class StockWindow(QDialog):
         more.addTab(page_stale, "💤 Залёживается и списания")
         layout.addWidget(more, 1)
         self.stock_line = QLabel()
+        self.stock_line.setWordWrap(True)
         layout.addWidget(self.stock_line)
         return page
 

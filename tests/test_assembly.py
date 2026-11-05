@@ -342,8 +342,14 @@ def test_windows_fit_small_screen(window):
     limit_w, limit_h = 1280, 700
 
     def fits(name, widget):
+        from PySide6.QtWidgets import QWidget
         hint = widget.minimumSizeHint()
-        assert hint.width() <= limit_w and hint.height() <= limit_h, f"{name}: {hint.width()}×{hint.height()}"
+        if hint.width() <= limit_w and hint.height() <= limit_h:
+            return
+        widest = sorted(((c.minimumSizeHint().width(), c.minimumSizeHint().height(), type(c).__name__,
+                          (getattr(c, "text", lambda: "")() or c.objectName())[:50])
+                         for c in widget.findChildren(QWidget) if c.isVisibleTo(widget)), reverse=True)[:12]
+        raise AssertionError(f"{name}: {hint.width()}x{hint.height()}; шире всех: {widest}")
 
     fits("главное окно", w)
     w.open_stock()
