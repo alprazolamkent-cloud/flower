@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
 from . import stock_import
 from .db import UserError
 from .delivery_dialog import money, money_box
+from .flow_layout import FlowLayout, flow_policy
 from .icon import flower_icon
 from .photos import pick_photo, pixmap
 from .shifts import WRITEOFF_REASONS
@@ -27,7 +28,7 @@ from .stock import (
     CATEGORIES, PAYMENTS, CartLine, Product, Recipe, day_range, ean13_check, qty_text, reorder_text, short_label,
     split_codes,
 )
-from .theme import C, fit_to_screen, primary
+from .theme import C, fit_to_screen, primary, scrollable
 
 MOVE_KINDS = {"supply": "Поставка", "sale": "Продажа", "writeoff": "Списание", "count": "Инвентаризация",
               "return": "Возврат", "assembly": "Собрали букет", "disassembly": "Разобрали букет",
@@ -1269,7 +1270,7 @@ class StockWindow(QDialog):
         self.tabs.addTab(self._stock_tab(), "📦 Остатки")
         self.tabs.addTab(self._supplies_tab(), "🚚 Поставки")
         self.tabs.addTab(self._recipes_tab(), "📋 Техкарты")
-        self.analytics_index = self.tabs.addTab(self._analytics_tab(), "📊 Аналитика")
+        self.analytics_index = self.tabs.addTab(scrollable(self._analytics_tab()), "📊 Аналитика")  # узкое окно — прокрутка
         layout.addWidget(self.tabs, 1)
         self.tabs.currentChanged.connect(lambda _: self.refresh())
         QShortcut(QKeySequence("Ctrl+F"), self, activated=self.start_sale)
@@ -1340,12 +1341,12 @@ class StockWindow(QDialog):
         free_btn.clicked.connect(self._add_free)
         top.addWidget(free_btn)
         left.addLayout(top)
-        self.chips_row = QHBoxLayout()
-        self.chips_row.setSpacing(6)
+        chips_box = flow_policy(QWidget())  # разделы переносятся на новую строку, а не растягивают окно
+        self.chips_row = FlowLayout(chips_box)
         self.chips = QButtonGroup(self)
         self.chips.setExclusive(True)
         self.chips.buttonClicked.connect(lambda _: self._refresh_catalog())
-        left.addLayout(self.chips_row)
+        left.addWidget(chips_box)
         self.grid = TileGrid(self._add_tile, self._photo)
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -1404,7 +1405,8 @@ class StockWindow(QDialog):
         self.total_label = QLabel()
         total_row.addWidget(self.total_label)
         right.addLayout(total_row)
-        pay = QHBoxLayout()
+        pay_box = flow_policy(QWidget())
+        pay = FlowLayout(pay_box)
         self.pay_buttons = []
         for code, title in PAYMENTS.items():
             icon, key = {"cash": ("💵", "F5"), "card": ("💳", "F6"), "qr": ("📱", "F7")}[code]
@@ -1414,7 +1416,7 @@ class StockWindow(QDialog):
             button.clicked.connect(lambda _=False, c=code: self._sell(c))
             pay.addWidget(button)
             self.pay_buttons.append(button)
-        right.addLayout(pay)
+        right.addWidget(pay_box)
         self.shift_hint = _gray("")
         right.addWidget(self.shift_hint)
         right.addWidget(_gray("🧾 Чек пробейте на АТОЛ, как обычно — при сдаче смены суммы подставятся сами."))
@@ -1461,7 +1463,7 @@ class StockWindow(QDialog):
             chip.setChecked(key == (current or ("popular" if names[0][0] == "popular" else "all")))
         if self.chips.checkedButton() is None and self.chips.buttons():
             self.chips.buttons()[0].setChecked(True)
-        self.chips_row.addStretch(1)
+        self.chips_row.invalidate()
 
     def _refresh_catalog(self):
         query = self.search_edit.text().strip().lower()
@@ -1702,7 +1704,8 @@ class StockWindow(QDialog):
         self.stock_table = _table(["Товар", "Раздел", "Остаток", "Цена", "Себестоимость", "Мало, если ≤"])
         self.stock_table.itemDoubleClicked.connect(lambda _: self._edit_product() if self.admin else self._history())
         layout.addWidget(self.stock_table, 1)
-        buttons = QHBoxLayout()
+        buttons_box = flow_policy(QWidget())
+        buttons = FlowLayout(buttons_box)
         self.add_product_btn = QPushButton("➕ Товар")
         self.add_product_btn.clicked.connect(lambda: self._edit_product(new=True))
         self.edit_product_btn = QPushButton("✏️ Изменить")
@@ -1730,22 +1733,15 @@ class StockWindow(QDialog):
         self.import_btn = QPushButton("📥 Загрузить из таблицы")
         self.import_btn.setToolTip("Excel (.xlsx) или CSV: шаблон программы или выгрузка из Hoog")
         self.import_btn.clicked.connect(self._import)
-        # в два ряда: в один десять кнопок растягивали окно шире экрана
+        # кнопки переносятся: в один ряд десять кнопок растягивали окно шире экрана
         for b in (self.add_product_btn, self.edit_product_btn, writeoff_btn, self.count_btn, history_btn,
-                  self.archive_btn):
+                  self.archive_btn, reorder_btn, labels_btn, self.inventory_btn, self.import_btn):
             b.setMinimumHeight(30)
             buttons.addWidget(b)
-        buttons.addStretch(1)
-        layout.addLayout(buttons)
-        second = QHBoxLayout()
-        for b in (reorder_btn, labels_btn, self.inventory_btn, self.import_btn):
-            b.setMinimumHeight(30)
-            second.addWidget(b)
-        second.addStretch(1)
+        layout.addWidget(buttons_box)
         self.stock_summary = QLabel()
         self.stock_summary.setWordWrap(True)
-        second.addWidget(self.stock_summary, 1)
-        layout.addLayout(second)
+        layout.addWidget(self.stock_summary)
         return page
 
     def _refresh_stock(self):
@@ -1969,7 +1965,8 @@ class StockWindow(QDialog):
         self.recipes_table.setWordWrap(True)
         self.recipes_table.itemDoubleClicked.connect(lambda _: self._edit_recipe() if self.admin else None)
         layout.addWidget(self.recipes_table, 1)
-        buttons = QHBoxLayout()
+        actions_box, admin_box = flow_policy(QWidget()), flow_policy(QWidget())
+        buttons = FlowLayout(actions_box)
         assemble_btn = QPushButton("💐 Собрать на витрину")
         assemble_btn.clicked.connect(self._assemble)
         disassemble_btn = QPushButton("🔧 Разобрать / пересобрать")
@@ -1991,11 +1988,14 @@ class StockWindow(QDialog):
         for b in (assemble_btn, disassemble_btn, writeoff_btn, history_btn, recipe_labels):
             b.setMinimumHeight(32)
             buttons.addWidget(b)
-        buttons.addStretch(1)
+        admin = FlowLayout(admin_box, align_right=True)
         for b in (self.add_recipe_btn, self.edit_recipe_btn, self.archive_recipe_btn):
             b.setMinimumHeight(32)
-            buttons.addWidget(b)
-        layout.addLayout(buttons)
+            admin.addWidget(b)
+        row = QHBoxLayout()
+        row.addWidget(actions_box, 3)
+        row.addWidget(admin_box, 2)
+        layout.addLayout(row)
         return page
 
     def _refresh_recipes(self):
@@ -2167,14 +2167,14 @@ class StockWindow(QDialog):
         top.addWidget(self.period_label)
         top.addStretch(1)
         layout.addLayout(top)
-        cards = QGridLayout()
+        cards_box = flow_policy(QWidget())
+        cards = FlowLayout(cards_box, spacing=8)
         self.cards = {}
-        for i, (key, title) in enumerate((("revenue", "Выручка"), ("count", "Продаж"), ("average", "Средний чек"),
-                                          ("profit", "Валовая прибыль"), ("margin", "Маржа"),
-                                          ("writeoff", "Списано"))):
+        for key, title in (("revenue", "Выручка"), ("count", "Продаж"), ("average", "Средний чек"),
+                           ("profit", "Валовая прибыль"), ("margin", "Маржа"), ("writeoff", "Списано")):
             self.cards[key] = Card(title)
-            cards.addWidget(self.cards[key], 0, i)
-        layout.addLayout(cards)
+            cards.addWidget(self.cards[key])
+        layout.addWidget(cards_box)
         layout.addWidget(QLabel("<b>Выручка по дням</b>"))
         self.chart = BarChart()
         layout.addWidget(self.chart)

@@ -47,6 +47,7 @@ from .max_bot import MaxBot
 from .client_center import NEEDS_ACTION, ClientCenter, StaffLinkDialog, needs_action
 from .client_flow import inline, order_summary
 from .photos import PhotoViewer
+from .flow_layout import FlowLayout, flow_policy
 from .future_orders import FutureOrdersDialog
 from .stock import CartLine, qty_text
 from .stock_window import StockWindow
@@ -336,6 +337,9 @@ class MainWindow(QMainWindow):
 
         top = QHBoxLayout()
         top.addWidget(self.day_title, 1)
+        header_box = flow_policy(QWidget())  # кнопки справа переносятся на вторую строку, если не помещаются
+        header = FlowLayout(header_box, align_right=True)
+        top.addWidget(header_box, 1)
         self.user_btn = QPushButton()
         self.user_btn.setToolTip("Кто сейчас вошёл. Здесь же — смена пароля")
         user_menu = QMenu(self.user_btn)
@@ -344,24 +348,25 @@ class MainWindow(QMainWindow):
         link_action = user_menu.addAction("📱 Телефон для фото букетов (Telegram / MAX)")
         link_action.triggered.connect(self.link_telegram)
         self.user_btn.setMenu(user_menu)
-        top.addWidget(self.user_btn)
+        header.addWidget(self.user_btn)
         self.ann_btn = QPushButton("📢 Объявления")
         self.ann_btn.clicked.connect(self.open_announcements)
-        top.addWidget(self.ann_btn)
+        header.addWidget(self.ann_btn)
         self.notif_btn = QPushButton("🔔 Уведомления")
         self.notif_btn.setToolTip("Всё, что программа показывала в углу экрана за последние 24 часа")
         self.notif_btn.clicked.connect(self.open_notifications)
-        top.addWidget(self.notif_btn)
+        header.addWidget(self.notif_btn)
         self.settings_btn = QPushButton("⚙ Настройки")
         self.settings_btn.clicked.connect(self.open_settings)
         logout_btn = QPushButton("🚪 Выйти")
         logout_btn.setToolTip("Выйти из профиля, чтобы вошёл другой сотрудник. Смена при этом не закрывается.")
         logout_btn.clicked.connect(self.logout)
         for b in (self.settings_btn, logout_btn):
-            top.addWidget(b)
+            header.addWidget(b)
         right.addLayout(top)
 
-        buttons = QHBoxLayout()
+        actions_box, nav_box = flow_policy(QWidget()), flow_policy(QWidget())
+        buttons = FlowLayout(actions_box)  # не помещаются по ширине — переносятся, а не растягивают окно
         add_btn = QPushButton("➕ Доставка")
         add_btn.setToolTip("Добавить доставку (Ctrl+N)")
         primary(add_btn)
@@ -383,7 +388,7 @@ class MainWindow(QMainWindow):
         for b in (add_btn, self.edit_btn, self.delete_btn, self.keep_btn, self.write_btn):
             b.setMinimumHeight(32)
             buttons.addWidget(b)
-        buttons.addStretch(1)
+        buttons = FlowLayout(nav_box, align_right=True)
         self.stock_btn = QPushButton("📦 Склад")
         self.stock_btn.setToolTip("Остатки, поставки, техкарты букетов, продажи за день и аналитика")
         self.stock_btn.setMinimumHeight(32)
@@ -399,7 +404,10 @@ class MainWindow(QMainWindow):
         self.clients_btn.setMinimumHeight(32)
         self.clients_btn.clicked.connect(self.open_clients)
         buttons.addWidget(self.clients_btn)
-        right.addLayout(buttons)
+        row = QHBoxLayout()
+        row.addWidget(actions_box, 3)
+        row.addWidget(nav_box, 2)
+        right.addLayout(row)
 
         self.table = QTableWidget(0, len(HEADERS))
         self.table.setHorizontalHeaderLabels(HEADERS)
