@@ -1184,12 +1184,12 @@ class LabelsDialog(QDialog):
         row = QHBoxLayout()
         self.browser_btn = QPushButton("🌐 В браузере")
         self.browser_btn.setToolTip("Открыть этикетки страницей в браузере и напечатать оттуда (Ctrl+P)")
-        self.browser_btn.clicked.connect(lambda: self._print(browser=True))
+        self.browser_btn.clicked.connect(self._print_browser)
         row.addWidget(self.browser_btn)
         row.addStretch(1)
         self.print_btn = QPushButton("🖨 Напечатать")
         primary(self.print_btn)
-        self.print_btn.clicked.connect(lambda: self._print())
+        self.print_btn.clicked.connect(self._print_direct)
         row.addWidget(self.print_btn)
         close = QPushButton("Закрыть")
         close.clicked.connect(self.reject)
@@ -1236,6 +1236,12 @@ class LabelsDialog(QDialog):
                 self.db.set_label_text(kind, item_id, text)
             result.append(Label(text, code, price if self.with_price.isChecked() else None, self.copies[i].value()))
         return result
+
+    def _print_direct(self):
+        self._print()
+
+    def _print_browser(self):
+        self._print(browser=True)
 
     def _print(self, browser: bool = False):
         layout = self.layout_box.currentData()
