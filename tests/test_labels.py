@@ -105,7 +105,7 @@ def test_labels_dialog_and_scanning(db, monkeypatch):
     dialog.checks[[k for k, *_ in dialog.items].index("product")].setChecked(True)
     dialog.copies[0].setValue(2)
     assert "этикеток: <b>3</b>" in dialog.summary.text()
-    dialog._print()
+    dialog._print(browser=True)
     assert dialog.created == 2 and opened and "Этикеток: 3" in open(opened[0], encoding="utf-8").read()
     rose_code, bouquet_code = db.ensure_code("product", rose), db.ensure_code("recipe", recipe)
 
@@ -136,7 +136,7 @@ def test_short_label_on_top(db, monkeypatch):
     dialog.checks[rows[card]].setChecked(True)
     dialog.checks[rows[rose]].setChecked(True)
     dialog.tops[rows[rose]].setText("Р60")  # своя подпись — запомнится
-    dialog._print()
+    dialog._print(browser=True)
     page = open(opened[0], encoding="utf-8").read()
     assert '<div class="title">н15</div><div class="price">150 ₽</div>' in page and '"title">Р60<' in page
     assert db.get_product(rose).label_text == "Р60" and db.get_product(card).label_text == ""

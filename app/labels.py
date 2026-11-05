@@ -122,3 +122,137 @@ body {{ margin: 0; font-family: Arial, sans-serif; color: #000; }}
 поля — нет{', размер бумаги 58×40 мм' if thermal else ''}.</div>
 <div class="sheet">{''.join(cells)}</div>
 </body></html>"""
+
+
+# ----- печать прямо на принтер (Xprinter и любой другой, через драйвер Windows) -----
+
+LABEL_MM = {"thermal": (58, 40), "a4": (70, 37)}
+A4_GRID = (3, 8)  # 24 наклейки на листе A4
+
+
+def barcode_modules(code: str) -> tuple[str, int]:
+    """(модули «1»/«0», поле тишины в модулях) — EAN-13 или Code 128."""
+    return (ean13_modules(code), 11) if is_ean13(code) else (code128_modules(code), 10)
+
+
+def paint_label(painter, rect, label: Label, dpmm: float):
+    """Нарисовать этикетку в прямоугольнике rect (точки устройства): сверху мелко подпись, крупно цена,
+    внизу штрихкод. Ширина полоски — целое число точек: у термопринтера дробные полоски расплываются."""
+    from PySide6.QtCore import QRectF, Qt
+    from PySide6.QtGui import QColor, QFont, QFontMetricsF
+
+    pad_x, pad_y = 2.5 * dpmm, 1.6 * dpmm
+    inner = QRectF(rect).adjusted(pad_x, pad_y, -pad_x, -pad_y)
+    painter.save()
+    painter.setPen(QColor("black"))
+    font = QFont("Arial")
+    font.setPixelSize(max(int(2.6 * dpmm), 6))
+    painter.setFont(font)
+    title = QFontMetricsF(font).elidedText(label.title, Qt.ElideRight, inner.width())
+    top_h = 3.4 * dpmm
+    painter.drawText(QRectF(inner.left(), inner.top(), inner.width(), top_h), Qt.AlignLeft | Qt.AlignVCenter, title)
+
+    code_h, bars_h = 2.8 * dpmm, min(11 * dpmm, inner.height() * 0.38)
+    bottom = inner.bottom()
+    if label.price is not None:
+        text = f"{label.price:,} ₽".replace(",", " ")
+        big = QFont("Arial")
+        big.setBold(True)
+        space_h = bottom - code_h - bars_h - inner.top() - top_h
+        size = int(min(space_h * 0.9, 10 * dpmm))
+        while size > 6:
+            big.setPixelSize(size)
+            if QFontMetricsF(big).horizontalAdvance(text) <= inner.width():
+                break
+            size -= 1
+        painter.setFont(big)
+        painter.drawText(QRectF(inner.left(), inner.top() + top_h, inner.width(), space_h), Qt.AlignCenter, text)
+
+    modules, quiet = barcode_modules(label.code)
+    total = len(modules) + 2 * quiet
+    unit = max(int(inner.width() // total), 1)
+    x = inner.left() + (inner.width() - unit * total) / 2 + quiet * unit
+    bars_top = bottom - code_h - bars_h
+    painter.setPen(Qt.NoPen)
+    painter.setBrush(QColor("black"))
+    start = None
+    for i, bit in enumerate(modules + "0"):
+        if bit == "1" and start is None:
+            start = i
+        elif bit == "0" and start is not None:
+            painter.drawRect(QRectF(round(x + start * unit), bars_top, (i - start) * unit, bars_h))
+            start = None
+    painter.setPen(QColor("black"))
+    small = QFont("Arial")
+    small.setPixelSize(max(int(2.3 * dpmm), 6))
+    painter.setFont(small)
+    painter.drawText(QRectF(inner.left(), bottom - code_h, inner.width(), code_h), Qt.AlignCenter, label.code)
+    painter.restore()
+
+
+def render_label_image(label: Label, layout: str = "thermal", dpi: int = 203):
+    """Этикетка картинкой (как напечатает принтер с таким разрешением) — для просмотра и проверки."""
+    from PySide6.QtCore import QRectF, Qt
+    from PySide6.QtGui import QImage, QPainter
+    w_mm, h_mm = LABEL_MM[layout]
+    dpmm = dpi / 25.4
+    image = QImage(round(w_mm * dpmm), round(h_mm * dpmm), QImage.Format_RGB32)
+    image.fill(Qt.white)
+    painter = QPainter(image)
+    paint_label(painter, QRectF(0, 0, image.width(), image.height()), label, dpmm)
+    painter.end()
+    return image
+
+
+def print_labels(labels: list[Label], layout: str = "thermal", printer_name: str = "", pdf_path: str = "") -> int:
+    """Напечатать на принтер (по имени, как в Windows) или в PDF. Возвращает число страниц.
+    Термопринтер — по этикетке 58×40 мм на страницу; A4 — сеткой 3×8."""
+    from PySide6.QtCore import QMarginsF, QRectF, QSizeF
+    from PySide6.QtGui import QPageLayout, QPageSize, QPainter
+    from PySide6.QtPrintSupport import QPrinter
+
+    copies = [label for label in labels for _ in range(max(label.copies, 0))]
+    if not copies:
+        return 0
+    printer = QPrinter(QPrinter.HighResolution)
+    if pdf_path:
+        printer.setOutputFormat(QPrinter.PdfFormat)
+        printer.setOutputFileName(pdf_path)
+    elif printer_name:
+        printer.setPrinterName(printer_name)
+    printer.setFullPage(True)
+    w_mm, h_mm = LABEL_MM[layout]
+    if layout == "thermal":
+        size = QPageSize(QSizeF(w_mm, h_mm), QPageSize.Millimeter, "Этикетка 58×40", QPageSize.ExactMatch)
+        orientation = QPageLayout.Landscape if size.size(QPageSize.Millimeter).width() < w_mm else QPageLayout.Portrait
+        printer.setPageLayout(QPageLayout(size, orientation, QMarginsF(0, 0, 0, 0), QPageLayout.Millimeter))
+    else:
+        printer.setPageLayout(QPageLayout(QPageSize(QPageSize.A4), QPageLayout.Portrait, QMarginsF(0, 0, 0, 0),
+                                          QPageLayout.Millimeter))
+    painter = QPainter()
+    if not painter.begin(printer):
+        raise OSError(f"принтер «{printer_name or 'по умолчанию'}» не отвечает — проверьте, что он включён")
+    dpmm = printer.resolution() / 25.4
+    per_page = 1 if layout == "thermal" else A4_GRID[0] * A4_GRID[1]
+    pages = 0
+    for i, label in enumerate(copies):
+        slot = i % per_page
+        if slot == 0:
+            if i:
+                printer.newPage()
+            pages += 1
+        col, row = slot % A4_GRID[0], slot // A4_GRID[0]
+        x, y = (0, 0) if layout == "thermal" else (col * w_mm, row * h_mm)
+        paint_label(painter, QRectF(x * dpmm, y * dpmm, w_mm * dpmm, h_mm * dpmm), label, dpmm)
+    painter.end()
+    return pages
+
+
+def printers() -> tuple[list[str], str]:
+    """(все принтеры Windows, какой выбрать по умолчанию — похожий на принтер этикеток)."""
+    from PySide6.QtPrintSupport import QPrinterInfo
+    names = QPrinterInfo.availablePrinterNames()
+    label_like = [n for n in names if any(w in n.lower() for w in ("xprinter", "xp-", "label", "этикет", "tsc",
+                                                                     "godex", "zebra", "atol bp", "атол bp"))]
+    default = QPrinterInfo.defaultPrinterName()
+    return names, (label_like[0] if label_like else default if default in names else (names[0] if names else ""))

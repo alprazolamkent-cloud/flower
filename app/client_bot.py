@@ -17,6 +17,7 @@ from .client_flow import PREORDER_DAYS, ClientFlow, Incoming
 from .holidays import DEFAULT_TEXT as DEFAULT_HOLIDAYS
 from .holidays import next_holiday
 from .photos import shrink
+from .stock_settings import scan_required
 
 POLL_EVERY_MS = 30_000  # запасной таймер: если опрос оборвался, запустить заново
 FLUSH_EVERY_MS = 30_000
@@ -222,6 +223,7 @@ class ClientBot(QObject):
 
     def process(self, parsed: list[Parsed], now: datetime):
         flow = ClientFlow(self.db, client_settings()["shop"], self.link_tries, self.staff_state, preorder(now))
+        flow.scan_writeoff = scan_required("writeoff")
         for p in parsed:
             if p.message is None:
                 continue

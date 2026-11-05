@@ -39,6 +39,7 @@ from .shifts import (
     PROBLEM_STATUSES, REMIND_BEFORE_MINUTES, Shift, business_day, opening_business_day, short_name, window,
 )
 from .templates_dialog import load_templates
+from .stock_settings import scan_required
 from .theme import C, primary
 from .update_ui import UpdateController
 from .assembly_dialog import SNOOZE, AssemblyReminder
@@ -1848,6 +1849,10 @@ class MainWindow(QMainWindow):
                                       + (", букет на витрине в боте." if shown else ".")
                                       + ("\n⚠ По программе не хватало: " + "; ".join(short)
                                          + " — проверьте, внесена ли поставка." if short else ""))
+            elif scan_required("writeoff"):  # начали списывать до того, как включили «только сканером»
+                self.client_bot.queue(chat, "🔒 Списание только сканером — спишите в программе, отсканировав "
+                                      "штрихкод товара.")
+                return
             else:
                 _, _, _, what, ident, qty, reason = ev
                 if what == "product":

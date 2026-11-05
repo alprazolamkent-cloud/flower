@@ -1,0 +1,175 @@
+"""Печать этикеток прямо на принтер и режим «только сканером» (продажа, поставка, инвентаризация, списание)."""
+
+from datetime import datetime
+
+import pytest
+from PySide6.QtCore import QSettings
+from PySide6.QtGui import QDesktopServices
+from PySide6.QtWidgets import QDialogButtonBox, QMessageBox, QWidget
+
+from app import stock_window
+from app.client_flow import ClientFlow, Incoming
+from app.db import Database
+from app.labels import Label, print_labels, render_label_image
+from app.stock import Product, Recipe
+
+NOW = datetime(2026, 11, 5, 12, 0)
+
+
+@pytest.fixture
+def db():
+    database = Database(":memory:")
+    yield database
+    database.close()
+
+
+@pytest.fixture
+def store(monkeypatch):
+    values = {}
+    monkeypatch.setattr(QSettings, "value", lambda self, key, default=None: values.get(key, default))
+    monkeypatch.setattr(QSettings, "setValue", lambda self, key, value: values.__setitem__(key, value))
+    return values
+
+
+class FakeMain(QWidget):
+    def __init__(self, db, user):
+        super().__init__()
+        self.db, self.user, self.shift, self.log = db, user, None, []
+
+    def audit(self, action, details=""):
+        self.log.append((action, details))
+
+    def sale_shift_id(self):
+        return None
+
+
+def test_print_to_pdf_and_image(tmp_path):
+    pdf = tmp_path / "labels.pdf"
+    pages = print_labels([Label("н15", "2000000000015", 150, 2), Label("Шар", "AB-12", None, 1)],
+                         "thermal", pdf_path=str(pdf))
+    assert pages == 3 and pdf.read_bytes().startswith(b"%PDF")
+    assert print_labels([Label("x", "2000000000015", 100, 30)], "a4", pdf_path=str(tmp_path / "a4.pdf")) == 2
+    image = render_label_image(Label("н15", "2000000000015", 150), "thermal", 203)
+    assert (image.width(), image.height()) == (round(58 * 203 / 25.4), round(40 * 203 / 25.4))
+
+
+def test_labels_dialog_prints_to_chosen_printer(db, store, monkeypatch):
+    rose = db.save_product(Product(0, "Кения", "Цветы", price=250))
+    printed, opened = [], []
+    monkeypatch.setattr(stock_window, "printers", lambda: (["Microsoft Print to PDF", "Xprinter XP-365B"],
+                                                           "Xprinter XP-365B"))
+    monkeypatch.setattr(stock_window, "print_labels", lambda labels, layout, name: printed.append((labels, layout, name)))
+    monkeypatch.setattr(QDesktopServices, "openUrl", lambda url: opened.append(url))
+    dialog = stock_window.LabelsDialog(None, db, "product", rose)
+    assert dialog.printer.currentData() == "Xprinter XP-365B"  # принтер этикеток выбран сам
+    dialog.copies[0].setValue(3)
+    dialog._print()
+    labels, layout, name = printed[0]
+    assert name == "Xprinter XP-365B" and layout == "thermal" and labels[0].copies == 3 and not opened
+    assert store["label_printer"] == "Xprinter XP-365B" and db.get_product(rose).barcode.startswith("200")
+
+    def broken(*args):
+        raise OSError("принтер не отвечает")
+    monkeypatch.setattr(stock_window, "print_labels", broken)
+    monkeypatch.setattr(stock_window, "_confirm", lambda *args: True)
+    again = stock_window.LabelsDialog(None, db, "product", rose)
+    again._print()  # не напечаталось — предложили браузер
+    assert opened
+
+    store["label_printer"] = "Microsoft Print to PDF"  # выбор запомнился
+    assert stock_window.LabelsDialog(None, db).printer.currentData() == "Microsoft Print to PDF"
+
+
+def test_labels_filter_without_barcode(db, store, monkeypatch):
+    monkeypatch.setattr(stock_window, "printers", lambda: ([], ""))
+    db.save_product(Product(0, "Кения", "Цветы", price=250, barcode="4600000000015"))
+    db.save_product(Product(0, "Пион", "Цветы", price=300))
+    dialog = stock_window.LabelsDialog(None, db)
+    dialog.only_new.setChecked(True)
+    dialog._mark_shown()
+    marked = [dialog.items[i][2] for i, c in enumerate(dialog.checks) if c.isChecked()]
+    assert marked == ["Пион"] and dialog.printer.currentData() == ""
+
+
+def test_sale_only_by_scanner(db, store, monkeypatch):
+    store["scan_sale"] = "true"
+    seller = db.add_user("anna", "Анна", "1")
+    rose = db.save_product(Product(0, "Кения", "Цветы", price=250, barcode="4600000000015"))
+    db.add_supply("База", [(rose, 20, 80)], None, NOW)
+    w = stock_window.StockWindow(FakeMain(db, seller))
+    assert w.scan_only and w.scan_note.isVisibleTo(w)
+    w.grid.tiles[0].on_add(*w.grid.tiles[0].key)  # нажали плитку — не добавилось
+    w.search_edit.setText("кен")
+    w._refresh_catalog()
+    w._add_selected()  # Enter по названию — тоже нет
+    assert not w.rows and "без штрихкода" in w.scan_note.text()
+    w.search_edit.setText("4600000000015")
+    w._add_selected()
+    assert [r.key for r in w.rows] == [("Кения", None, rose)]
+    w.rows[0].qty.setValue(3)  # количество после скана поправить можно
+    shown = []
+    monkeypatch.setattr(QMessageBox, "information", lambda *args: shown.append(args[2]))
+    w._add_free()
+    assert "только у администратора" in shown[0] and len(w.rows) == 1
+    w.deleteLater()
+
+
+def test_supply_only_by_scanner(db, store):
+    rose = db.save_product(Product(0, "Кения", "Цветы", price=250, barcode="4600000000015"))
+    editor = stock_window.LinesEditor(db.products(), with_cost=True, scan_only=True)
+    editor.pick.setEditText("кения")
+    editor._add_picked()
+    assert editor.lines() == [] and "не добавляется" in editor.scan_note.text()
+    editor.pick.setEditText("4600000000015")
+    editor._add_picked()
+    editor.pick.setEditText("4600000000015")
+    editor._add_picked()
+    assert editor.lines() == [(rose, 2, 0)]
+    store["scan_supply"] = "true"
+    dialog = stock_window.SupplyDialog(None, db, None, admin=True)
+    assert dialog.lines.scan_only
+
+
+def test_inventory_only_by_scanner(db):
+    rose = db.save_product(Product(0, "Кения", "Цветы", price=250, barcode="4600000000015"))
+    db.save_product(Product(0, "Пион", "Цветы", price=300))
+    db.add_supply("База", [(rose, 20, 80)], None, NOW)
+    dialog = stock_window.InventoryDialog(None, db.products(), scan_only=True)
+    assert not any(box.isEnabled() for box in dialog.boxes)
+    dialog.scan_edit.setText("4600000000015")
+    dialog._scanned()
+    dialog.scan_edit.setText("4600000000015")
+    dialog._scanned()
+    assert dialog.actual() == {rose: 2}
+    dialog.scan_edit.setText("123456789")
+    dialog._scanned()
+    assert "нет ни у одного" in dialog.scan_note.text() and dialog.actual() == {rose: 2}
+
+
+def test_writeoff_needs_matching_scan(db, store):
+    store["scan_writeoff"] = "true"
+    rose = db.save_product(Product(0, "Кения", "Цветы", price=250, barcode="4600000000015"))
+    dialog = stock_window.WriteOffDialog(None, db.get_product(rose))
+    ok = dialog.findChild(QDialogButtonBox).button(QDialogButtonBox.Ok)
+    assert not ok.isEnabled()
+    dialog.gate.edit.setText("2000000000015")
+    dialog.gate._check()
+    assert not ok.isEnabled() and "не тот" in dialog.gate.status.text()
+    dialog.gate.edit.setText("4600000000015")
+    dialog.gate._check()
+    assert ok.isEnabled()
+    bare = stock_window.WriteOffDialog(None, Product(0, "Без кода", "Цветы"))
+    assert not bare.findChild(QDialogButtonBox).button(QDialogButtonBox.Ok).isEnabled()
+    assert "нет штрихкода" in bare.gate.status.text()
+    recipe = db.save_recipe(Recipe(0, "Классика", 3500, items=[(rose, 9)]))
+    assert stock_window.ReadyWriteOffDialog(None, db.get_recipe(recipe)).gate is not None
+    store["scan_writeoff"] = "false"
+    assert stock_window.WriteOffDialog(None, db.get_product(rose)).gate is None
+
+
+def test_phone_writeoff_refused_when_scan_only(db):
+    db.link_work_phone(db.work_phone_code(), "555", NOW)
+    flow = ClientFlow(db, "Страна Чудес")
+    flow.scan_writeoff = True
+    res = flow.handle(Incoming("555", "", name="Иван", callback="kw:"), NOW)
+    assert "только сканером" in res.replies[0].text and "555" not in flow.staff_state

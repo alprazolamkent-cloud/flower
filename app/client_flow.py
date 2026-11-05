@@ -204,6 +204,7 @@ class ClientFlow:
         self.today = date.today()
         self.link_tries = link_tries if link_tries is not None else {}  # чат → неверных кодов
         self.staff_state = staff_state if staff_state is not None else {}  # чат флориста → шаг «новый букет»
+        self.scan_writeoff = False  # в программе «Списание только сканером» — с телефона списывать нельзя
 
     def handle(self, msg: Incoming, now: datetime) -> Result:
         res = Result()
@@ -503,6 +504,10 @@ class ClientFlow:
             low = [p for p in self.db.products() if p.low]
             res.say("Заканчивается:\n" + "\n".join(f"• {p.name} — {qty_text(p.stock)} {p.unit}" for p in low[:30])
                     if low else "Всего хватает 🌷", STAFF_MENU)
+            return True
+        if kind == "kw" and self.scan_writeoff:
+            res.say("🔒 Списание только сканером — спишите в программе на компьютере: отсканируйте штрихкод "
+                    "товара («📦 Остатки» → «🗑 Списать»).", STAFF_MENU)
             return True
         if kind in ("kw", "kf"):
             self.staff_state[chat] = {"step": "writeoff_find" if kind == "kw" else "stock_find"}

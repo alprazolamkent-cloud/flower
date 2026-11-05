@@ -23,7 +23,8 @@ from .flow_layout import FlowLayout, flow_policy
 from .icon import flower_icon
 from .photos import pick_photo, pixmap
 from .shifts import WRITEOFF_REASONS
-from .labels import LAYOUTS, Label, labels_html
+from .labels import LAYOUTS, Label, barcode_modules, labels_html, print_labels, printers
+from .stock_settings import SCAN_ONLY, label_printer, scan_required, set_label_printer
 from .stock import (
     CATEGORIES, PAYMENTS, CartLine, Product, Recipe, day_range, ean13_check, qty_text, reorder_text, short_label,
     split_codes,
@@ -592,9 +593,9 @@ class ProductDialog(QDialog):
 class LinesEditor(QWidget):
     """Таблица «товар — сколько [— цена]» для поставки и техкарты."""
 
-    def __init__(self, products: list[Product], with_cost: bool, on_unknown=None):
+    def __init__(self, products: list[Product], with_cost: bool, on_unknown=None, scan_only: bool = False):
         super().__init__()
-        self.products, self.with_cost = products, with_cost
+        self.products, self.with_cost, self.scan_only = products, with_cost, scan_only
         self.on_unknown = on_unknown  # отсканировали код, которого нет ни у одного товара
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -605,13 +606,24 @@ class LinesEditor(QWidget):
         for p in products:
             self.pick.addItem(f"{p.name} · {p.category}", p.id)
         self.pick.setCurrentIndex(-1)
-        self.pick.lineEdit().setPlaceholderText("Начните писать название…")
+        self.pick.lineEdit().setPlaceholderText("🔒 Сканируйте штрихкод товара…" if scan_only
+                                                else "Начните писать название…")
+        if scan_only:  # выпадающий список и подсказки по названию не нужны — только код
+            self.pick.setCompleter(None)
+            self.pick.view().setEnabled(False)
         add.addWidget(self.pick, 1)
         add_btn = QPushButton("＋ Добавить")
         add_btn.clicked.connect(self._add_picked)
+        add_btn.setVisible(not scan_only)
         self.pick.lineEdit().returnPressed.connect(self._add_picked)
         add.addWidget(add_btn)
         layout.addLayout(add)
+        self.scan_note = QLabel()
+        self.scan_note.setWordWrap(True)
+        self.scan_note.setVisible(scan_only)
+        self.scan_note.setText(f"<b style='color:{C.pink}'>🔒 Только сканером</b> — товар добавляется по штрихкоду, "
+                               "количество потом можно поправить.")
+        layout.addWidget(self.scan_note)
         headers = ["Товар", "Сколько"] + (["Цена закупки, ₽ за ед.", "Сумма"] if with_cost else []) + [""]
         self.table = _table(headers)
         layout.addWidget(self.table, 1)
@@ -623,6 +635,9 @@ class LinesEditor(QWidget):
         return next((p for p in self.products if p.id == pid), None)
 
     def _add_picked(self):
+        if self.scan_only:
+            self._add_scanned()
+            return
         pid = self.pick.currentData()
         if pid is None:
             text = self.pick.currentText().strip().lower()
@@ -639,6 +654,20 @@ class LinesEditor(QWidget):
             self.add(pid, 1, self._product(pid).avg_cost)
             self.pick.setCurrentIndex(-1)
             self.pick.clearEditText()
+
+    def _add_scanned(self):
+        code = "".join(self.pick.currentText().split())
+        self.pick.setCurrentIndex(-1)
+        self.pick.clearEditText()
+        pid = next((p.id for p in self.products if code and code in split_codes(p.barcode)), None)
+        if pid is not None:
+            self.add(pid, 1, self._product(pid).avg_cost)
+            self.scan_note.setText(f"<b style='color:{C.green}'>✓ {html.escape(self._product(pid).name)}</b>")
+        elif code.isdigit() and len(code) >= 6 and self.on_unknown:
+            self.on_unknown(code)
+        elif code:
+            self.scan_note.setText(f"<b style='color:{C.red}'>{SCAN_ONLY}</b> — «{html.escape(code)}» не штрихкод "
+                                   "товара, по названию не добавляется.")
 
     def add_product(self, p: Product):
         """Новый товар (завели прямо отсюда) — в список выбора и сразу строкой."""
@@ -735,15 +764,19 @@ class SupplyDialog(QDialog):
         self.note_edit.setPlaceholderText("Номер накладной, что не довезли…")
         form.addRow("Заметка:", self.note_edit)
         layout.addLayout(form)
-        self.lines = LinesEditor(db.products(), with_cost=True, on_unknown=self._unknown_code)
+        self.scan_only = scan_required("supply")
+        self.lines = LinesEditor(db.products(), with_cost=True, on_unknown=self._unknown_code,
+                                 scan_only=self.scan_only)
         layout.addWidget(self.lines, 1)
         row = QHBoxLayout()
-        row.addWidget(_gray("Печатайте название и Enter или сканируйте заводской штрихкод. Цена закупки — за одну "
-                            "штуку / ветку (подставлена прошлая); себестоимость пересчитается сама."), 1)
+        row.addWidget(_gray(("Сканируйте штрихкод каждого товара" if self.scan_only else
+                             "Печатайте название и Enter или сканируйте заводской штрихкод")
+                            + ". Цена закупки — за одну штуку / ветку (подставлена прошлая); себестоимость "
+                            "пересчитается сама."), 1)
         new_btn = QPushButton("➕ Новый товар")
         new_btn.setToolTip("Приехал товар, которого ещё нет в программе — завести и сразу добавить в поставку")
         new_btn.clicked.connect(lambda: self._new_product(""))
-        new_btn.setVisible(admin)
+        new_btn.setVisible(admin and not self.scan_only)  # только сканером — новый товар заводится по его коду
         row.addWidget(new_btn)
         layout.addLayout(row)
         if not admin:
@@ -844,19 +877,71 @@ class RecipeDialog(QDialog):
         super().accept()
 
 
+class ScanEdit(QLineEdit):
+    """Поле для сканера: Enter после кода не нажимает кнопку окна (не спишет и не запишет случайно)."""
+
+    def keyPressEvent(self, event):  # noqa: N802 — имя из Qt
+        super().keyPressEvent(event)
+        if event.key() in (Qt.Key_Return, Qt.Key_Enter):
+            event.accept()
+
+
+class ScanGate(QWidget):
+    """«Только сканером»: кнопка действия включится, когда отсканируют штрихкод именно этого товара или букета."""
+
+    def __init__(self, codes: str, button: QPushButton):
+        super().__init__()
+        self.codes, self.button, self.ok = split_codes(codes), button, False
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self.edit = ScanEdit()
+        self.edit.setPlaceholderText("🔒 Отсканируйте штрихкод с товара")
+        self.edit.setMinimumWidth(280)
+        self.edit.returnPressed.connect(self._check)
+        layout.addWidget(self.edit)
+        self.status = QLabel()
+        self.status.setWordWrap(True)
+        layout.addWidget(self.status)
+        if self.codes:
+            self.status.setText(f"<span style='color:{C.pink}'>Без штрихкода не пробивается.</span>")
+        else:
+            self.status.setText(f"<span style='color:{C.red}'>У него нет штрихкода — напечатайте этикетку "
+                                "(«🏷 Этикетки»), наклейте и отсканируйте.</span>")
+        button.setEnabled(False)
+        QTimer.singleShot(0, self.edit.setFocus)
+
+    def _check(self):
+        code = "".join(self.edit.text().split())
+        self.edit.clear()
+        self.ok = bool(code) and code in self.codes
+        self.button.setEnabled(self.ok)
+        self.status.setText(f"<b style='color:{C.green}'>✓ Штрихкод совпал</b>" if self.ok else
+                            f"<b style='color:{C.red}'>✕ Это не тот штрихкод ({html.escape(code)})</b>")
+
+
+def _scan_gate(form: QFormLayout, buttons: QDialogButtonBox, codes: str) -> ScanGate | None:
+    if not scan_required("writeoff"):
+        return None
+    gate = ScanGate(codes, buttons.button(QDialogButtonBox.Ok))
+    form.insertRow(form.rowCount() - 1, "Штрихкод:", gate)
+    return gate
+
+
 class WriteOffDialog(QDialog):
     def __init__(self, parent, product: Product):
         super().__init__(parent)
         self.setWindowTitle("Списание")
         form = QFormLayout(self)
-        form.addRow(QLabel(f"<b>{product.name}</b> · на складе {qty_text(product.stock)} {product.unit}"))
+        form.addRow(QLabel(f"<b>{html.escape(product.name)}</b> · на складе {qty_text(product.stock)} {product.unit}"))
         self.qty_box = qty_box(product.unit)
         form.addRow("Сколько списать:", self.qty_box)
         self.reason_box = QComboBox()
         self.reason_box.addItems(WRITEOFF_REASONS)
         form.addRow("Причина:", self.reason_box)
         form.addRow(_gray("Сумма по себестоимости сама попадёт в «Списано» при сдаче смены."))
-        form.addRow(_buttons(self, "Списать"))
+        buttons = _buttons(self, "Списать")
+        form.addRow(buttons)
+        self.gate = _scan_gate(form, buttons, product.barcode)
 
 
 class AssembleDialog(QDialog):
@@ -923,7 +1008,9 @@ class ReadyWriteOffDialog(QDialog):
         form.addRow("Причина:", self.reason_box)
         form.addRow(_gray("Списывается весь букет по себестоимости сборки — сумма попадёт в сдачу смены. "
                           "Часть цветов ещё живая? Тогда лучше «🔧 Разобрать»."))
-        form.addRow(_buttons(self, "Списать"))
+        buttons = _buttons(self, "Списать")
+        form.addRow(buttons)
+        self.gate = _scan_gate(form, buttons, recipe.barcode)
 
 
 class DisassembleDialog(QDialog):
@@ -981,7 +1068,12 @@ class DisassembleDialog(QDialog):
         self.rebuild.setEnabled(self.target_box.count() > 0)
         layout.addWidget(_gray("Пересобрать: целое из разобранного пойдёт в новый букет, чего не хватит — "
                                "возьмётся со склада, лишнее останется на складе."))
-        layout.addWidget(_buttons(self, "🔧 Разобрал"))
+        buttons = _buttons(self, "🔧 Разобрал")
+        self.gate = None
+        if scan_required("writeoff"):  # разбор со списанием — тоже только по штрихкоду букета
+            self.gate = ScanGate(recipe.barcode, buttons.button(QDialogButtonBox.Ok))
+            layout.addWidget(self.gate)
+        layout.addWidget(buttons)
         self.qty_box.valueChanged.connect(self._show)
         self._show()
 
@@ -1023,6 +1115,13 @@ class LabelsDialog(QDialog):
         self.only_marked = QCheckBox("Только отмеченные")
         self.only_marked.toggled.connect(self._filter)
         top.addWidget(self.only_marked)
+        self.only_new = QCheckBox("Только без штрихкода")
+        self.only_new.toggled.connect(self._filter)
+        top.addWidget(self.only_new)
+        mark_all = QPushButton("☑ Отметить показанные")
+        mark_all.setProperty("small", True)
+        mark_all.clicked.connect(self._mark_shown)
+        top.addWidget(mark_all)
         layout.addLayout(top)
         self.items = [("recipe", r.id, "💐 " + r.title, r.price, r.barcode, r.label_text or short_label(r.title))
                       for r in db.recipes()]
@@ -1068,11 +1167,29 @@ class LabelsDialog(QDialog):
         self.summary = QLabel()
         options.addWidget(self.summary)
         layout.addLayout(options)
+        printer_row = QHBoxLayout()
+        printer_row.addWidget(QLabel("Принтер:"))
+        self.printer = QComboBox()
+        names, guess = printers()
+        saved = label_printer()
+        for name in names:
+            self.printer.addItem(name, name)
+        if not names:
+            self.printer.addItem("— принтеров нет (установите драйвер Xprinter)", "")
+        self.printer.setCurrentIndex(max(self.printer.findData(saved if saved in names else guess), 0))
+        printer_row.addWidget(self.printer, 1)
+        layout.addLayout(printer_row)
+        layout.addWidget(_gray("Xprinter: установите его драйвер для Windows, в свойствах принтера задайте бумагу "
+                               "58×40 мм — и выберите его здесь. Печать сразу, без браузера."))
         row = QHBoxLayout()
+        self.browser_btn = QPushButton("🌐 В браузере")
+        self.browser_btn.setToolTip("Открыть этикетки страницей в браузере и напечатать оттуда (Ctrl+P)")
+        self.browser_btn.clicked.connect(lambda: self._print(browser=True))
+        row.addWidget(self.browser_btn)
         row.addStretch(1)
         self.print_btn = QPushButton("🖨 Напечатать")
         primary(self.print_btn)
-        self.print_btn.clicked.connect(self._print)
+        self.print_btn.clicked.connect(lambda: self._print())
         row.addWidget(self.print_btn)
         close = QPushButton("Закрыть")
         close.clicked.connect(self.reject)
@@ -1088,14 +1205,21 @@ class LabelsDialog(QDialog):
         for i, (_, _, title, _, codes, _) in enumerate(self.items):
             hidden = (bool(query) and query not in title.casefold() and query not in codes
                       and query not in self.tops[i].text().casefold()) or \
-                (self.only_marked.isChecked() and not self.checks[i].isChecked())
+                (self.only_marked.isChecked() and not self.checks[i].isChecked()) or \
+                (self.only_new.isChecked() and bool(codes))
             self.table.setRowHidden(i, hidden)
+
+    def _mark_shown(self):
+        for i, check in enumerate(self.checks):
+            if not self.table.isRowHidden(i):
+                check.setChecked(True)
 
     def _update(self):
         marked = [i for i, c in enumerate(self.checks) if c.isChecked()]
         total = sum(self.copies[i].value() for i in marked)
         self.summary.setText(f"Отмечено: <b>{len(marked)}</b>, этикеток: <b>{total}</b>" if marked else "")
         self.print_btn.setEnabled(bool(marked))
+        self.browser_btn.setEnabled(bool(marked))
 
     def labels(self) -> list[Label]:
         """Отмеченное — в этикетки; у кого нет штрихкода, создаётся свой."""
@@ -1113,15 +1237,32 @@ class LabelsDialog(QDialog):
             result.append(Label(text, code, price if self.with_price.isChecked() else None, self.copies[i].value()))
         return result
 
-    def _print(self):
+    def _print(self, browser: bool = False):
+        layout = self.layout_box.currentData()
         try:
-            page = labels_html(self.labels(), self.layout_box.currentData())
+            labels = self.labels()
+            for label in labels:  # штрихкод рисуется? (латиница и цифры)
+                barcode_modules(label.code)
         except ValueError as e:
             QMessageBox.warning(self, "Этикетки", f"Не получилось нарисовать штрихкод: {e}.")
             return
+        name = self.printer.currentData()
+        if not browser and name:
+            set_label_printer(name)
+            try:
+                print_labels(labels, layout, name)
+                self.accept()
+                return
+            except OSError as e:
+                if not _confirm(self, "Этикетки", f"Не получилось напечатать: {e}.\n\nОткрыть этикетки в браузере "
+                                "и напечатать оттуда?"):
+                    return
+        elif not browser and not _confirm(self, "Этикетки", "Принтер не найден — установите драйвер Xprinter. "
+                                          "Пока открыть этикетки в браузере?"):
+            return
         path = os.path.join(tempfile.gettempdir(), "AloFlorist-etiketki.html")
         with open(path, "w", encoding="utf-8") as f:
-            f.write(page)
+            f.write(labels_html(labels, layout))
         QDesktopServices.openUrl(QUrl.fromLocalFile(path))
         self.accept()
 
@@ -1184,9 +1325,9 @@ class ReorderDialog(QDialog):
 class InventoryDialog(QDialog):
     """Инвентаризация списком: «по программе» и «на самом деле» для всех товаров, недостача в рублях."""
 
-    def __init__(self, parent, products: list):
+    def __init__(self, parent, products: list, scan_only: bool = False):
         super().__init__(parent)
-        self.products = products
+        self.products, self.scan_only = products, scan_only
         self.setWindowTitle("Инвентаризация списком")
         fit_to_screen(self, 820, 640)
         layout = QVBoxLayout(self)
@@ -1200,7 +1341,19 @@ class InventoryDialog(QDialog):
         top.addWidget(self.category)
         top.addStretch(1)
         layout.addLayout(top)
-        layout.addWidget(_gray("Впишите, сколько на самом деле. Не пересчитывали — оставьте пусто: этот товар не тронется."))
+        if scan_only:
+            self.scan_edit = ScanEdit()
+            self.scan_edit.setPlaceholderText("🔒 Сканируйте штрихкод: каждый скан — +1, количество можно поправить")
+            self.scan_edit.returnPressed.connect(self._scanned)
+            layout.addWidget(self.scan_edit)
+            self.scan_note = QLabel(f"<b style='color:{C.pink}'>🔒 Инвентаризация только сканером</b> — "
+                                    "без штрихкода товар не пересчитывается.")
+            self.scan_note.setWordWrap(True)
+            layout.addWidget(self.scan_note)
+            QTimer.singleShot(0, self.scan_edit.setFocus)
+        else:
+            layout.addWidget(_gray("Впишите, сколько на самом деле. Не пересчитывали — оставьте пусто: "
+                                   "этот товар не тронется."))
         self.table = _table(["Товар", "Раздел", "По программе", "На самом деле", "Разница"])
         self.table.setRowCount(len(products))
         self.boxes = []
@@ -1215,6 +1368,9 @@ class InventoryDialog(QDialog):
             box.setValue(-1)
             box.setSuffix(f" {p.unit}")
             box.valueChanged.connect(self._update)
+            if scan_only:  # поле откроется после скана
+                box.setEnabled(False)
+                box.setSpecialValueText("— сканируйте" if p.barcode else "— нет штрихкода")
             self.table.setCellWidget(i, 3, box)
             self.table.setItem(i, 4, _item("", align_right=True))
             self.boxes.append(box)
@@ -1223,6 +1379,25 @@ class InventoryDialog(QDialog):
         layout.addWidget(self.total)
         layout.addWidget(_buttons(self, "Записать пересчёт"))
         self._update()
+
+    def _scanned(self):
+        code = "".join(self.scan_edit.text().split())
+        self.scan_edit.clear()
+        i = next((i for i, p in enumerate(self.products) if code and code in split_codes(p.barcode)), None)
+        if i is None:
+            if code:
+                self.scan_note.setText(f"<b style='color:{C.red}'>✕ Штрихкода {html.escape(code)} нет ни у одного "
+                                       "товара.</b>")
+            return
+        p, box = self.products[i], self.boxes[i]
+        box.setEnabled(True)
+        box.setValue(1 if box.value() < 0 else box.value() + 1)
+        self.table.setRowHidden(i, False)
+        self.table.selectRow(i)
+        self.table.scrollToItem(self.table.item(i, 0))
+        self.scan_note.setText(f"<b style='color:{C.green}'>✓ {html.escape(p.name)}: {qty_text(box.value())} "
+                               f"{p.unit}</b>")
+        self.scan_edit.setFocus()
 
     def _filter(self):
         category = self.category.currentData()
@@ -1344,6 +1519,7 @@ class StockWindow(QDialog):
         page = self.tabs.currentIndex()
         if page == 0:
             self._photos.clear()  # фото могли поменять в «Остатках» / «Техкартах»
+            self._update_scan_mode()
             self._refresh_chips()
             self._refresh_catalog()
             self._refresh_today()
@@ -1363,6 +1539,7 @@ class StockWindow(QDialog):
         layout = QHBoxLayout(page)
         left = QVBoxLayout()
         top = QHBoxLayout()
+        self.scan_only = False
         self.search_edit = QLineEdit()
         self.search_edit.setPlaceholderText("🔍 Печатайте название (F2), Enter — в корзину; оплата F5 / F6 / F7")
         self.search_edit.setClearButtonEnabled(True)
@@ -1376,13 +1553,17 @@ class StockWindow(QDialog):
         free_btn.clicked.connect(self._add_free)
         top.addWidget(free_btn)
         left.addLayout(top)
+        self.scan_note = QLabel()
+        self.scan_note.setWordWrap(True)
+        self.scan_note.hide()
+        left.addWidget(self.scan_note)
         chips_box = flow_policy(QWidget())  # разделы переносятся на новую строку, а не растягивают окно
         self.chips_row = FlowLayout(chips_box)
         self.chips = QButtonGroup(self)
         self.chips.setExclusive(True)
         self.chips.buttonClicked.connect(lambda _: self._refresh_catalog())
         left.addWidget(chips_box)
-        self.grid = TileGrid(self._add_tile, self._photo)
+        self.grid = TileGrid(self._tile_clicked, self._photo)
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
@@ -1543,6 +1724,9 @@ class StockWindow(QDialog):
         if code.isdigit() and len(code) >= 6:  # цифры, но такого кода нет
             self._unknown_barcode(code)
             return
+        if self.scan_only:  # по названию в корзину нельзя — только штрихкодом
+            self._scan_refused()
+            return
         if self._search_timer.isActive():  # нажали Enter, не дождавшись поиска
             self._search_timer.stop()
             self._refresh_catalog()
@@ -1567,6 +1751,27 @@ class StockWindow(QDialog):
             self._refresh_catalog()
             self._add_line(CartLine(p.name, 1, p.price, product_id=p.id), unit=p.unit)
 
+    def _update_scan_mode(self):
+        """Включили «Продажа только сканером» в настройках — плитки и поиск только показывают товар."""
+        self.scan_only = scan_required("sale")
+        self.scan_note.setVisible(self.scan_only)
+        self.scan_note.setText(f"<b style='color:{C.pink}'>🔒 Продажа только сканером</b> — нажатие на плитку "
+                               "не добавляет товар, сканируйте штрихкод. Количество в корзине поправить можно.")
+        self.search_edit.setPlaceholderText(
+            "🔍 Сканируйте штрихкод (F2) — товар в корзину; поиск по названию только показывает; оплата F5 / F6 / F7"
+            if self.scan_only else "🔍 Печатайте название (F2), Enter — в корзину; оплата F5 / F6 / F7")
+
+    def _scan_refused(self):
+        self.scan_note.setText(f"<b style='color:{C.red}'>{SCAN_ONLY}</b> — без штрихкода товар не пробивается.")
+        self.search_edit.selectAll()
+        self.search_edit.setFocus()
+
+    def _tile_clicked(self, kind: str, ident: int):
+        if self.scan_only:
+            self._scan_refused()
+            return
+        self._add_tile(kind, ident)
+
     def _add_tile(self, kind: str, ident: int):
         if kind == "recipe":
             r = self.db.get_recipe(ident)
@@ -1576,6 +1781,10 @@ class StockWindow(QDialog):
             self._add_line(CartLine(p.name, 1, p.price, product_id=p.id), unit=p.unit)
 
     def _add_free(self):
+        if self.scan_only and not self.admin:
+            QMessageBox.information(self, "Своя позиция", "Включена продажа только сканером — «Своя позиция» "
+                                    "только у администратора.")
+            return
         title, ok = QInputDialog.getText(self, "Своя позиция", "Что продали:")
         if not ok or not title.strip():
             return
@@ -1849,6 +2058,9 @@ class StockWindow(QDialog):
         self._refresh_stock()
 
     def _count(self):
+        if scan_required("inventory"):  # пересчёт только сканером — в окне инвентаризации
+            self._inventory()
+            return
         p = self._selected_product()
         if p is None:
             return
@@ -1930,7 +2142,7 @@ class StockWindow(QDialog):
         ReorderDialog(self, self.db.reorder(datetime.now())).exec()
 
     def _inventory(self):
-        dialog = InventoryDialog(self, self.db.products())
+        dialog = InventoryDialog(self, self.db.products(), scan_only=scan_required("inventory"))
         if dialog.exec() != QDialog.Accepted:
             return
         actual = dialog.actual()

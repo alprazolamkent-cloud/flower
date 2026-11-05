@@ -28,6 +28,7 @@ from .reports import parse_time
 from .salary_dialog import EmployeeTiersDialog, HolidaysDialog, PenaltyCatalogEditor, TiersEditor
 from .shifts import DEFAULT_CHANGE, DEFAULT_GRACE_MINUTES, WaterSchedule
 from .templates_dialog import TemplatesDialog
+from .stock_settings import SCAN_ACTIONS, scan_required, set_scan_required
 from .theme import C, fit_to_screen, primary_ok, scrollable
 
 DEFAULT_LEAD_MINUTES = 20
@@ -45,6 +46,8 @@ def assembly_minutes() -> int:
 def assembly_alert_minutes() -> int:
     """За сколько минут до доставки сообщить администраторам, что букет всё ещё не собран (0 — не сообщать)."""
     return int(_settings().value("assembly_alert_minutes", 30))
+
+
 
 
 def backup_to_telegram() -> bool:
@@ -268,6 +271,7 @@ class SettingsDialog(QDialog):
         self.tabs.addTab(self._clients_tab(), "Клиенты")
         self.tabs.addTab(self._reports_tab(), "Отчёты")
         self.tabs.addTab(self._backup_tab(), "Копии")
+        self.tabs.addTab(self._stock_tab(), "Склад")
         self.tabs.addTab(self._program_tab(), "Программа")
         for i in range(self.tabs.count()):  # каждая вкладка — в прокрутке: на маленьком экране низ не пропадает
             title, page = self.tabs.tabText(i), self.tabs.widget(i)
@@ -825,6 +829,35 @@ class SettingsDialog(QDialog):
                                 + (f" — ссылка для клиентов: <a href='{link}'>{link}</a>" if link else "")
                                 + ". Не забудьте «Сохранить».")
 
+    def _stock_tab(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        box = QGroupBox("Только сканером")
+        form = QVBoxLayout(box)
+        hint = _gray_label("Включено — товар попадает в действие только по отсканированному штрихкоду: щелчок по "
+                             "плитке, поиск по названию и ручной выбор не добавляют. Количество после скана можно "
+                             "поправить (100 роз — один скан и «100»). В инвентаризации поле «на самом деле» "
+                             "открывается только после скана товара. Списание с телефона флориста при этом "
+                             "отключается — только сканером на компьютере.")
+        hint.setWordWrap(True)
+        form.addWidget(hint)
+        self.scan_checks = {}
+        for action, title in SCAN_ACTIONS.items():
+            check = QCheckBox(title)
+            check.setChecked(scan_required(action))
+            form.addWidget(check)
+            self.scan_checks[action] = check
+        without = [p.name for p in self.main.db.products() if not p.barcode]
+        note = QLabel(f"⚠ Без штрихкода товаров: <b>{len(without)}</b> — их нельзя будет провести в этих действиях. "
+                      "Напечатайте им этикетки: «📦 Склад» → «Остатки» → «🏷 Этикетки» → «Только без штрихкода»."
+                      if without else "✓ У всех товаров есть штрихкод.")
+        note.setWordWrap(True)
+        note.setStyleSheet(f"color: {C.orange if without else C.green}")
+        form.addWidget(note)
+        layout.addWidget(box)
+        layout.addStretch(1)
+        return page
+
     def _backup_tab(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
@@ -992,6 +1025,8 @@ class SettingsDialog(QDialog):
             ("требовать собрать за (мин)", assembly_minutes(), self.assembly_box.value(), False),
             ("сообщить, если не собран за (мин)", assembly_alert_minutes(), self.assembly_alert_box.value(), False),
             ("копия в Telegram", backup_to_telegram(), self.tg_backup_check.isChecked(), False),
+            *((f"только сканером: {title.lower()}", scan_required(action), self.scan_checks[action].isChecked(), False)
+              for action, title in SCAN_ACTIONS.items()),
             ("напоминание накануне праздника", holiday_eve_time().strftime("%H:%M") if holiday_eve_time() else "выкл",
              self.eve_edit.time().toString("HH:mm") if self.eve_check.isChecked() else "выкл", False),
             ("пересменка", shift_change().strftime("%H:%M"), self.change_edit.time().toString("HH:mm"), False),
@@ -1072,6 +1107,8 @@ class SettingsDialog(QDialog):
         settings.setValue("assembly_minutes", self.assembly_box.value())
         settings.setValue("assembly_alert_minutes", self.assembly_alert_box.value())
         settings.setValue("backup_to_telegram", _bool(self.tg_backup_check.isChecked()))
+        for action, check in self.scan_checks.items():
+            set_scan_required(action, check.isChecked())
         settings.setValue("holiday_eve_time", self.eve_edit.time().toString("HH:mm") if self.eve_check.isChecked()
                           else "off")
         settings.setValue("shift_change", self.change_edit.time().toString("HH:mm"))
