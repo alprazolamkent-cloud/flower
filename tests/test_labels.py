@@ -119,3 +119,26 @@ def test_labels_dialog_and_scanning(db, monkeypatch):
     assert db.ready_of(recipe) == 0 and db.stock_of(rose) == 20 - 9 - 1
     dialog.deleteLater()
     w.deleteLater()
+
+
+def test_short_label_on_top(db, monkeypatch):
+    from app.stock import short_label
+    from app.stock_window import LabelsDialog
+    assert short_label("Открытка большая н13") == "н13" and short_label("Конверт для денег н90-06-s") == "н90-06-s"
+    assert short_label("Роза Кения 60 см") == "Роза Кения 60 см"
+    card = db.save_product(Product(0, "Открытка большая н15", "Сопутствующие", price=150))
+    rose = db.save_product(Product(0, "Кения", "Цветы", price=250))
+    opened = []
+    monkeypatch.setattr(QDesktopServices, "openUrl", lambda url: opened.append(url.toLocalFile()))
+    dialog = LabelsDialog(None, db)
+    rows = {item[1]: i for i, item in enumerate(dialog.items)}
+    assert dialog.tops[rows[card]].text() == "н15"
+    dialog.checks[rows[card]].setChecked(True)
+    dialog.checks[rows[rose]].setChecked(True)
+    dialog.tops[rows[rose]].setText("Р60")  # своя подпись — запомнится
+    dialog._print()
+    page = open(opened[0], encoding="utf-8").read()
+    assert '<div class="title">н15</div><div class="price">150 ₽</div>' in page and '"title">Р60<' in page
+    assert db.get_product(rose).label_text == "Р60" and db.get_product(card).label_text == ""
+    again = LabelsDialog(None, db)
+    assert again.tops[rows[rose]].text() == "Р60"

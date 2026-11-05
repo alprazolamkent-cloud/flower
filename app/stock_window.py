@@ -24,7 +24,8 @@ from .photos import pick_photo, pixmap
 from .shifts import WRITEOFF_REASONS
 from .labels import LAYOUTS, Label, labels_html
 from .stock import (
-    CATEGORIES, PAYMENTS, CartLine, Product, Recipe, day_range, ean13_check, qty_text, reorder_text, split_codes,
+    CATEGORIES, PAYMENTS, CartLine, Product, Recipe, day_range, ean13_check, qty_text, reorder_text, short_label,
+    split_codes,
 )
 from .theme import C, primary
 
@@ -987,29 +988,36 @@ class LabelsDialog(QDialog):
         self.only_marked.toggled.connect(self._filter)
         top.addWidget(self.only_marked)
         layout.addLayout(top)
-        self.items = [("recipe", r.id, "💐 " + r.title, r.price, r.barcode) for r in db.recipes()]
-        self.items += [("product", p.id, p.name, p.price, p.barcode) for p in db.products()]
-        self.table = _table(["", "Что", "Цена", "Штрихкод", "Сколько этикеток"], stretch=1)
+        self.items = [("recipe", r.id, "💐 " + r.title, r.price, r.barcode, r.label_text or short_label(r.title))
+                      for r in db.recipes()]
+        self.items += [("product", p.id, p.name, p.price, p.barcode, p.label_text or short_label(p.name))
+                       for p in db.products()]
+        self.table = _table(["", "Что", "Подпись сверху", "Цена", "Штрихкод", "Сколько этикеток"], stretch=1)
         self.table.setRowCount(len(self.items))
-        self.checks, self.copies = [], []
-        for i, (k, item_id, title, price, codes) in enumerate(self.items):
+        self.checks, self.copies, self.tops = [], [], []
+        for i, (k, item_id, title, price, codes, top) in enumerate(self.items):
             check = QCheckBox()
             check.setChecked(k == kind and item_id == ident)
             check.toggled.connect(self._update)
             self.table.setCellWidget(i, 0, check)
             self.table.setItem(i, 1, _item(title))
-            self.table.setItem(i, 2, _item(money(price), align_right=True))
+            top_edit = QLineEdit(top)
+            top_edit.setPlaceholderText("мелко сверху, например н15")
+            top_edit.setMaxLength(60)
+            self.table.setCellWidget(i, 2, top_edit)
+            self.table.setItem(i, 3, _item(money(price), align_right=True))
             code = split_codes(codes)[0] if codes else ""
-            self.table.setItem(i, 3, _item(code or "— создастся свой", align_right=False))
+            self.table.setItem(i, 4, _item(code or "— создастся свой", align_right=False))
             if not code:
-                self.table.item(i, 3).setForeground(QColor(C.gray))
+                self.table.item(i, 4).setForeground(QColor(C.gray))
             box = QSpinBox()
             box.setRange(1, 500)
             box.setSuffix(" шт")
             box.valueChanged.connect(self._update)
-            self.table.setCellWidget(i, 4, box)
+            self.table.setCellWidget(i, 5, box)
             self.checks.append(check)
             self.copies.append(box)
+            self.tops.append(top_edit)
         layout.addWidget(self.table, 1)
         options = QHBoxLayout()
         self.layout_box = QComboBox()
@@ -1041,8 +1049,9 @@ class LabelsDialog(QDialog):
 
     def _filter(self):
         query = self.search.text().strip().casefold()
-        for i, (_, _, title, _, codes) in enumerate(self.items):
-            hidden = (bool(query) and query not in title.casefold() and query not in codes) or \
+        for i, (_, _, title, _, codes, _) in enumerate(self.items):
+            hidden = (bool(query) and query not in title.casefold() and query not in codes
+                      and query not in self.tops[i].text().casefold()) or \
                 (self.only_marked.isChecked() and not self.checks[i].isChecked())
             self.table.setRowHidden(i, hidden)
 
@@ -1058,12 +1067,14 @@ class LabelsDialog(QDialog):
         for i, check in enumerate(self.checks):
             if not check.isChecked():
                 continue
-            kind, item_id, title, price, codes = self.items[i]
+            kind, item_id, title, price, codes, top = self.items[i]
             if not codes:
                 self.created += 1
             code = self.db.ensure_code(kind, item_id)
-            result.append(Label(title.removeprefix("💐 "), code, price if self.with_price.isChecked() else None,
-                                self.copies[i].value()))
+            text = self.tops[i].text().strip() or title.removeprefix("💐 ")
+            if text != top:  # поправили подпись — запомнить на следующий раз
+                self.db.set_label_text(kind, item_id, text)
+            result.append(Label(text, code, price if self.with_price.isChecked() else None, self.copies[i].value()))
         return result
 
     def _print(self):

@@ -116,6 +116,8 @@ STOCK_MIGRATIONS = {  # (таблица, столбец) → как добави
     ("recipes", "ready_cost"): "ALTER TABLE recipes ADD COLUMN ready_cost REAL NOT NULL DEFAULT 0",
     ("recipes", "in_bot"): "ALTER TABLE recipes ADD COLUMN in_bot INTEGER NOT NULL DEFAULT 1",
     ("products", "barcode"): "ALTER TABLE products ADD COLUMN barcode TEXT NOT NULL DEFAULT ''",
+    ("products", "label_text"): "ALTER TABLE products ADD COLUMN label_text TEXT NOT NULL DEFAULT ''",
+    ("recipes", "label_text"): "ALTER TABLE recipes ADD COLUMN label_text TEXT NOT NULL DEFAULT ''",
 }
 OUTGOING = "('sale', 'assembly', 'writeoff', 'return', 'disassembly')"  # расход со склада (возвраты — минусом)
 OPEN_ORDER = "('new', 'priced', 'paid_claimed')"  # заказ из бота ещё не принят — букет забронирован
@@ -143,6 +145,13 @@ def split_codes(text: str) -> list[str]:
         if code and code not in result:
             result.append(code)
     return result
+
+
+def short_label(name: str) -> str:
+    """Подпись сверху на этикетке: номер вроде «н15» из названия («Открытка большая н13» → «н13»),
+    иначе само название."""
+    found = re.search(r"(?<![^\W\d_])н\s?(\d[\w-]*)", name, re.IGNORECASE)
+    return f"н{found.group(1)}" if found else name.strip()
 
 
 def ean13_check(body: str) -> str:
@@ -182,6 +191,7 @@ class Product:
     stock: float = 0  # остаток (считается из движений)
     has_photo: bool = False
     barcode: str = ""
+    label_text: str = ""  # короткая подпись сверху на этикетке («н15»); пусто — из названия
 
     @property
     def low(self) -> bool:
@@ -199,6 +209,7 @@ class Recipe:
     ready: float = 0  # собрано и стоит на витрине
     in_bot: bool = True  # собранные показывать в витрине ботов
     barcode: str = ""  # штрихкоды через запятую
+    label_text: str = ""  # короткая подпись сверху на этикетке
 
 
 @dataclass
@@ -320,12 +331,12 @@ class StockStore:
         sql = ("SELECT p.id, p.name, p.category, p.unit, p.price, p.avg_cost, p.min_stock, p.active,"
                " COALESCE((SELECT SUM(m.qty) FROM stock_moves m WHERE m.product_id = p.id), 0),"
                " p.photo IS NOT NULL, COALESCE((SELECT GROUP_CONCAT(b.code, ', ') FROM barcodes b"
-               " WHERE b.kind = 'product' AND b.ident = p.id), '') FROM products p")
+               " WHERE b.kind = 'product' AND b.ident = p.id), ''), p.label_text FROM products p")
         if active_only:
             sql += " WHERE p.active = 1"
         rows = self.conn.execute(sql + " ORDER BY p.category, p.name COLLATE NOCASE").fetchall()
-        return [Product(r[0], r[1], r[2], r[3], r[4], r[5], r[6], bool(r[7]), round(r[8], 3), bool(r[9]), r[10])
-                for r in rows]
+        return [Product(r[0], r[1], r[2], r[3], r[4], r[5], r[6], bool(r[7]), round(r[8], 3), bool(r[9]), r[10],
+                        r[11]) for r in rows]
 
     def get_product(self, product_id: int) -> Product | None:
         return next((p for p in self.products(active_only=False) if p.id == product_id), None)
@@ -400,6 +411,11 @@ class StockStore:
         self.conn.execute("INSERT INTO barcodes (code, kind, ident) VALUES (?, ?, ?)", (code, kind, ident))
         self.conn.commit()
         return code
+
+    def set_label_text(self, kind: str, ident: int, text: str):
+        table = {"product": "products", "recipe": "recipes"}[kind]
+        self.conn.execute(f"UPDATE {table} SET label_text=? WHERE id=?", (text.strip()[:60], ident))
+        self.conn.commit()
 
     def find_code(self, code: str) -> tuple[str, int] | None:
         """Что за штрихкод: ("product", номер) или ("recipe", номер) — только то, что не в архиве."""
@@ -524,14 +540,14 @@ class StockStore:
         sql = ("SELECT r.id, r.title, r.price, r.active, r.photo IS NOT NULL, r.in_bot,"
                " COALESCE((SELECT SUM(m.qty) FROM ready_moves m WHERE m.recipe_id = r.id), 0),"
                " COALESCE((SELECT GROUP_CONCAT(b.code, ', ') FROM barcodes b WHERE b.kind = 'recipe'"
-               " AND b.ident = r.id), '') FROM recipes r"
+               " AND b.ident = r.id), ''), r.label_text FROM recipes r"
                + (" WHERE r.active = 1" if active_only else ""))
         result = []
         for r in self.conn.execute(sql + " ORDER BY title COLLATE NOCASE").fetchall():
             items = self.conn.execute("SELECT product_id, qty FROM recipe_items WHERE recipe_id=? ORDER BY rowid",
                                       (r[0],)).fetchall()
             result.append(Recipe(r[0], r[1], r[2], bool(r[3]), [tuple(x) for x in items], bool(r[4]),
-                                 round(r[6], 3), bool(r[5]), r[7]))
+                                 round(r[6], 3), bool(r[5]), r[7], r[8]))
         return result
 
     def get_recipe(self, recipe_id: int) -> Recipe | None:

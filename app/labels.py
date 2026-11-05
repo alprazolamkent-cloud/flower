@@ -78,7 +78,7 @@ def _runs(modules: str):
 
 @dataclass
 class Label:
-    title: str
+    title: str  # мелко сверху — короткая подпись («н15») или название
     code: str
     price: int | None = None  # None — без цены
     copies: int = 1
@@ -95,11 +95,12 @@ def labels_html(labels: list[Label], layout: str = "thermal") -> str:
     thermal = layout == "thermal"
     width, height = (58, 40) if thermal else (70, 37)
     cells = []
-    for label in labels:
-        price = (f'<div class="price">{label.price:,} ₽</div>'.replace(",", " ") if label.price is not None else "")
+    for label in labels:  # сверху мелко подпись, посередине крупно цена, внизу штрихкод
+        price = (f'<div class="price">{label.price:,} ₽</div>'.replace(",", " ") if label.price is not None
+                 else '<div class="price"></div>')
         cell = (f'<div class="label"><div class="title">{html.escape(label.title)}</div>{price}'
-                f'<div class="bars">{barcode_svg(label.code, width - 10, 11 if thermal else 10)}</div>'
-                f'<div class="code">{html.escape(label.code)}</div></div>')
+                f'<div class="bars">{barcode_svg(label.code, width - 10, 11 if thermal else 10)}'
+                f'<div class="code">{html.escape(label.code)}</div></div></div>')
         cells += [cell] * max(label.copies, 0)
     page = ("@page { size: 58mm 40mm; margin: 0; } .label { page-break-after: always; }" if thermal else
             "@page { size: A4; margin: 0; } .sheet { display: grid; grid-template-columns: repeat(3, 70mm); }"
@@ -110,9 +111,9 @@ body {{ margin: 0; font-family: Arial, sans-serif; color: #000; }}
 {page}
 .label {{ width: {width}mm; height: {height}mm; padding: 2mm 5mm; overflow: hidden; display: flex;
           flex-direction: column; justify-content: space-between; }}
-.title {{ font-size: 9pt; font-weight: bold; line-height: 1.15; max-height: 2.4em; overflow: hidden; }}
-.price {{ font-size: 15pt; font-weight: bold; }}
-.bars svg {{ display: block; }}
+.title {{ font-size: 8pt; line-height: 1.15; max-height: 2.3em; overflow: hidden; }}
+.price {{ font-size: {26 if thermal else 24}pt; font-weight: bold; line-height: 1; text-align: center; }}
+.bars svg {{ display: block; margin: 0 auto; }}
 .code {{ font-size: 7.5pt; letter-spacing: 1px; text-align: center; }}
 .tip {{ font: 13px Arial; padding: 10px 14px; background: #fdeef3; border-bottom: 1px solid #f1c3d3; }}
 @media print {{ .tip {{ display: none; }} }}
