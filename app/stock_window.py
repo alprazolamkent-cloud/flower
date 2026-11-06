@@ -458,6 +458,16 @@ class AdjustDialog(QDialog):
         super().accept()
 
 
+class ScanEdit(QLineEdit):
+    """Поле для сканера: Enter после кода не уходит в окно — не нажмёт «Своя позиция», «Принять поставку»,
+    «Сохранить» (сканер «печатает» код и сам жмёт Enter)."""
+
+    def keyPressEvent(self, event):  # noqa: N802 — имя из Qt
+        super().keyPressEvent(event)
+        if event.key() in (Qt.Key_Return, Qt.Key_Enter):
+            event.accept()
+
+
 def _confirm(parent, title: str, text: str) -> bool:
     """Переспросить; по умолчанию — «Нет» (Enter случайно не подтвердит)."""
     return QMessageBox.question(parent, title, text, QMessageBox.Yes | QMessageBox.No,
@@ -485,13 +495,20 @@ class CodesEdit(QWidget):
         self.db = db
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        self.edit = QLineEdit(codes)
+        self.edit = ScanEdit(codes)
         self.edit.setPlaceholderText("отсканируйте заводской или нажмите «Создать свой»; несколько — через запятую")
+        self.edit.returnPressed.connect(self._next_code)
         layout.addWidget(self.edit, 1)
         own = QPushButton("🏷 Создать свой")
         own.setToolTip("Свой штрихкод магазина (EAN-13 на 200…) — напечатать на этикетке")
         own.clicked.connect(self._add_own)
         layout.addWidget(own)
+
+    def _next_code(self):
+        """Отсканировали код — запятая, чтобы следующий скан стал отдельным кодом."""
+        text = self.edit.text().rstrip()
+        if text and not text.endswith((",", ";")):
+            self.edit.setText(text + ", ")
 
     def _add_own(self):
         codes = split_codes(self.edit.text())
@@ -604,6 +621,7 @@ class LinesEditor(QWidget):
         add = QHBoxLayout()
         self.pick = QComboBox()
         self.pick.setEditable(True)
+        self.pick.setLineEdit(ScanEdit())  # Enter сканера не примет поставку раньше времени
         self.pick.setInsertPolicy(QComboBox.NoInsert)
         for p in products:
             self.pick.addItem(f"{p.name} · {p.category}", p.id)
@@ -879,15 +897,6 @@ class RecipeDialog(QDialog):
         super().accept()
 
 
-class ScanEdit(QLineEdit):
-    """Поле для сканера: Enter после кода не нажимает кнопку окна (не спишет и не запишет случайно)."""
-
-    def keyPressEvent(self, event):  # noqa: N802 — имя из Qt
-        super().keyPressEvent(event)
-        if event.key() in (Qt.Key_Return, Qt.Key_Enter):
-            event.accept()
-
-
 class ScanGate(QWidget):
     """«Только сканером»: кнопка действия включится, когда отсканируют штрихкод именно этого товара или букета."""
 
@@ -1109,7 +1118,7 @@ class LabelsDialog(QDialog):
                                "создаст свой (EAN-13 на 200…). Есть заводской — напечатается он. Клеите этикетку на "
                                "ведро, упаковку или букет — и в продаже просто сканируете."))
         top = QHBoxLayout()
-        self.search = QLineEdit()
+        self.search = ScanEdit()
         self.search.setPlaceholderText("🔍 Найти…")
         self.search.setClearButtonEnabled(True)
         self.search.textChanged.connect(self._filter)
@@ -1610,6 +1619,13 @@ class StockWindow(QDialog):
             QShortcut(QKeySequence(key), self, activated=lambda c=code: self._sell_key(c))
         self.refresh()
 
+    def keyPressEvent(self, event):  # noqa: N802 — имя из Qt
+        """Enter (его жмёт и сканер после кода) не нажимает кнопки окна — например, «Своя позиция»."""
+        if event.key() in (Qt.Key_Return, Qt.Key_Enter):
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
     def start_sale(self):
         """На продажу, курсор в поиске — можно сразу печатать название."""
         if self.tabs.currentIndex() != 0:
@@ -1661,7 +1677,7 @@ class StockWindow(QDialog):
         left = QVBoxLayout()
         top = QHBoxLayout()
         self.scan_only = False
-        self.search_edit = QLineEdit()
+        self.search_edit = ScanEdit()
         self.search_edit.setPlaceholderText("🔍 Печатайте название (F2), Enter — в корзину; оплата F5 / F6 / F7")
         self.search_edit.setClearButtonEnabled(True)
         self._search_timer = QTimer(self, singleShot=True, interval=150)  # ищем, когда допечатали
@@ -2051,7 +2067,7 @@ class StockWindow(QDialog):
         page = QWidget()
         layout = QVBoxLayout(page)
         filters = QHBoxLayout()
-        self.stock_search = QLineEdit()
+        self.stock_search = ScanEdit()
         self.stock_search.setPlaceholderText("🔍 Поиск товара…")
         self.stock_search.setClearButtonEnabled(True)
         self.stock_search.textChanged.connect(self._refresh_stock)

@@ -241,3 +241,37 @@ def test_label_size_offset_and_zero_price(db, store, monkeypatch, tmp_path):
     assert printed[1][0][0].price is None  # «0 ₽» не печатаем
     again = stock_window.LabelsDialog(None, db)
     assert again.size_box.currentData() == "43x25" and again.shift_y.value() == -3.0
+
+
+def test_scanner_enter_does_not_press_window_buttons(db, store, monkeypatch):
+    """Сканер «печатает» код и жмёт Enter: в продаже это не открывает «Своя позиция», в поставке —
+    не принимает её после первого же скана, в карточке товара — не сохраняет, а ждёт следующий код."""
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+    from PySide6.QtWidgets import QInputDialog
+    seller = db.add_user("anna", "Анна", "1")
+    rose = db.save_product(Product(0, "Кения", "Цветы", price=250, barcode="4600000000015"))
+    db.add_supply("База", [(rose, 20, 80)], None, NOW)
+    asked = []
+    monkeypatch.setattr(QInputDialog, "getText", lambda *a, **k: (asked.append(1), ("", False))[1])
+    w = stock_window.StockWindow(FakeMain(db, seller))
+    w.show()
+    QTest.keyClicks(w.search_edit, "4600000000015")
+    QTest.keyClick(w.search_edit, Qt.Key_Return)
+    assert len(w.rows) == 1 and not asked and w.isVisible()
+
+    supply = stock_window.SupplyDialog(None, db, None, admin=True)
+    supply.show()
+    edit = supply.lines.pick.lineEdit()
+    for _ in range(2):
+        QTest.keyClicks(edit, "4600000000015")
+        QTest.keyClick(edit, Qt.Key_Return)
+    assert supply.isVisible() and supply.lines.lines() == [(rose, 2, 80)]
+
+    codes = stock_window.CodesEdit(db, "")
+    QTest.keyClicks(codes.edit, "4600000000022")
+    QTest.keyClick(codes.edit, Qt.Key_Return)
+    QTest.keyClicks(codes.edit, "AB-12")
+    assert codes.text() == "4600000000022, AB-12"
+    supply.reject()
+    w.close()
