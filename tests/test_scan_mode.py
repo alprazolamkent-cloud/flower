@@ -54,6 +54,7 @@ def test_print_to_pdf_and_image(tmp_path):
 
 
 def test_labels_dialog_prints_to_chosen_printer(db, store, monkeypatch):
+    store["label_direct"] = "false"  # через драйвер Windows
     rose = db.save_product(Product(0, "Кения", "Цветы", price=250))
     printed, opened = [], []
     monkeypatch.setattr(stock_window, "printers", lambda: (["Microsoft Print to PDF", "Xprinter XP-365B"],
@@ -66,7 +67,7 @@ def test_labels_dialog_prints_to_chosen_printer(db, store, monkeypatch):
     dialog._print()
     labels, layout, name, kw = printed[0]
     assert name == "Xprinter XP-365B" and layout == "thermal" and labels[0].copies == 3 and not opened
-    assert kw == {"size": (58, 40), "offset": (0.0, 0.0)} and labels[0].price == 250
+    assert kw == {"size": (58, 40), "offset": (0.0, 0.0), "frame": False} and labels[0].price == 250
     assert store["label_printer"] == "Xprinter XP-365B" and db.get_product(rose).barcode.startswith("200")
 
     def broken(*args, **kw):
@@ -221,6 +222,7 @@ def test_scan_in_russian_layout(db):
 
 def test_label_size_offset_and_zero_price(db, store, monkeypatch, tmp_path):
     """Рулон другого размера, сдвиг под принтер, пробная с рамкой; цена 0 ₽ не печатается."""
+    store["label_direct"] = "false"
     pdf = tmp_path / "small.pdf"
     assert print_labels([Label("x", "2000000000015", 100)], "thermal", pdf_path=str(pdf), size=(40, 30),
                         offset=(0, -3), frame=True) == 1
@@ -275,3 +277,34 @@ def test_scanner_enter_does_not_press_window_buttons(db, store, monkeypatch):
     assert codes.text() == "4600000000022, AB-12"
     supply.reject()
     w.close()
+
+
+def test_direct_tspl_printing(db, store, monkeypatch):
+    """Напрямую, минуя драйвер: принтеру уходят команды TSPL с размером этикетки, зазором и картинкой."""
+    import re
+
+    from app.labels import send_raw, tspl_job
+    job = tspl_job([Label("н15", "2000000000015", 250, 3)], size=(58, 40))
+    assert job.startswith(b"SIZE 58 mm,40 mm\r\nGAP 2 mm,0 mm\r\nDIRECTION 1\r\n") and job.endswith(b"PRINT 1,3\r\n")
+    found = re.search(rb"BITMAP 0,0,(\d+),(\d+),0,", job)
+    width, height = int(found[1]), int(found[2])
+    bits = job[found.end():found.end() + width * height]
+    assert (width, height) == (58, 320) and len(bits) == width * height
+    black = sum(8 - bin(b).count("1") for b in bits)  # в TSPL чёрная точка — 0
+    assert 0.05 < black / (width * 8 * height) < 0.3  # цена и штрихкод, но не залито целиком
+    assert b"DIRECTION 0" in tspl_job([Label("x", "2000000000015")], flip=True)
+    with pytest.raises(OSError):
+        send_raw("Нет такого принтера AloFlorist", b"")
+
+    rose = db.save_product(Product(0, "Кения", "Цветы", price=250))
+    sent = []
+    monkeypatch.setattr(stock_window, "printers", lambda: (["Xprinter XP-365B"], "Xprinter XP-365B"))
+    monkeypatch.setattr(stock_window, "send_raw", lambda name, data: sent.append((name, data)))
+    dialog = stock_window.LabelsDialog(None, db, "product", rose)
+    assert dialog.direct.isChecked()  # по умолчанию — напрямую
+    dialog.size_box.setCurrentIndex(dialog.size_box.findData("43x25"))
+    dialog._print_test()
+    dialog._print()
+    assert [name for name, _ in sent] == ["Xprinter XP-365B"] * 2
+    assert sent[0][1].startswith(b"SIZE 43 mm,25 mm") and sent[1][1].endswith(b"PRINT 1,1\r\n")
+    assert store["label_direct"] == "true"

@@ -1,7 +1,7 @@
 """Этикетки со штрихкодами: EAN-13 (свои 200… и большинство заводских) и Code 128 (заводские с буквами).
 
-Рисуем сами, в SVG: страница открывается в браузере и печатается на любом принтере — лист A4 с наклейками
-или термопринтер этикеток 58×40 мм.
+Рисуем сами: SVG для браузера, QPainter для печати через драйвер Windows и TSPL-картинкой прямо
+на принтер этикеток (Xprinter, TSC) — так размер этикетки и зазор задаёт сама программа, а не драйвер.
 """
 
 import html
@@ -258,6 +258,73 @@ def print_labels(labels: list[Label], layout: str = "thermal", printer_name: str
         paint_label(painter, QRectF(x * dpmm, y * dpmm, w_mm * dpmm, h_mm * dpmm), label, dpmm, frame)
     painter.end()
     return pages
+
+
+def tspl_job(labels: list[Label], size: tuple = (58, 40), offset: tuple = (0, 0), frame: bool = False,
+             flip: bool = False, gap: float = 2, dpi: int = 203) -> bytes:
+    """Задание для принтера этикеток на языке TSPL (Xprinter, TSC и похожие) — в обход драйвера Windows:
+    принтер сам узнаёт размер этикетки и зазор, этикетка уходит картинкой. В TSPL точка 1 — белая, 0 — чёрная."""
+    from PySide6.QtCore import QRectF, Qt
+    from PySide6.QtGui import QImage, QPainter, qGray
+
+    w_mm, h_mm = size
+    dpmm = dpi / 25.4
+    width_bytes, height = (round(w_mm * dpmm) + 7) // 8, round(h_mm * dpmm)
+    out = [f"SIZE {w_mm:g} mm,{h_mm:g} mm\r\nGAP {gap:g} mm,0 mm\r\nDIRECTION {0 if flip else 1}\r\n"
+           "REFERENCE 0,0\r\nDENSITY 8\r\nSPEED 3\r\n".encode("ascii")]
+    for label in labels:
+        if label.copies <= 0:
+            continue
+        image = QImage(width_bytes * 8, height, QImage.Format_RGB32)
+        image.fill(Qt.white)
+        painter = QPainter(image)
+        paint_label(painter, QRectF(offset[0] * dpmm, offset[1] * dpmm, w_mm * dpmm, h_mm * dpmm), label, dpmm, frame)
+        painter.end()
+        mono = image.convertToFormat(QImage.Format_Mono, Qt.ThresholdDither)
+        black_is_one = qGray(mono.colorTable()[1]) < 128
+        line, raw = mono.bytesPerLine(), bytes(mono.constBits())
+        rows = b"".join(raw[y * line:y * line + width_bytes] for y in range(height))
+        if black_is_one:  # у TSPL наоборот: чёрное — 0
+            rows = bytes(b ^ 0xFF for b in rows)
+        out.append(b"CLS\r\n" + f"BITMAP 0,0,{width_bytes},{height},0,".encode("ascii") + rows
+                   + f"\r\nPRINT 1,{label.copies}\r\n".encode("ascii"))
+    return b"".join(out)
+
+
+def send_raw(printer_name: str, data: bytes):
+    """Отдать байты принтеру как есть (RAW), минуя драйвер — так печатают программы для этикеток."""
+    import sys
+    if sys.platform != "win32":
+        raise OSError("прямая печать работает только в Windows")
+    import ctypes
+    from ctypes import wintypes
+
+    class DocInfo(ctypes.Structure):
+        _fields_ = [("pDocName", wintypes.LPWSTR), ("pOutputFile", wintypes.LPWSTR), ("pDatatype", wintypes.LPWSTR)]
+
+    spool = ctypes.WinDLL("winspool.drv")
+    spool.OpenPrinterW.argtypes = [wintypes.LPWSTR, ctypes.POINTER(wintypes.HANDLE), ctypes.c_void_p]
+    spool.StartDocPrinterW.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(DocInfo)]
+    spool.WritePrinter.argtypes = [wintypes.HANDLE, ctypes.c_char_p, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
+    for name in ("StartPagePrinter", "EndPagePrinter", "EndDocPrinter", "ClosePrinter"):
+        getattr(spool, name).argtypes = [wintypes.HANDLE]
+    handle = wintypes.HANDLE()
+    if not spool.OpenPrinterW(printer_name, ctypes.byref(handle), None):
+        raise OSError(f"принтер «{printer_name}» не найден")
+    try:
+        doc = DocInfo("AloFlorist — этикетки", None, "RAW")
+        if not spool.StartDocPrinterW(handle, 1, ctypes.byref(doc)):
+            raise OSError(f"принтер «{printer_name}» не принимает задание")
+        try:
+            spool.StartPagePrinter(handle)
+            written = wintypes.DWORD()
+            if not spool.WritePrinter(handle, data, len(data), ctypes.byref(written)) or written.value != len(data):
+                raise OSError(f"принтер «{printer_name}» не принял данные")
+            spool.EndPagePrinter(handle)
+        finally:
+            spool.EndDocPrinter(handle)
+    finally:
+        spool.ClosePrinter(handle)
 
 
 def printers() -> tuple[list[str], str]:

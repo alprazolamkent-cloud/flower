@@ -61,3 +61,14 @@ def set_label_setup(size: str, offset: tuple[float, float]):
     _settings().setValue("label_size", size)
     _settings().setValue("label_offset_x", offset[0])
     _settings().setValue("label_offset_y", offset[1])
+
+
+def label_direct() -> tuple[bool, bool]:
+    """(печатать напрямую командами TSPL, минуя драйвер; перевернуть) — по умолчанию напрямую."""
+    s = _settings()
+    return str(s.value("label_direct", "true")) == "true", str(s.value("label_flip", "false")) == "true"
+
+
+def set_label_direct(direct: bool, flip: bool):
+    _settings().setValue("label_direct", "true" if direct else "false")
+    _settings().setValue("label_flip", "true" if flip else "false")
