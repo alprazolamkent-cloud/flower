@@ -25,10 +25,11 @@ from .photos import pick_photo, pixmap
 from .shifts import WRITEOFF_REASONS
 from .labels import (
     LAYOUTS, THERMAL_SIZES, Label, barcode_modules, labels_html, print_labels, printers, send_raw, tspl_job,
+    tspl_probe,
 )
 from .stock_settings import (
-    SCAN_ONLY, label_direct, label_offset, label_printer, label_size, scan_required, set_label_direct,
-    set_label_printer, set_label_setup,
+    SCAN_ONLY, direct_checked, label_direct, label_offset, label_printer, label_size, scan_required,
+    set_direct_checked, set_label_direct, set_label_printer, set_label_setup,
 )
 from .stock import (
     CATEGORIES, PAYMENTS, CartLine, Product, Recipe, day_range, ean13_check, qty_text, reorder_text, short_label,
@@ -1225,7 +1226,7 @@ class LabelsDialog(QDialog):
         setup.addWidget(self.test_btn)
         setup.addStretch(1)
         direct, flip = label_direct()
-        self.direct = QCheckBox("Напрямую, минуя драйвер (Xprinter, TSC)")
+        self.direct = QCheckBox("Напрямую, минуя драйвер (принтер в режиме этикеток)")
         self.direct.setToolTip("Программа сама говорит принтеру размер этикетки и зазор — печать ложится ровно, "
                                "даже если в драйвере Windows стоит другая бумага")
         self.direct.setChecked(direct)
@@ -1246,9 +1247,10 @@ class LabelsDialog(QDialog):
         setup.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(self.setup_box)
         self.layout_box.currentIndexChanged.connect(self._layout_changed)
-        layout.addWidget(_gray("Печать кривая — включите «Напрямую», выберите размер рулона и нажмите «🧪 Пробная»: "
-                               "рамка должна идти по краю этикетки. Немного мимо — подвиньте «Сдвигом» (минус — "
-                               "вверх / влево). Вместо этикетки непонятные буквы — снимите «Напрямую»."))
+        layout.addWidget(_gray("Выберите размер рулона и нажмите «🧪 Пробная»: рамка должна идти по краю этикетки. "
+                               "Немного мимо — подвиньте «Сдвигом» (минус — вверх / влево). «Напрямую» — только "
+                               "если принтер переключён в режим этикеток; сначала программа печатает одну маленькую "
+                               "пробную и спрашивает, ровно ли вышло."))
         row = QHBoxLayout()
         self.browser_btn = QPushButton("🌐 В браузере")
         self.browser_btn.setToolTip("Открыть этикетки страницей в браузере и напечатать оттуда (Ctrl+P)")
@@ -1330,6 +1332,20 @@ class LabelsDialog(QDialog):
         else:
             print_labels(labels, "thermal", name, frame=frame, **setup)
 
+    def _direct_test(self, name: str) -> bool:
+        """Прямая печать: сначала крошечная пробная, человек подтверждает — иначе обратно на драйвер."""
+        setup = self._thermal_setup()
+        send_raw(name, tspl_probe(flip=self.flip.isChecked(), **setup))
+        if QMessageBox.question(self, "Пробная напрямую", "Вышла этикетка с рамкой и надписью «OK»?\n\n"
+                                "«Нет» — если вышли непонятные символы или ничего: значит, принтер стоит в режиме "
+                                "чеков, а не этикеток. Печать пойдёт через драйвер.",
+                                QMessageBox.Yes | QMessageBox.No, QMessageBox.No) == QMessageBox.Yes:
+            set_direct_checked(name)
+            return True
+        self.direct.setChecked(False)
+        set_label_direct(False, self.flip.isChecked())
+        return False
+
     def _print_test(self):
         name = self.printer.currentData()
         if not name:
@@ -1337,6 +1353,9 @@ class LabelsDialog(QDialog):
             return
         set_label_printer(name)
         try:
+            if self.direct.isChecked():
+                self._direct_test(name)
+                return
             self._send_thermal([Label("Пробная · н15", "2000000000015", 1250)], name, frame=True)
         except OSError as e:
             QMessageBox.warning(self, "Этикетки", f"Не получилось напечатать: {e}.")
@@ -1357,6 +1376,11 @@ class LabelsDialog(QDialog):
         if not browser and name:
             set_label_printer(name)
             try:
+                if layout == "thermal" and self.direct.isChecked() and not direct_checked(name):
+                    QMessageBox.information(self, "Этикетки", "Прямую печать на этом принтере ещё не проверяли. "
+                                            "Нажмите «🧪 Пробная» — выйдет одна маленькая этикетка — и подтвердите, "
+                                            "что она ровная. Без этого рулон не трачу.")
+                    return
                 if layout == "thermal":
                     self._send_thermal(labels, name)
                 else:

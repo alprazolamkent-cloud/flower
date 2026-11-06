@@ -291,6 +291,21 @@ def tspl_job(labels: list[Label], size: tuple = (58, 40), offset: tuple = (0, 0)
     return b"".join(out)
 
 
+def tspl_probe(size: tuple = (58, 40), offset: tuple = (0, 0), flip: bool = False, gap: float = 2,
+               dpi: int = 203) -> bytes:
+    """Маленькая пробная на TSPL: рамка по краю и надпись, без картинки — пара сотен байт. Если принтер
+    TSPL не понимает (стоит в режиме чеков), он напечатает пару строк мусора, а не метр рулона."""
+    w_mm, h_mm = size
+    dpmm = dpi / 25.4
+    x, y = round((0.6 + offset[0]) * dpmm), round((0.6 + offset[1]) * dpmm)
+    x2, y2 = round((w_mm - 0.6 + offset[0]) * dpmm), round((h_mm - 0.6 + offset[1]) * dpmm)
+    return (f"SIZE {w_mm:g} mm,{h_mm:g} mm\r\nGAP {gap:g} mm,0 mm\r\nDIRECTION {0 if flip else 1}\r\n"
+            "REFERENCE 0,0\r\nCLS\r\n"
+            f"BOX {x},{y},{x2},{y2},3\r\n"
+            f"TEXT {x + 4 * round(dpmm)},{y + 4 * round(dpmm)},\"3\",0,1,1,\"OK {w_mm:g}x{h_mm:g}\"\r\n"
+            "PRINT 1,1\r\n").encode("ascii")
+
+
 def send_raw(printer_name: str, data: bytes):
     """Отдать байты принтеру как есть (RAW), минуя драйвер — так печатают программы для этикеток."""
     import sys

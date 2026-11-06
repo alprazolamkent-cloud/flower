@@ -64,11 +64,21 @@ def set_label_setup(size: str, offset: tuple[float, float]):
 
 
 def label_direct() -> tuple[bool, bool]:
-    """(печатать напрямую командами TSPL, минуя драйвер; перевернуть) — по умолчанию напрямую."""
+    """(печатать напрямую командами TSPL, минуя драйвер; перевернуть) — по умолчанию через драйвер:
+    принтер в режиме чеков печатает команды текстом и изводит рулон."""
     s = _settings()
-    return str(s.value("label_direct", "true")) == "true", str(s.value("label_flip", "false")) == "true"
+    return str(s.value("label_direct_v2", "false")) == "true", str(s.value("label_flip", "false")) == "true"
+
+
+def direct_checked(printer: str) -> bool:
+    """На этом принтере прямую печать проверили маленькой пробной и подтвердили, что вышла этикетка."""
+    return bool(printer) and str(_settings().value("label_direct_ok", "") or "") == printer
+
+
+def set_direct_checked(printer: str):
+    _settings().setValue("label_direct_ok", printer)
 
 
 def set_label_direct(direct: bool, flip: bool):
-    _settings().setValue("label_direct", "true" if direct else "false")
+    _settings().setValue("label_direct_v2", "true" if direct else "false")
     _settings().setValue("label_flip", "true" if flip else "false")

@@ -54,7 +54,7 @@ def test_print_to_pdf_and_image(tmp_path):
 
 
 def test_labels_dialog_prints_to_chosen_printer(db, store, monkeypatch):
-    store["label_direct"] = "false"  # через драйвер Windows
+    store["label_direct_v2"] = "false"  # через драйвер Windows
     rose = db.save_product(Product(0, "Кения", "Цветы", price=250))
     printed, opened = [], []
     monkeypatch.setattr(stock_window, "printers", lambda: (["Microsoft Print to PDF", "Xprinter XP-365B"],
@@ -222,7 +222,7 @@ def test_scan_in_russian_layout(db):
 
 def test_label_size_offset_and_zero_price(db, store, monkeypatch, tmp_path):
     """Рулон другого размера, сдвиг под принтер, пробная с рамкой; цена 0 ₽ не печатается."""
-    store["label_direct"] = "false"
+    store["label_direct_v2"] = "false"
     pdf = tmp_path / "small.pdf"
     assert print_labels([Label("x", "2000000000015", 100)], "thermal", pdf_path=str(pdf), size=(40, 30),
                         offset=(0, -3), frame=True) == 1
@@ -296,15 +296,30 @@ def test_direct_tspl_printing(db, store, monkeypatch):
     with pytest.raises(OSError):
         send_raw("Нет такого принтера AloFlorist", b"")
 
+    from app.labels import tspl_probe
+    probe = tspl_probe((58, 40))
+    assert len(probe) < 300 and b"BOX " in probe and b"BITMAP" not in probe  # мусором — пара строк, не рулон
+
     rose = db.save_product(Product(0, "Кения", "Цветы", price=250))
-    sent = []
+    sent, shown = [], []
     monkeypatch.setattr(stock_window, "printers", lambda: (["Xprinter XP-365B"], "Xprinter XP-365B"))
     monkeypatch.setattr(stock_window, "send_raw", lambda name, data: sent.append((name, data)))
+    monkeypatch.setattr(QMessageBox, "information", lambda *args: shown.append(args[2]))
     dialog = stock_window.LabelsDialog(None, db, "product", rose)
-    assert dialog.direct.isChecked()  # по умолчанию — напрямую
+    assert not dialog.direct.isChecked()  # по умолчанию — через драйвер: чековый режим не изведёт рулон
+    dialog.direct.setChecked(True)
+    dialog._print()  # без пробной напрямую не печатаем
+    assert not sent and "Пробная" in shown[0]
+    monkeypatch.setattr(QMessageBox, "question", lambda *args: QMessageBox.No)
+    dialog._print_test()  # вышел мусор — «Нет»: обратно на драйвер
+    assert len(sent[0][1]) < 300 and not dialog.direct.isChecked() and store["label_direct_v2"] == "false"
+
+    sent.clear()
+    dialog.direct.setChecked(True)
     dialog.size_box.setCurrentIndex(dialog.size_box.findData("43x25"))
-    dialog._print_test()
+    monkeypatch.setattr(QMessageBox, "question", lambda *args: QMessageBox.Yes)
+    dialog._print_test()  # вышла ровная — теперь можно
     dialog._print()
     assert [name for name, _ in sent] == ["Xprinter XP-365B"] * 2
-    assert sent[0][1].startswith(b"SIZE 43 mm,25 mm") and sent[1][1].endswith(b"PRINT 1,1\r\n")
-    assert store["label_direct"] == "true"
+    assert sent[0][1].startswith(b"SIZE 43 mm,25 mm") and b"BITMAP" in sent[1][1]
+    assert sent[1][1].endswith(b"PRINT 1,1\r\n") and store["label_direct_ok"] == "Xprinter XP-365B"
