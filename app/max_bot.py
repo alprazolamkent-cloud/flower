@@ -325,7 +325,10 @@ class MaxBot(ClientBot):
             results.append(result)
             if result["error"] and not result["permanent"]:
                 break
-        self.sent.emit(results)
+        try:
+            self.sent.emit(results)
+        except RuntimeError:  # программу уже закрывают — сообщать о результате некому
+            pass
 
     def _remember_photo(self, item_id: int, file_id: str):
         item = self.db.get_showcase_item(item_id)
