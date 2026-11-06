@@ -85,7 +85,7 @@ class Label:
 
 
 LAYOUTS = {
-    "thermal": "Термопринтер, этикетка 58×40 мм",
+    "thermal": "Термопринтер (рулон этикеток)",
     "a4": "Лист A4, 24 наклейки (70×37 мм)",
 }
 
@@ -128,6 +128,8 @@ body {{ margin: 0; font-family: Arial, sans-serif; color: #000; }}
 
 LABEL_MM = {"thermal": (58, 40), "a4": (70, 37)}
 A4_GRID = (3, 8)  # 24 наклейки на листе A4
+# размеры рулонов для термопринтера (ширина × высота, мм) — какой стоит, смотрите на коробке рулона
+THERMAL_SIZES = {"58x40": (58, 40), "58x30": (58, 30), "60x40": (60, 40), "40x30": (40, 30), "43x25": (43, 25)}
 
 
 def barcode_modules(code: str) -> tuple[str, int]:
@@ -135,22 +137,29 @@ def barcode_modules(code: str) -> tuple[str, int]:
     return (ean13_modules(code), 11) if is_ean13(code) else (code128_modules(code), 10)
 
 
-def paint_label(painter, rect, label: Label, dpmm: float):
+def paint_label(painter, rect, label: Label, dpmm: float, frame: bool = False):
     """Нарисовать этикетку в прямоугольнике rect (точки устройства): сверху мелко подпись, крупно цена,
     внизу штрихкод. Ширина полоски — целое число точек: у термопринтера дробные полоски расплываются."""
     from PySide6.QtCore import QRectF, Qt
     from PySide6.QtGui import QColor, QFont, QFontMetricsF
 
-    pad_x, pad_y = 2.5 * dpmm, 1.6 * dpmm
+    pad_x, pad_y = 2.5 * dpmm, 2 * dpmm
     inner = QRectF(rect).adjusted(pad_x, pad_y, -pad_x, -pad_y)
     painter.save()
     painter.setPen(QColor("black"))
+    if frame:  # пробная: рамка по краю — видно, куда сдвинулась печать
+        from PySide6.QtGui import QPen
+        pen = QPen(QColor("black"))
+        pen.setWidthF(0.3 * dpmm)
+        painter.setPen(pen)
+        painter.drawRect(QRectF(rect).adjusted(0.6 * dpmm, 0.6 * dpmm, -0.6 * dpmm, -0.6 * dpmm))
+        painter.setPen(QColor("black"))
     font = QFont("Arial")
     font.setPixelSize(max(int(2.6 * dpmm), 6))
     painter.setFont(font)
     title = QFontMetricsF(font).elidedText(label.title, Qt.ElideRight, inner.width())
     top_h = 3.4 * dpmm
-    painter.drawText(QRectF(inner.left(), inner.top(), inner.width(), top_h), Qt.AlignLeft | Qt.AlignVCenter, title)
+    painter.drawText(QRectF(inner.left(), inner.top(), inner.width(), top_h), Qt.AlignCenter, title)
 
     code_h, bars_h = 2.8 * dpmm, min(11 * dpmm, inner.height() * 0.38)
     bottom = inner.bottom()
@@ -190,11 +199,11 @@ def paint_label(painter, rect, label: Label, dpmm: float):
     painter.restore()
 
 
-def render_label_image(label: Label, layout: str = "thermal", dpi: int = 203):
+def render_label_image(label: Label, layout: str = "thermal", dpi: int = 203, size: tuple | None = None):
     """Этикетка картинкой (как напечатает принтер с таким разрешением) — для просмотра и проверки."""
     from PySide6.QtCore import QRectF, Qt
     from PySide6.QtGui import QImage, QPainter
-    w_mm, h_mm = LABEL_MM[layout]
+    w_mm, h_mm = size or LABEL_MM[layout]
     dpmm = dpi / 25.4
     image = QImage(round(w_mm * dpmm), round(h_mm * dpmm), QImage.Format_RGB32)
     image.fill(Qt.white)
@@ -204,9 +213,11 @@ def render_label_image(label: Label, layout: str = "thermal", dpi: int = 203):
     return image
 
 
-def print_labels(labels: list[Label], layout: str = "thermal", printer_name: str = "", pdf_path: str = "") -> int:
+def print_labels(labels: list[Label], layout: str = "thermal", printer_name: str = "", pdf_path: str = "",
+                 size: tuple | None = None, offset: tuple = (0, 0), frame: bool = False) -> int:
     """Напечатать на принтер (по имени, как в Windows) или в PDF. Возвращает число страниц.
-    Термопринтер — по этикетке 58×40 мм на страницу; A4 — сеткой 3×8."""
+    Термопринтер — по этикетке на страницу (size, мм; по умолчанию 58×40); A4 — сеткой 3×8.
+    offset — (вправо, вниз) в мм: подвинуть печать, если принтер кладёт её мимо этикетки."""
     from PySide6.QtCore import QMarginsF, QRectF, QSizeF
     from PySide6.QtGui import QPageLayout, QPageSize, QPainter
     from PySide6.QtPrintSupport import QPrinter
@@ -221,11 +232,11 @@ def print_labels(labels: list[Label], layout: str = "thermal", printer_name: str
     elif printer_name:
         printer.setPrinterName(printer_name)
     printer.setFullPage(True)
-    w_mm, h_mm = LABEL_MM[layout]
+    w_mm, h_mm = (size or LABEL_MM[layout]) if layout == "thermal" else LABEL_MM[layout]
     if layout == "thermal":
-        size = QPageSize(QSizeF(w_mm, h_mm), QPageSize.Millimeter, "Этикетка 58×40", QPageSize.ExactMatch)
-        orientation = QPageLayout.Landscape if size.size(QPageSize.Millimeter).width() < w_mm else QPageLayout.Portrait
-        printer.setPageLayout(QPageLayout(size, orientation, QMarginsF(0, 0, 0, 0), QPageLayout.Millimeter))
+        page = QPageSize(QSizeF(w_mm, h_mm), QPageSize.Millimeter, f"Этикетка {w_mm:g}×{h_mm:g}", QPageSize.ExactMatch)
+        orientation = QPageLayout.Landscape if page.size(QPageSize.Millimeter).width() < w_mm else QPageLayout.Portrait
+        printer.setPageLayout(QPageLayout(page, orientation, QMarginsF(0, 0, 0, 0), QPageLayout.Millimeter))
     else:
         printer.setPageLayout(QPageLayout(QPageSize(QPageSize.A4), QPageLayout.Portrait, QMarginsF(0, 0, 0, 0),
                                           QPageLayout.Millimeter))
@@ -243,7 +254,8 @@ def print_labels(labels: list[Label], layout: str = "thermal", printer_name: str
             pages += 1
         col, row = slot % A4_GRID[0], slot // A4_GRID[0]
         x, y = (0, 0) if layout == "thermal" else (col * w_mm, row * h_mm)
-        paint_label(painter, QRectF(x * dpmm, y * dpmm, w_mm * dpmm, h_mm * dpmm), label, dpmm)
+        x, y = x + offset[0], y + offset[1]
+        paint_label(painter, QRectF(x * dpmm, y * dpmm, w_mm * dpmm, h_mm * dpmm), label, dpmm, frame)
     painter.end()
     return pages
 

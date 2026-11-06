@@ -42,3 +42,22 @@ def weekly_count_day() -> int:
 
 def set_weekly_count_day(day: int):
     _settings().setValue("weekly_count_day", day)
+
+
+def label_size() -> str:
+    """Размер рулона этикеток для термопринтера: ключ из labels.THERMAL_SIZES."""
+    return str(_settings().value("label_size", "58x40") or "58x40")
+
+
+def label_offset() -> tuple[float, float]:
+    """Сдвиг печати (вправо, вниз) в мм — подогнать под принтер."""
+    try:
+        return float(_settings().value("label_offset_x", 0) or 0), float(_settings().value("label_offset_y", 0) or 0)
+    except (TypeError, ValueError):
+        return 0.0, 0.0
+
+
+def set_label_setup(size: str, offset: tuple[float, float]):
+    _settings().setValue("label_size", size)
+    _settings().setValue("label_offset_x", offset[0])
+    _settings().setValue("label_offset_y", offset[1])

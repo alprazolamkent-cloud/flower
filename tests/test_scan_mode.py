@@ -58,17 +58,18 @@ def test_labels_dialog_prints_to_chosen_printer(db, store, monkeypatch):
     printed, opened = [], []
     monkeypatch.setattr(stock_window, "printers", lambda: (["Microsoft Print to PDF", "Xprinter XP-365B"],
                                                            "Xprinter XP-365B"))
-    monkeypatch.setattr(stock_window, "print_labels", lambda labels, layout, name: printed.append((labels, layout, name)))
+    monkeypatch.setattr(stock_window, "print_labels", lambda labels, layout, name, **kw: printed.append((labels, layout, name, kw)))
     monkeypatch.setattr(QDesktopServices, "openUrl", lambda url: opened.append(url))
     dialog = stock_window.LabelsDialog(None, db, "product", rose)
     assert dialog.printer.currentData() == "Xprinter XP-365B"  # принтер этикеток выбран сам
     dialog.copies[0].setValue(3)
     dialog._print()
-    labels, layout, name = printed[0]
+    labels, layout, name, kw = printed[0]
     assert name == "Xprinter XP-365B" and layout == "thermal" and labels[0].copies == 3 and not opened
+    assert kw == {"size": (58, 40), "offset": (0.0, 0.0)} and labels[0].price == 250
     assert store["label_printer"] == "Xprinter XP-365B" and db.get_product(rose).barcode.startswith("200")
 
-    def broken(*args):
+    def broken(*args, **kw):
         raise OSError("принтер не отвечает")
     monkeypatch.setattr(stock_window, "print_labels", broken)
     monkeypatch.setattr(stock_window, "_confirm", lambda *args: True)
@@ -216,3 +217,27 @@ def test_scan_in_russian_layout(db):
     editor.pick.setEditText("ФИ-12")
     editor._add_picked()
     assert editor.lines() == [(box, 1)]
+
+
+def test_label_size_offset_and_zero_price(db, store, monkeypatch, tmp_path):
+    """Рулон другого размера, сдвиг под принтер, пробная с рамкой; цена 0 ₽ не печатается."""
+    pdf = tmp_path / "small.pdf"
+    assert print_labels([Label("x", "2000000000015", 100)], "thermal", pdf_path=str(pdf), size=(40, 30),
+                        offset=(0, -3), frame=True) == 1
+    box = pdf.read_bytes()
+    assert b"MediaBox [0 0 113" in box  # 40×30 мм = 113×85 pt — страница нужного размера
+    free = db.save_product(Product(0, "Кенделайт", "Цветы", price=0))
+    printed = []
+    monkeypatch.setattr(stock_window, "printers", lambda: (["Xprinter XP-365B"], "Xprinter XP-365B"))
+    monkeypatch.setattr(stock_window, "print_labels", lambda labels, layout, name, **kw: printed.append((labels, kw)))
+    dialog = stock_window.LabelsDialog(None, db, "product", free)
+    assert "Цена 0 ₽" in dialog.summary.text()
+    dialog.size_box.setCurrentIndex(dialog.size_box.findData("43x25"))
+    dialog.shift_y.setValue(-3)
+    dialog._print_test()
+    assert printed[0][1] == {"size": (43, 25), "offset": (0.0, -3.0), "frame": True}
+    assert store["label_size"] == "43x25" and store["label_offset_y"] == -3.0
+    dialog._print()
+    assert printed[1][0][0].price is None  # «0 ₽» не печатаем
+    again = stock_window.LabelsDialog(None, db)
+    assert again.size_box.currentData() == "43x25" and again.shift_y.value() == -3.0
