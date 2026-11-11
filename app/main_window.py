@@ -561,6 +561,17 @@ class MainWindow(QMainWindow):
         return True
 
     def _after_shift_started(self, shift: Shift):
+        prev = self.db.previous_shift(shift)
+        if prev is not None:  # принимающий не подтвердил обязанности прошлой смены — администраторам
+            wrong = [i for i in self.db.checklist(prev) if i.check == "no"]
+            if wrong:
+                details = "; ".join(i.text + (f" ({i.check_note})" if i.check_note else "") for i in wrong)
+                self.telegram.queue(f"⚠ {shift.user_name or 'Сотрудник'} принял(а) смену: у {prev.user_name or 'прошлой смены'} "
+                                    "отмечено сделанным, но не сделано:\n• "
+                                    + "\n• ".join(i.text + (f" — {i.check_note}" if i.check_note else "")
+                                                   for i in wrong), key=f"duty_check:{shift.id}")
+                self.db.log_action(self.user, "Обязанности не подтверждены",
+                                   f"смена {prev.user_name or '—'} {prev.day:%d.%m}: {details}")
         handover = self.db.handover_difference(shift)
         if telegram.settings()["on_start"] or handover:
             prev = self.db.previous_shift(shift)

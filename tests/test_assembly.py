@@ -391,3 +391,37 @@ def test_weekly_count_falls_on_someone_on_shift(window, monkeypatch):
     w.open_weekly_count()
     assert db.weekly_count(week).done_at is not None and db.stock_of(rose) == 4 and not w.count_btn.isVisibleTo(w)
     assert any("недостача 80" in text for text, _ in w.queued)
+
+
+def test_next_shift_confirms_duties(window, monkeypatch):
+    """Принимающий смену подтверждает обязанности прошлой: «не сделано» — администраторам и в историю."""
+    from app.shift_dialogs import StartShiftDialog
+    w, db = window, window.db
+    now = datetime.now()
+    olga = db.add_user("olga", "Ольга", "1")
+    db.save_duties([(None, "Помыть вёдра"), (None, "Протереть витрину"), (None, "Вынести мусор")])
+    buckets, showcase, trash = db.duties()
+    prev = db.open_shift(olga.id, 0, now - timedelta(hours=3), mw.shift_change())
+    db.set_duty_done(prev.id, buckets.id, buckets.text, True, now - timedelta(hours=2))
+    db.set_duty_done(prev.id, showcase.id, showcase.text, True, now - timedelta(hours=2))
+    db.close_shift(prev.id, now - timedelta(hours=1), 0, 0, 0)
+
+    dlg = StartShiftDialog(w, db, w.user, mw.shift_change())
+    assert [item.text for item, *_ in dlg.checks] == ["Помыть вёдра", "Протереть витрину"]  # мусор не отмечали
+    warned = []
+    monkeypatch.setattr(QMessageBox, "warning", lambda *a, **k: warned.append(a[2]))
+    dlg.cash_box.setValue(0)
+    dlg.accept()  # не ответил по обязанностям — смену не начать
+    assert dlg.shift is None and "Помыть вёдра" in warned[0]
+    dlg.checks[0][1].button(1).setChecked(True)
+    dlg.checks[1][1].button(0).setChecked(True)
+    dlg.checks[1][2].setText("в разводах")
+    dlg.accept()
+    assert dlg.shift is not None
+    checked = {i.text: i for i in db.checklist(db.get_shift(prev.id))}
+    assert checked["Помыть вёдра"].check == "ok" and checked["Протереть витрину"].check == "no"
+    assert checked["Протереть витрину"].check_note == "в разводах" and checked["Протереть витрину"].checked_by == "Анна"
+
+    w._after_shift_started(dlg.shift)
+    text = next(t for t, key in w.queued if key == f"duty_check:{dlg.shift.id}")
+    assert "Ольга" in text and "Протереть витрину — в разводах" in text and "Помыть вёдра" not in text

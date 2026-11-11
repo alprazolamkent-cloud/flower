@@ -137,6 +137,9 @@ class ChecklistItem:
     duty_id: int
     text: str
     done_at: datetime | None
+    check: str = ""  # что сказал принявший смену: "ok" — правда сделано, "no" — не сделано, "" — не проверял
+    check_note: str = ""  # что не так (если «не сделано»)
+    checked_by: str = ""  # кто принимал смену
 
     @property
     def done(self) -> bool:

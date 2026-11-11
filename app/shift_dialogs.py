@@ -9,7 +9,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QGridLayout, QGroupBox,
-    QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMessageBox, QPlainTextEdit, QPushButton,
+    QButtonGroup, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMessageBox, QPlainTextEdit, QPushButton, QRadioButton,
     QSpinBox, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
@@ -106,6 +106,35 @@ class StartShiftDialog(QDialog):
                                f"color: {C.note_fg}; padding: 6px")
             form.addRow(note)
 
+        # обязанности, которые прошлая смена отметила сделанными, — принимающий подтверждает, правда ли
+        self.checks: list[tuple] = []  # (пункт, группа «сделано / не сделано», что не так)
+        if self.prev is not None and self.prev.closed_at is not None and self.prev.user_id != user.id:
+            done = [i for i in db.checklist(self.prev) if i.done and not i.check]
+            if done:
+                box = QGroupBox(f"Проверьте за предыдущей сменой ({self.prev.user_name or '—'})")
+                rows = QGridLayout(box)
+                hint = QLabel("Это отметили сделанным. Посмотрите сами: правда сделано или отмечено для галочки?")
+                hint.setWordWrap(True)
+                rows.addWidget(hint, 0, 0, 1, 4)
+                for n, item in enumerate(done, start=1):
+                    text = QLabel(item.text)
+                    text.setWordWrap(True)
+                    yes, no = QRadioButton("✅ Сделано"), QRadioButton("❌ Не сделано")
+                    group = QButtonGroup(box)
+                    group.addButton(yes, 1)
+                    group.addButton(no, 0)
+                    why = QLineEdit()
+                    why.setPlaceholderText("что не так")
+                    why.setEnabled(False)
+                    no.toggled.connect(why.setEnabled)
+                    rows.addWidget(text, n, 0)
+                    rows.addWidget(yes, n, 1)
+                    rows.addWidget(no, n, 2)
+                    rows.addWidget(why, n, 3)
+                    self.checks.append((item, group, why))
+                rows.setColumnStretch(0, 1)
+                form.addRow(box)
+
         self.cash_box = count_box()
         self.cash_box.valueChanged.connect(self._update)
         form.addRow("Пересчитайте наличные в кассе:", self.cash_box)
@@ -130,6 +159,11 @@ class StartShiftDialog(QDialog):
 
     def accept(self):
         cash = self.cash_box.value()
+        unanswered = [item.text for item, group, _ in self.checks if group.checkedId() < 0]
+        if unanswered:
+            QMessageBox.warning(self, "Обязанности", "Отметьте по каждой обязанности прошлой смены: сделано или нет.\n\n"
+                                "Не отмечено: " + ", ".join(unanswered))
+            return
         if cash < 0:
             QMessageBox.warning(self, "Касса", "Пересчитайте наличные и введите сумму.")
             return
@@ -145,6 +179,9 @@ class StartShiftDialog(QDialog):
             if answer != QMessageBox.Yes:
                 return
         self.shift = self.db.open_shift(self.user.id, cash, datetime.now(), self.change)
+        now, name = datetime.now(), self.user.name or self.user.login
+        for item, group, why in self.checks:
+            self.db.check_duty(self.prev.id, item.duty_id, group.checkedId() == 1, why.text(), name, now)
         super().accept()
 
 
@@ -637,11 +674,18 @@ class CabinetDialog(QDialog):
                         who, when = waters[s.day]
                         item.setToolTip(f"Отметил(а) {who or '—'} {when:%d.%m %H:%M}")
                 if col == C_DUTIES and s.duties_total:
-                    missed = [i.text for i in self.db.checklist(s) if not i.done]
+                    duties = self.db.checklist(s)
+                    missed = [i.text for i in duties if not i.done]
+                    wrong = [i for i in duties if i.done and i.check == "no"]  # отметили, а принявший не подтвердил
+                    if wrong:
+                        item.setText(item.text() + " ⚠")
                     if closed:
-                        item.setForeground(QColor(C.red if missed else C.green))
-                    if missed:
-                        item.setToolTip("Не сделано: " + ", ".join(missed))
+                        item.setForeground(QColor(C.red if missed or wrong else C.green))
+                    tips = (["Не сделано: " + ", ".join(missed)] if missed else []) + [
+                        f"Отмечено, но {i.checked_by or 'принявший'} не подтвердил(а): {i.text}"
+                        + (f" — {i.check_note}" if i.check_note else "") for i in wrong]
+                    if tips:
+                        item.setToolTip("\n".join(tips))
                 if col == C_PENALTY and shift_penalties.get(s.id):
                     item.setForeground(QColor(C.red))
                     item.setToolTip("\n".join(f"{p.title}: −{money(p.amount)} ({p.created_by or '—'}, "

@@ -612,7 +612,9 @@ def cmd_duties(ctx: BotContext, args: str) -> str:
     if not items:
         return "Обязанности не заданы."
     lines = [f"📋 Обязанности смены {s.day:%d.%m} ({_name(s.user_name)}): {sum(i.done for i in items)} из {len(items)}"]
-    lines += [f"{'✅' if i.done else '❌'} {i.text}" for i in items]
+    lines += [f"{'⚠' if i.check == 'no' else '✅' if i.done else '❌'} {i.text}"
+              + (f" — отмечено, но {_name(i.checked_by)} не подтвердил(а)" + (f": {i.check_note}" if i.check_note else "")
+                 if i.check == "no" else "") for i in items]
     return "\n".join(lines)
 
 

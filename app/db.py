@@ -300,6 +300,13 @@ SHIFT_MIGRATIONS = {
     for column in ("revenue", "flowers", "terminal", "qr", "deliveries", "writeoff")
 }
 
+DUTY_MIGRATIONS = {  # проверка обязанностей тем, кто принимает смену
+    "checked": "ALTER TABLE shift_duties ADD COLUMN checked TEXT NOT NULL DEFAULT ''",
+    "check_note": "ALTER TABLE shift_duties ADD COLUMN check_note TEXT NOT NULL DEFAULT ''",
+    "checked_by": "ALTER TABLE shift_duties ADD COLUMN checked_by TEXT NOT NULL DEFAULT ''",
+    "checked_at": "ALTER TABLE shift_duties ADD COLUMN checked_at TEXT",
+}
+
 SHOWCASE_MIGRATIONS = {
     "single": "ALTER TABLE showcase ADD COLUMN single INTEGER NOT NULL DEFAULT 0",
     "recipe_id": "ALTER TABLE showcase ADD COLUMN recipe_id INTEGER",
@@ -894,6 +901,10 @@ class Database(ClientStore, StockStore):
         for column, sql in SHIFT_MIGRATIONS.items():
             if column not in existing:
                 self.conn.execute(sql)
+        existing = {r[1] for r in self.conn.execute("PRAGMA table_info(shift_duties)")}
+        for column, sql in DUTY_MIGRATIONS.items():
+            if column not in existing:
+                self.conn.execute(sql)
         existing = {r[1] for r in self.conn.execute("PRAGMA table_info(showcase)")}
         for column, sql in SHOWCASE_MIGRATIONS.items():
             if column not in existing:
@@ -1368,17 +1379,26 @@ class Database(ClientStore, StockStore):
 
     def checklist(self, shift: Shift) -> list[ChecklistItem]:
         """Обязанности смены: у идущей — текущий список, у сданной — каким он был при сдаче."""
+        checks = ", COALESCE(sd.checked, ''), COALESCE(sd.check_note, ''), COALESCE(sd.checked_by, '')"
         if shift.closed_at is None:
             rows = self.conn.execute(
-                "SELECT d.id, d.text, sd.done_at FROM duties d LEFT JOIN shift_duties sd"
+                "SELECT d.id, d.text, sd.done_at" + checks + " FROM duties d LEFT JOIN shift_duties sd"
                 " ON sd.duty_id = d.id AND sd.shift_id = ? WHERE d.active = 1 ORDER BY d.position, d.id",
                 (shift.id,)).fetchall()
         else:
             rows = self.conn.execute(
-                "SELECT sd.duty_id, sd.text, sd.done_at FROM shift_duties sd LEFT JOIN duties d"
+                "SELECT sd.duty_id, sd.text, sd.done_at" + checks + " FROM shift_duties sd LEFT JOIN duties d"
                 " ON d.id = sd.duty_id WHERE sd.shift_id = ? ORDER BY COALESCE(d.position, 0), sd.duty_id",
                 (shift.id,)).fetchall()
-        return [ChecklistItem(r[0], r[1], datetime.fromisoformat(r[2]) if r[2] else None) for r in rows]
+        return [ChecklistItem(r[0], r[1], datetime.fromisoformat(r[2]) if r[2] else None, r[3], r[4], r[5])
+                for r in rows]
+
+    def check_duty(self, shift_id: int, duty_id: int, ok: bool, note: str, by_name: str, now: datetime):
+        """Принимающий смену подтвердил («правда сделано») или нет то, что отметила прошлая смена."""
+        self.conn.execute("UPDATE shift_duties SET checked = ?, check_note = ?, checked_by = ?, checked_at = ?"
+                          " WHERE shift_id = ? AND duty_id = ?",
+                          ("ok" if ok else "no", note.strip(), by_name, _ts(now), shift_id, duty_id))
+        self.conn.commit()
 
     def set_duty_done(self, shift_id: int, duty_id: int, text: str, done: bool, now: datetime):
         self.conn.execute(
