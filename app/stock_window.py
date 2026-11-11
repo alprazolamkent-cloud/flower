@@ -8,12 +8,13 @@ import os
 import tempfile
 from datetime import date, datetime, timedelta
 
-from PySide6.QtCore import QRectF, Qt, QTimer, QUrl
+from PySide6.QtCore import QAbstractTableModel, QModelIndex, QRectF, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QColor, QDesktopServices, QFont, QKeySequence, QPainter, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QButtonGroup, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFileDialog,
     QFormLayout, QFrame, QGridLayout, QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit, QMenu, QMessageBox,
-    QPushButton, QRadioButton, QScrollArea, QSpinBox, QTableWidget, QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget,
+    QPushButton, QRadioButton, QScrollArea, QSpinBox, QStyledItemDelegate, QTableView, QTableWidget, QTableWidgetItem,
+    QTabWidget, QVBoxLayout, QWidget,
 )
 
 from . import stock_import
@@ -78,14 +79,134 @@ def delta_text(now: float, before: float, money_like: bool = True) -> tuple[str,
     return f"{'▲' if change > 0 else '▼'} {abs(change):.0f} % к прошлому периоду", C.green if good else C.red
 
 
+_READ_ONLY = Qt.ItemIsSelectable | Qt.ItemIsEnabled
+_RIGHT = Qt.AlignRight | Qt.AlignVCenter
+
+
 def _item(text: str, data=None, align_right: bool = False) -> QTableWidgetItem:
     item = QTableWidgetItem(text)
-    item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+    item.setFlags(_READ_ONLY)
     if data is not None:
         item.setData(Qt.UserRole, data)
     if align_right:
-        item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        item.setTextAlignment(_RIGHT)
     return item
+
+
+SUPPLY_PREVIEW = 8  # сколько позиций поставки показать в таблице, остальное — двойным щелчком
+
+
+class Row:
+    """Строка быстрой таблицы: тексты клеток, что за запись (id), цвета и подсказки по колонкам."""
+    __slots__ = ("cells", "data", "colors", "tips")
+
+    def __init__(self, cells: list[str], data=None, colors: dict | None = None, tips: dict | None = None):
+        self.cells, self.data, self.colors, self.tips = cells, data, colors or {}, tips or {}
+
+
+_DISPLAY, _USER, _ALIGN, _FOREGROUND, _TOOLTIP = (int(r.value) for r in (
+    Qt.DisplayRole, Qt.UserRole, Qt.TextAlignmentRole, Qt.ForegroundRole, Qt.ToolTipRole))
+_ROLES = frozenset((_DISPLAY, _USER, _ALIGN, _FOREGROUND, _TOOLTIP))
+
+
+class _RowsModel(QAbstractTableModel):
+    def __init__(self, headers: list[str], right_from: int):
+        super().__init__()
+        self.headers, self.right_from, self.rows = headers, right_from, []
+        self._brushes: dict[str, QColor] = {}
+
+    def rowCount(self, parent=QModelIndex()):  # noqa: N802 — имена из Qt
+        return 0 if parent.isValid() else len(self.rows)
+
+    def columnCount(self, parent=QModelIndex()):  # noqa: N802
+        return 0 if parent.isValid() else len(self.headers)
+
+    def headerData(self, section, orientation, role=Qt.DisplayRole):  # noqa: N802
+        if role == Qt.DisplayRole and orientation == Qt.Horizontal:
+            return self.headers[section]
+        return None
+
+    def data(self, index, role=0):
+        role = int(getattr(role, "value", role))  # Qt зовёт это тысячи раз — сравниваем числа, а не перечисления
+        if role not in _ROLES:
+            return None
+        row = self.rows[index.row()]
+        col = index.column()
+        if role == _DISPLAY:
+            return row.cells[col]
+        if role == _USER:
+            return row.data
+        if role == _ALIGN:
+            return _RIGHT if col >= self.right_from else None
+        if role == _FOREGROUND:
+            color = row.colors.get(col)
+            return None if color is None else self._brushes.setdefault(color, QColor(color))
+        return row.tips.get(col)  # подсказка
+
+
+class _Cell:
+    """Клетка быстрой таблицы — как QTableWidgetItem: text() и data(роль)."""
+
+    def __init__(self, model: _RowsModel, row: int, col: int):
+        self.model, self.index = model, model.index(row, col)
+
+    def text(self) -> str:
+        return self.model.data(self.index)
+
+    def data(self, role):
+        return self.model.data(self.index, role)
+
+    def foreground(self):
+        return self.model.data(self.index, Qt.ForegroundRole)
+
+
+class DataTable(QTableView):
+    """Таблица на тысячи строк: данные лежат в модели, а не по объекту на клетку, — и открывается, и
+    ищется, и прокручивается сразу. Ширина колонок считается по первым строкам, а не по всем."""
+    itemDoubleClicked = Signal(object)
+
+    def __init__(self, headers: list[str], stretch: int = 0, right_from: int = 2, wrap: bool = False):
+        super().__init__()
+        self._model = _RowsModel(headers, right_from)
+        self.setModel(self._model)
+        self.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.verticalHeader().setVisible(False)
+        self.setWordWrap(wrap)
+        header = self.horizontalHeader()
+        header.setResizeContentsPrecision(60)
+        for col in range(len(headers)):
+            header.setSectionResizeMode(col, QHeaderView.Stretch if col == stretch else QHeaderView.ResizeToContents)
+        if wrap:  # высота строк по тексту — тоже только по видимым
+            self.verticalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+            self.verticalHeader().setResizeContentsPrecision(1)
+        self.doubleClicked.connect(self._double_clicked)
+
+    def _double_clicked(self, index):
+        self.itemDoubleClicked.emit(_Cell(self._model, index.row(), index.column()))
+
+    def set_rows(self, rows: list[Row], select=None):
+        """Заменить строки; select — id записи, которую снова выделить."""
+        self._model.beginResetModel()
+        self._model.rows = rows
+        self._model.endResetModel()
+        if select is not None:
+            for i, row in enumerate(rows):
+                if row.data == select:
+                    self.selectRow(i)
+                    self.scrollTo(self._model.index(i, 0))
+                    break
+
+    def rowCount(self) -> int:  # noqa: N802 — как у QTableWidget
+        return len(self._model.rows)
+
+    def item(self, row: int, col: int) -> _Cell | None:
+        return _Cell(self._model, row, col) if 0 <= row < len(self._model.rows) else None
+
+    def currentRow(self) -> int:  # noqa: N802
+        rows = self.selectionModel().selectedRows()
+        return rows[0].row() if rows else -1
 
 
 def _table(headers: list[str], stretch: int = 0) -> QTableWidget:
@@ -1109,6 +1230,82 @@ class DisassembleDialog(QDialog):
             self.table.item(i, 3).setText(qty_text(max(total - box.value(), 0)))
 
 
+class _CheckCell:
+    """Флажок-клетка таблицы (без отдельного QCheckBox на строку — их тысячи)."""
+
+    def __init__(self, item: QTableWidgetItem):
+        self.item = item
+
+    def isChecked(self) -> bool:  # noqa: N802 — как у QCheckBox
+        return self.item.checkState() == Qt.Checked
+
+    def setChecked(self, on: bool):  # noqa: N802
+        self.item.setCheckState(Qt.Checked if on else Qt.Unchecked)
+
+
+class _TextCell:
+    def __init__(self, item: QTableWidgetItem):
+        self.item = item
+
+    def text(self) -> str:
+        return self.item.text()
+
+    def setText(self, text: str):  # noqa: N802
+        self.item.setText(text)
+
+
+_VALUE = Qt.UserRole + 1  # число в клетке; показывается текстом с единицей
+
+
+class _NumberCell:
+    """Число-клетка вместо счётчика на строку: value() / setValue() как у QSpinBox; −1 — пусто."""
+
+    def __init__(self, item: QTableWidgetItem, fmt, empty: str = "—", read_only: bool = False):
+        self.item, self.fmt, self.empty, self.read_only = item, fmt, empty, read_only
+        item.setTextAlignment(_RIGHT)
+        item.setFlags(_READ_ONLY if read_only else _READ_ONLY | Qt.ItemIsEditable)
+
+    def value(self) -> float:
+        v = self.item.data(_VALUE)
+        return -1 if v is None else v
+
+    def setValue(self, v):  # noqa: N802
+        if v is None or v < 0:
+            self.item.setData(_VALUE, None)
+            self.item.setText(self.empty)
+        else:
+            self.item.setData(_VALUE, v)
+            self.item.setText(self.fmt(v))
+
+    def isReadOnly(self) -> bool:  # noqa: N802
+        return self.read_only
+
+
+class _SpinDelegate(QStyledItemDelegate):
+    """Правка числа в клетке счётчиком — счётчик живёт, только пока правят одну клетку."""
+
+    def __init__(self, parent, cells: list, minimum: float, maximum: float, decimals=lambda row: 0):
+        super().__init__(parent)
+        self.cells, self.minimum, self.maximum, self.decimals = cells, minimum, maximum, decimals
+
+    def createEditor(self, parent, option, index):  # noqa: N802 — имена из Qt
+        decimals = self.decimals(index.row())
+        box = QDoubleSpinBox(parent) if decimals else QSpinBox(parent)
+        if decimals:
+            box.setDecimals(decimals)
+        box.setRange(self.minimum, self.maximum)
+        return box
+
+    def setEditorData(self, editor, index):  # noqa: N802
+        v = self.cells[index.row()].value()
+        editor.setValue(v if v >= 0 else max(self.minimum, 0))
+        editor.selectAll()
+
+    def setModelData(self, editor, model, index):  # noqa: N802
+        editor.interpretText()
+        self.cells[index.row()].setValue(editor.value())
+
+
 class LabelsDialog(QDialog):
     """Этикетки со штрихкодами: отметить товары и букеты, сколько штук, с ценой или без — печать из браузера."""
 
@@ -1143,31 +1340,40 @@ class LabelsDialog(QDialog):
         self.items += [("product", p.id, p.name, p.price, p.barcode, p.label_text or short_label(p.name))
                        for p in db.products()]
         self.table = _table(["", "Что", "Подпись сверху", "Цена", "Штрихкод", "Сколько этикеток"], stretch=1)
-        self.table.setRowCount(len(self.items))
+        self.table.setEditTriggers(QAbstractItemView.DoubleClicked | QAbstractItemView.SelectedClicked
+                                   | QAbstractItemView.EditKeyPressed | QAbstractItemView.AnyKeyPressed)
         self.checks, self.copies, self.tops = [], [], []
+        self.table.setItemDelegateForColumn(5, _SpinDelegate(self.table, self.copies, 1, 500))
+        self.table.setToolTip("Подпись сверху и сколько этикеток — двойной щелчок по клетке, чтобы поправить")
+        self.table.setUpdatesEnabled(False)
+        self.table.blockSignals(True)
+        self.table.setRowCount(len(self.items))
+        editable = Qt.ItemIsSelectable | Qt.ItemIsEnabled | Qt.ItemIsEditable
+        gray = QColor(C.gray)
         for i, (k, item_id, title, price, codes, top) in enumerate(self.items):
-            check = QCheckBox()
-            check.setChecked(k == kind and item_id == ident)
-            check.toggled.connect(self._update)
-            self.table.setCellWidget(i, 0, check)
+            check = QTableWidgetItem()
+            check.setFlags(Qt.ItemIsSelectable | Qt.ItemIsEnabled | Qt.ItemIsUserCheckable)
+            check.setCheckState(Qt.Checked if k == kind and item_id == ident else Qt.Unchecked)
+            self.table.setItem(i, 0, check)
             self.table.setItem(i, 1, _item(title))
-            top_edit = QLineEdit(top)
-            top_edit.setPlaceholderText("мелко сверху, например н15")
-            top_edit.setMaxLength(60)
-            self.table.setCellWidget(i, 2, top_edit)
+            top_item = QTableWidgetItem(top)
+            top_item.setFlags(editable)
+            self.table.setItem(i, 2, top_item)
             self.table.setItem(i, 3, _item(money(price), align_right=True))
             code = split_codes(codes)[0] if codes else ""
-            self.table.setItem(i, 4, _item(code or "— создастся свой", align_right=False))
+            code_item = _item(code or "— создастся свой")
             if not code:
-                self.table.item(i, 4).setForeground(QColor(C.gray))
-            box = QSpinBox()
-            box.setRange(1, 500)
-            box.setSuffix(" шт")
-            box.valueChanged.connect(self._update)
-            self.table.setCellWidget(i, 5, box)
-            self.checks.append(check)
-            self.copies.append(box)
-            self.tops.append(top_edit)
+                code_item.setForeground(gray)
+            self.table.setItem(i, 4, code_item)
+            count = _NumberCell(QTableWidgetItem(), lambda v: f"{v:g} шт")
+            count.setValue(1)
+            self.table.setItem(i, 5, count.item)
+            self.checks.append(_CheckCell(check))
+            self.copies.append(count)
+            self.tops.append(_TextCell(top_item))
+        self.table.blockSignals(False)
+        self.table.setUpdatesEnabled(True)
+        self.table.itemChanged.connect(self._item_changed)
         layout.addWidget(self.table, 1)
         options = QHBoxLayout()
         self.layout_box = QComboBox()
@@ -1279,10 +1485,18 @@ class LabelsDialog(QDialog):
                 (self.only_new.isChecked() and bool(codes))
             self.table.setRowHidden(i, hidden)
 
+    def _item_changed(self, item):
+        if item.column() in (0, 5):
+            self._update()
+
     def _mark_shown(self):
+        self.table.blockSignals(True)  # тысячи галочек — пересчитать итог один раз в конце
         for i, check in enumerate(self.checks):
             if not self.table.isRowHidden(i):
                 check.setChecked(True)
+        self.table.blockSignals(False)
+        self.table.viewport().update()
+        self._update()
 
     def _update(self):
         marked = [i for i, c in enumerate(self.checks) if c.isChecked()]
@@ -1496,30 +1710,32 @@ class InventoryDialog(QDialog):
             layout.addWidget(self.scan_note)
             QTimer.singleShot(0, self.scan_edit.setFocus)
         else:
-            layout.addWidget(_gray("Впишите, сколько на самом деле. Не пересчитывали — оставьте пусто: "
-                                   "этот товар не тронется."))
+            layout.addWidget(_gray("Сколько на самом деле: щёлкните клетку «На самом деле» и наберите число, Enter. "
+                                   "Не пересчитывали — оставьте «—»: этот товар не тронется."))
         self.table = _table(["Товар", "Раздел", "По программе", "На самом деле", "Разница"])
+        self.boxes: list[_NumberCell] = []
+        if not scan_only:  # вписать — двойной щелчок или просто начать печатать цифры в клетке
+            self.table.setEditTriggers(QAbstractItemView.DoubleClicked | QAbstractItemView.SelectedClicked
+                                       | QAbstractItemView.EditKeyPressed | QAbstractItemView.AnyKeyPressed)
+            self.table.setItemDelegateForColumn(3, _SpinDelegate(
+                self.table, self.boxes, 0, 1_000_000, lambda row: 0 if self.products[row].unit == "шт" else 2))
+        self.table.setUpdatesEnabled(False)
+        self.table.blockSignals(True)
         self.table.setRowCount(len(products))
-        self.boxes = []
         for i, p in enumerate(products):
             self.table.setItem(i, 0, _item(p.name))
             self.table.setItem(i, 1, _item(p.category))
             self.table.setItem(i, 2, _item(f"{qty_text(p.stock)} {p.unit}", align_right=True))
-            box = QDoubleSpinBox()
-            box.setRange(-1, 1_000_000)
-            box.setDecimals(0 if p.unit == "шт" else 2)
-            box.setSpecialValueText("—")  # −1 — не пересчитывали
+            # «—» — не пересчитывали; только сканером — вписать руками нельзя
+            empty = ("— сканируйте" if p.barcode else "— нет штрихкода") if scan_only else "—"
+            box = _NumberCell(QTableWidgetItem(), lambda v, unit=p.unit: f"{qty_text(v)} {unit}", empty, scan_only)
             box.setValue(-1)
-            box.setSuffix(f" {p.unit}")
-            box.valueChanged.connect(self._update)
-            if scan_only:  # количество — только сканами, вписать руками нельзя
-                box.setReadOnly(True)
-                box.setProperty("small", True)  # без стрелок (NoButtons под стилем схлопывает поле)
-                box.setFocusPolicy(Qt.NoFocus)
-                box.setSpecialValueText("— сканируйте" if p.barcode else "— нет штрихкода")
-            self.table.setCellWidget(i, 3, box)
+            self.table.setItem(i, 3, box.item)
             self.table.setItem(i, 4, _item("", align_right=True))
             self.boxes.append(box)
+        self.table.blockSignals(False)
+        self.table.setUpdatesEnabled(True)
+        self.table.itemChanged.connect(self._item_changed)
         layout.addWidget(self.table, 1)
         self.total = QLabel()
         layout.addWidget(self.total)
@@ -1532,6 +1748,10 @@ class InventoryDialog(QDialog):
                                        "(«🏷 Этикетки» → «Только без штрихкода»)."))
         layout.addWidget(_buttons(self, "Записать пересчёт"))
         self._update()
+
+    def _item_changed(self, item):
+        if item.column() == 3:
+            self._update()
 
     def _undo(self):
         if not self.history:
@@ -1590,16 +1810,21 @@ class InventoryDialog(QDialog):
 
     def _update(self):
         counted = money_diff = 0
+        self.table.blockSignals(True)  # пишем «Разницу» — это не правка количества
         for i, (p, box) in enumerate(zip(self.products, self.boxes)):
             item = self.table.item(i, 4)
-            if box.value() < 0:
-                item.setText("")
+            value = box.value()
+            if value < 0:
+                if item.text():
+                    item.setText("")
                 continue
             counted += 1
-            diff = box.value() - p.stock
+            diff = value - p.stock
             money_diff += diff * p.avg_cost
             item.setText(("+" if diff > 0 else "") + qty_text(diff) if diff else "сошлось")
             item.setForeground(QColor(C.green if diff >= 0 else C.red))
+        self.table.blockSignals(False)
+        self.table.viewport().update()
         if self.weekly:
             self.total.setText(f"Отсканировано товаров: <b>{counted}</b> из "
                                f"{sum(1 for p in self.products if p.barcode)}")
@@ -1658,6 +1883,7 @@ class StockWindow(QDialog):
         self.setWindowTitle("Продажи и склад")
         self.setWindowIcon(flower_icon())
         self._photos: dict[tuple[str, int], QPixmap] = {}
+        self._fresh: dict[int, tuple] = {}  # вкладка → состояние базы, с которым её показали
         fit_to_screen(self, 1180, 720)
         layout = QVBoxLayout(self)
         self.tabs = QTabWidget()
@@ -1710,8 +1936,14 @@ class StockWindow(QDialog):
             widget.setVisible(self.admin)
         page = self.tabs.currentIndex()
         if page == 0:
-            self._photos.clear()  # фото могли поменять в «Остатках» / «Техкартах»
             self._update_scan_mode()
+        # вкладку не пересобираем, если в базе с прошлого раза ничего не менялось (переключение — мгновенно)
+        key = (self.db.conn.total_changes, self.admin, date.today())
+        if self._fresh.get(page) == key:
+            return
+        self._fresh[page] = key
+        if page == 0:
+            self._photos.clear()  # фото могли поменять в «Остатках» / «Техкартах»
             self._refresh_chips()
             self._refresh_catalog()
             self._refresh_today()
@@ -1873,13 +2105,19 @@ class StockWindow(QDialog):
             self.chips.buttons()[0].setChecked(True)
         self.chips_row.invalidate()
 
+    def _catalog_items(self) -> tuple[dict, dict]:
+        """Букеты и товары для плиток; пока в базе ничего не менялось — из памяти (поиск по буквам не ждёт базу)."""
+        key = self.db.conn.total_changes
+        if getattr(self, "_catalog_cache", (None,))[0] != key:
+            self._catalog_cache = (key, {r.id: r for r in self.db.recipes()}, {p.id: p for p in self.db.products()})
+        return self._catalog_cache[1], self._catalog_cache[2]
+
     def _refresh_catalog(self):
         query = self.search_edit.text().strip().lower()
         chip = self.chips.checkedButton().property("chip") if self.chips.checkedButton() else "all"
         if query:
             chip = "all"  # ищем везде
-        recipes = {r.id: r for r in self.db.recipes()}
-        products = {p.id: p for p in self.db.products()}
+        recipes, products = self._catalog_items()
         if chip == "popular":
             keys = self.db.popular(datetime.now() - timedelta(days=30), 24)
         else:
@@ -2125,20 +2363,23 @@ class StockWindow(QDialog):
         self.stock_search = ScanEdit()
         self.stock_search.setPlaceholderText("🔍 Поиск товара…")
         self.stock_search.setClearButtonEnabled(True)
-        self.stock_search.textChanged.connect(self._refresh_stock)
+        self._stock_timer = QTimer(self, singleShot=True, interval=200)  # фильтруем, когда допечатали
+        self._stock_timer.timeout.connect(self._fill_stock)
+        self.stock_search.textChanged.connect(self._stock_timer.start)
         filters.addWidget(self.stock_search, 1)
         self.category_filter = QComboBox()
         self.category_filter.addItem("Все разделы", "")
         for c in CATEGORIES:
             self.category_filter.addItem(c, c)
-        self.category_filter.currentIndexChanged.connect(self._refresh_stock)
+        self.category_filter.currentIndexChanged.connect(self._fill_stock)
         filters.addWidget(self.category_filter)
         self.low_only = QCheckBox("Только заканчивается")
-        self.low_only.toggled.connect(self._refresh_stock)
+        self.low_only.toggled.connect(self._fill_stock)
         filters.addWidget(self.low_only)
         layout.addLayout(filters)
-        self.stock_table = _table(["Товар", "Раздел", "Остаток", "Цена", "Себестоимость", "Мало, если ≤"])
-        self.stock_table.itemDoubleClicked.connect(lambda _: self._edit_product() if self.admin else self._history())
+        self.stock_table = DataTable(["Товар", "Раздел", "Остаток", "Цена", "Себестоимость", "Мало, если ≤"])
+        self._stock_products: list[Product] = []
+        self.stock_table.itemDoubleClicked.connect(self._stock_double_clicked)
         layout.addWidget(self.stock_table, 1)
         buttons_box = flow_policy(QWidget())
         buttons = FlowLayout(buttons_box)
@@ -2180,34 +2421,46 @@ class StockWindow(QDialog):
         layout.addWidget(self.stock_summary)
         return page
 
+    def _stock_double_clicked(self, _cell):
+        if self.admin:
+            self._edit_product()
+        else:
+            self._history()
+
     def _refresh_stock(self):
-        query = self.stock_search.text().strip().lower()
-        category = self.category_filter.currentData()
-        products = [p for p in self.db.products()
-                    if query in p.name.lower() and (not category or p.category == category)
-                    and (p.low or not self.low_only.isChecked())]
-        selected = self._selected_product_id()
-        self.stock_table.setRowCount(len(products))
-        for i, p in enumerate(products):
-            cells = [p.name, p.category, f"{qty_text(p.stock)} {p.unit}", money(p.price),
-                     money(round(p.avg_cost)) if self.admin and p.avg_cost else "—",
-                     f"{qty_text(p.min_stock)} {p.unit}" if p.min_stock else ""]
-            for col, text in enumerate(cells):
-                item = _item(text, p.id, align_right=col >= 2)
-                if col == 4 and self.admin and not p.avg_cost:
-                    item.setToolTip("Поставок с закупочной ценой не было — себестоимость неизвестна")
-                if p.low and col == 2:
-                    item.setForeground(QColor(C.red))
-                    item.setToolTip("Отрицательный остаток — значит, поставку не внесли" if p.stock < 0
-                                    else "Заканчивается — пора заказать")
-                self.stock_table.setItem(i, col, item)
-            if p.id == selected:
-                self.stock_table.selectRow(i)
-        low = sum(p.low for p in self.db.products())
+        """Перечитать склад из базы (после поставки, продажи…) и показать с текущими фильтрами."""
+        self._stock_products = self.db.products()
+        low = sum(p.low for p in self._stock_products)
         text = f"Заканчивается: <b style='color:{C.red if low else C.green}'>{low}</b>"
         if self.admin:
             text += f" · на складе на <b>{money(self.db.stock_value())}</b> (по себестоимости)"
         self.stock_summary.setText(text)
+        self._fill_stock()
+
+    def _fill_stock(self):
+        """Фильтр по уже загруженному списку — без базы, сразу."""
+        self._stock_timer.stop()
+        query = self.stock_search.text().strip().lower()
+        category = self.category_filter.currentData()
+        low_only = self.low_only.isChecked()
+        admin = self.admin
+        rows = []
+        for p in self._stock_products:
+            if (query and query not in p.name.lower() and query not in p.barcode) or \
+                    (category and p.category != category) or (low_only and not p.low):
+                continue
+            cells = [p.name, p.category, f"{qty_text(p.stock)} {p.unit}", money(p.price),
+                     money(round(p.avg_cost)) if admin and p.avg_cost else "—",
+                     f"{qty_text(p.min_stock)} {p.unit}" if p.min_stock else ""]
+            colors, tips = {}, {}
+            if admin and not p.avg_cost:
+                tips[4] = "Поставок с закупочной ценой не было — себестоимость неизвестна"
+            if p.low:
+                colors[2] = C.red
+                tips[2] = ("Отрицательный остаток — значит, поставку не внесли" if p.stock < 0
+                           else "Заканчивается — пора заказать")
+            rows.append(Row(cells, p.id, colors, tips))
+        self.stock_table.set_rows(rows, select=self._selected_product_id())
 
     def _selected_product_id(self) -> int | None:
         row = self.stock_table.currentRow()
@@ -2362,24 +2615,46 @@ class StockWindow(QDialog):
         self.supplies_summary.setWordWrap(True)
         top.addWidget(self.supplies_summary)
         layout.addLayout(top)
-        self.supplies_table = _table(["Когда", "Поставщик", "Что привезли", "Сумма", "Принял(а)"], stretch=2)
-        self.supplies_table.setWordWrap(True)
+        self.supplies_table = DataTable(["Когда", "Поставщик", "Что привезли", "Сумма", "Принял(а)"], stretch=2,
+                                        right_from=3, wrap=True)
+        self.supplies_table.itemDoubleClicked.connect(self._supply_details)
+        layout.addWidget(_gray("Двойной щелчок по поставке — весь список, что привезли."))
         layout.addWidget(self.supplies_table, 1)
         return page
 
     def _refresh_supplies(self):
         supplies = self.db.supplies()
-        self.supplies_table.setRowCount(len(supplies))
-        for i, s in enumerate(supplies):
-            what = ", ".join(f"{name} × {qty_text(qty)}" for name, qty, _ in s.lines)
-            cells = [f"{s.at:%d.%m.%Y %H:%M}", s.supplier or "—", what + (f"\n{s.note}" if s.note else ""),
-                     money(s.total), s.user_name]
-            for col, text in enumerate(cells):
-                self.supplies_table.setItem(i, col, _item(text, align_right=col == 3))
-        self.supplies_table.resizeRowsToContents()
+        self._supplies = {sp.id: sp for sp in supplies}
+        rows = []
+        for sp in supplies:
+            shown = ", ".join(f"{name} × {qty_text(qty)}" for name, qty, _ in sp.lines[:SUPPLY_PREVIEW])
+            more = len(sp.lines) - SUPPLY_PREVIEW
+            what = shown + (f"… и ещё {qty_text(more)} поз." if more > 0 else "")  # тысячи строк в клетке вешали окно
+            rows.append(Row([f"{sp.at:%d.%m.%Y %H:%M}", sp.supplier or "—", what + (f"\n{sp.note}" if sp.note else ""),
+                             money(sp.total), sp.user_name], sp.id))
+        self.supplies_table.set_rows(rows)
         month = date.today().replace(day=1)
         self.supplies_summary.setText(f"Поставок за {MONTHS[month.month - 1]}: "
                                       f"<b>{money(self.db.supplies_total(*day_range(month, date.today())))}</b>")
+
+    def _supply_details(self, cell):
+        sp = self._supplies.get(cell.data(Qt.UserRole))
+        if sp is None:
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"Поставка №{sp.id} — {sp.supplier or 'без поставщика'}")
+        fit_to_screen(dialog, 640, 560)
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(QLabel(f"{sp.at:%d.%m.%Y %H:%M} · позиций: <b>{len(sp.lines)}</b> · на "
+                                f"<b>{money(sp.total)}</b>" + (f"<br>{html.escape(sp.note)}" if sp.note else "")))
+        table = DataTable(["Товар", "Сколько", "Цена закупки", "Сумма"], stretch=0, right_from=1)
+        table.set_rows([Row([name, qty_text(qty), money(round(cost)) if cost else "—",
+                             money(round(qty * cost)) if cost else "—"]) for name, qty, cost in sp.lines])
+        layout.addWidget(table, 1)
+        close = QPushButton("Закрыть")
+        close.clicked.connect(dialog.accept)
+        layout.addWidget(close, 0, Qt.AlignRight)
+        dialog.exec()
 
     def _add_supply(self):
         if not self.db.products() and not self.admin:
@@ -2403,9 +2678,9 @@ class StockWindow(QDialog):
         layout.addWidget(_gray("Техкарта — из чего собирается букет. «💐 Собрать» — цветы и упаковка списываются "
                                "со склада сразу, букет встаёт на витрину (и в боты). Продали — со склада второй раз "
                                "не списывается. Не собирали заранее — спишется при продаже."))
-        self.recipes_table = _table(["Букет", "Состав", "Цена", "На витрине", "Себестоимость", "Наценка"], stretch=1)
-        self.recipes_table.setWordWrap(True)
-        self.recipes_table.itemDoubleClicked.connect(lambda _: self._edit_recipe() if self.admin else None)
+        self.recipes_table = DataTable(["Букет", "Состав", "Цена", "На витрине", "Себестоимость", "Наценка"], stretch=1,
+                                       wrap=True)
+        self.recipes_table.itemDoubleClicked.connect(self._recipe_double_clicked)
         layout.addWidget(self.recipes_table, 1)
         actions_box, admin_box = flow_policy(QWidget()), flow_policy(QWidget())
         buttons = FlowLayout(actions_box)
@@ -2440,28 +2715,39 @@ class StockWindow(QDialog):
         layout.addLayout(row)
         return page
 
+    def _recipe_double_clicked(self, _cell):
+        if self.admin:
+            self._edit_recipe()
+
     def _refresh_recipes(self):
         selected = self._selected_recipe_id()
         recipes = self.db.recipes()
-        self.recipes_table.setRowCount(len(recipes))
-        for i, r in enumerate(recipes):
-            cost = self.db.recipe_cost(r)
+        used = {pid for r in recipes for pid, _ in r.items}  # один запрос на все техкарты, а не на каждую
+        names = {p.id: p for p in self.db.products(active_only=False, ids=used)}
+        order = {c: i for i, c in enumerate(CATEGORIES)}
+        rows = []
+        for r in recipes:
+            cost = sum(q * names[pid].avg_cost for pid, q in r.items if pid in names)
             margin = 100 * (r.price - cost) / r.price if r.price else 0
-            parts = "\n".join(f"{group}: {', '.join(items)}" for group, items in self.db.composition(r))
+            groups: dict[str, list[str]] = {}
+            for pid, q in r.items:
+                p = names.get(pid)
+                if p is not None:
+                    unit = f" {p.unit}" if p.unit != "шт" else ""
+                    groups.setdefault(p.category, []).append(f"{p.name} × {qty_text(q)}{unit}")
+            parts = "\n".join(f"{g}: {', '.join(items)}"
+                               for g, items in sorted(groups.items(), key=lambda g: order.get(g[0], len(order))))
             reserved = self.db.reserved_of(r.id)
             ready = qty_text(r.ready) + (f" (заказано в боте: {reserved})" if reserved else "") if r.ready else "—"
             cells = [r.title + ("" if r.in_bot else "\n(не в боте)"), parts, money(r.price), ready,
                      money(round(cost)) if self.admin else "—", f"{margin:.0f} %" if self.admin else "—"]
-            for col, text in enumerate(cells):
-                item = _item(text, r.id, align_right=col >= 2)
-                if col == 3 and r.ready:
-                    item.setForeground(QColor(C.green))
-                if col == 5 and self.admin:
-                    item.setForeground(QColor(C.green if margin >= 50 else C.orange if margin >= 30 else C.red))
-                self.recipes_table.setItem(i, col, item)
-            if r.id == selected:
-                self.recipes_table.selectRow(i)
-        self.recipes_table.resizeRowsToContents()
+            colors = {}
+            if r.ready:
+                colors[3] = C.green
+            if self.admin:
+                colors[5] = C.green if margin >= 50 else C.orange if margin >= 30 else C.red
+            rows.append(Row(cells, r.id, colors))
+        self.recipes_table.set_rows(rows, select=selected)
 
     def _selected_recipe_id(self) -> int | None:
         row = self.recipes_table.currentRow()

@@ -8,6 +8,7 @@ from PySide6.QtWidgets import QDialog, QMessageBox, QWidget
 from app.db import Database
 from app.shift_dialogs import CloseShiftDialog
 from app.stock import Product, Recipe
+from app import stock_window
 from app.stock_window import StockWindow, delta_text, period_range, previous_range
 
 CH = time(8, 0)
@@ -353,3 +354,38 @@ def test_supply_with_new_product_and_scanned_code(main, db, monkeypatch):
     assert told and "администратора" in told[0] and staff.lines.lines() == []
     dlg.deleteLater()
     staff.deleteLater()
+
+
+def test_big_stock_stays_fast(main, db, monkeypatch):
+    """Склад на тысячи товаров: поставка из таблицы на сотни строк не пишется целиком в одну клетку (это вешало
+    окно), поиск фильтрует загруженный список, а переключение вкладок без изменений базу не перечитывает."""
+    ids = [db.save_product(Product(0, f"Товар {i}", "Цветы", price=100)) for i in range(300)]
+    db.add_supply("Загрузка из таблицы", [(p, 5, 10) for p in ids], None, datetime.now())
+    w = StockWindow(main)
+    w.tabs.setCurrentIndex(2)
+    first = w.supplies_table.item(0, 2).text()
+    assert "и ещё 292 поз." in first and len(first) < 400
+    shown = []
+    monkeypatch.setattr(QDialog, "exec", lambda self: shown.append(self.findChild(stock_window.DataTable).rowCount()))
+    w._supply_details(w.supplies_table.item(0, 2))
+    assert shown == [300]  # весь список — двойным щелчком
+
+    w.tabs.setCurrentIndex(1)
+    assert w.stock_table.rowCount() == 302
+    w.stock_search.setText("Товар 29")
+    w._fill_stock()  # поиск ждёт, пока допечатают
+    assert w.stock_table.rowCount() == 11  # «Товар 29» и 290–299
+    w.tabs.setCurrentIndex(3)
+    calls = []
+    real = db.products
+    monkeypatch.setattr(db, "products", lambda *a, **k: (calls.append(1), real(*a, **k))[1])
+    for i in (2, 1, 3, 0, 1):
+        w.tabs.setCurrentIndex(i)
+    assert calls == []  # ничего не меняли — вкладки не пересобирались
+    db.write_off(ids[0], 1, "Завяло", None, None, datetime.now())
+    w.tabs.setCurrentIndex(2)
+    w.tabs.setCurrentIndex(1)
+    w.stock_search.setText("Товар 0")
+    w._fill_stock()
+    assert calls and "4 шт" in next(w.stock_table.item(r, 2).text() for r in range(w.stock_table.rowCount())
+                                     if w.stock_table.item(r, 0).text() == "Товар 0")

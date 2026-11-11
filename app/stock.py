@@ -38,6 +38,7 @@ CREATE TABLE IF NOT EXISTS stock_moves (
 );
 CREATE INDEX IF NOT EXISTS idx_stock_moves_product ON stock_moves(product_id);
 CREATE INDEX IF NOT EXISTS idx_stock_moves_shift ON stock_moves(shift_id, kind);
+CREATE INDEX IF NOT EXISTS idx_stock_moves_ref ON stock_moves(kind, ref);
 CREATE TABLE IF NOT EXISTS supplies (
     id       INTEGER PRIMARY KEY AUTOINCREMENT,
     at       TEXT    NOT NULL,
@@ -375,19 +376,30 @@ class StockStore:
 
     # ----- товары -----
 
-    def products(self, active_only: bool = True) -> list[Product]:
+    def products(self, active_only: bool = True, ids=None) -> list[Product]:
+        """Товары с остатками и штрихкодами; ids — только эти (быстро, когда товаров тысячи)."""
         sql = ("SELECT p.id, p.name, p.category, p.unit, p.price, p.avg_cost, p.min_stock, p.active,"
                " COALESCE((SELECT SUM(m.qty) FROM stock_moves m WHERE m.product_id = p.id), 0),"
                " p.photo IS NOT NULL, COALESCE((SELECT GROUP_CONCAT(b.code, ', ') FROM barcodes b"
                " WHERE b.kind = 'product' AND b.ident = p.id), ''), p.label_text FROM products p")
+        where, args = [], []
         if active_only:
-            sql += " WHERE p.active = 1"
-        rows = self.conn.execute(sql + " ORDER BY p.category, p.name COLLATE NOCASE").fetchall()
+            where.append("p.active = 1")
+        if ids is not None:
+            ids = list(dict.fromkeys(int(i) for i in ids))
+            if not ids:
+                return []
+            where.append(f"p.id IN ({','.join('?' * len(ids))})")
+            args += ids
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        rows = self.conn.execute(sql + " ORDER BY p.category, p.name COLLATE NOCASE", args).fetchall()
         return [Product(r[0], r[1], r[2], r[3], r[4], r[5], r[6], bool(r[7]), round(r[8], 3), bool(r[9]), r[10],
                         r[11]) for r in rows]
 
     def get_product(self, product_id: int) -> Product | None:
-        return next((p for p in self.products(active_only=False) if p.id == product_id), None)
+        found = self.products(active_only=False, ids=[product_id])
+        return found[0] if found else None
 
     def save_product(self, p: Product) -> int:
         name = p.name.strip()
@@ -638,7 +650,7 @@ class StockStore:
 
     def composition(self, recipe: Recipe, flowers_only: bool = False) -> list[tuple[str, list[str]]]:
         """Состав по разделам: [(«Цветы», [«Роза пионовидная × 7», …]), («Зелень», …), …]."""
-        names = {p.id: p for p in self.products(active_only=False)}
+        names = {p.id: p for p in self.products(active_only=False, ids=[pid for pid, _ in recipe.items])}
         groups: dict[str, list[str]] = {}
         for pid, qty in recipe.items:
             p = names.get(pid)
@@ -771,7 +783,7 @@ class StockStore:
                 for pid, q in recipe.items:
                     if rest:
                         need[pid] = need.get(pid, 0) + q * rest
-        names = {p.id: p for p in self.products(active_only=False)}
+        names = {p.id: p for p in self.products(active_only=False, ids=need)}
         for pid, qty in need.items():
             p = names.get(pid)
             if p is not None and qty > p.stock:
