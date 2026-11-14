@@ -368,6 +368,8 @@ MIGRATIONS = {
 USER_MIGRATIONS = {
     "tg_chat": "ALTER TABLE users ADD COLUMN tg_chat TEXT NOT NULL DEFAULT ''",  # Telegram флориста в боте клиентов
     "tg_code": "ALTER TABLE users ADD COLUMN tg_code TEXT NOT NULL DEFAULT ''",  # код для привязки
+    # пароль временный (сброшен через Telegram) — при входе попросить свой
+    "must_change": "ALTER TABLE users ADD COLUMN must_change INTEGER NOT NULL DEFAULT 0",
 }
 
 COLUMNS = ("d.id, d.day, d.time, d.items, d.recipient, d.phone, d.address, d.price,"
@@ -1100,14 +1102,20 @@ class Database(ClientStore, StockStore):
             return User(row[0], row[1], row[2], bool(row[3]))
         return None
 
-    def set_password(self, user_id: int, password: str):
+    def set_password(self, user_id: int, password: str, temporary: bool = False):
+        """temporary — выдан через Telegram: при входе программа попросит придумать свой."""
         if not password:
             raise UserError("Введите пароль.")
         salt, digest = hash_password(password)
         self.conn.execute(
-            "UPDATE users SET salt=?, password_hash=? WHERE id=?", (salt, digest, user_id)
+            "UPDATE users SET salt=?, password_hash=?, must_change=? WHERE id=?",
+            (salt, digest, int(temporary), user_id)
         )
         self.conn.commit()
+
+    def must_change_password(self, user_id: int) -> bool:
+        row = self.conn.execute("SELECT must_change FROM users WHERE id=?", (user_id,)).fetchone()
+        return bool(row and row[0])
 
     def update_user(self, user_id: int, name: str, is_admin: bool):
         if not is_admin:

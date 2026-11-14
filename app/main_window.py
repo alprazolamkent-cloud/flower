@@ -498,6 +498,10 @@ class MainWindow(QMainWindow):
                 dlg = LoginDialog(self, self.db, self._on_shift_note())
             if dlg.exec() != QDialog.Accepted:
                 return False
+            if self.db.must_change_password(dlg.user.id):  # вошёл по временному паролю из Telegram
+                QMessageBox.information(self, "Новый пароль", "Вы вошли по временному паролю. Придумайте свой.")
+                if PasswordDialog(self, self.db, dlg.user, need_old=False).exec() != QDialog.Accepted:
+                    continue  # без своего пароля дальше не пускаем
             self.set_user(dlg.user)
             if self._shift_flow():
                 self.update_shift_box()

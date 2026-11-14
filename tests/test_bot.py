@@ -433,3 +433,25 @@ def test_morning_report_has_sales_when_stock_is_used(db):
     db.add_sale([CartLine("Кения", 2, 250, product_id=rose)], "cash", None, None, datetime(2026, 10, 19, 15, 0))
     text = report_text(report, ctx)
     assert "🛒 Продажи за вчерашнюю смену: 1 на 500 ₽" in text and "Заканчивается (1): Кения −2 шт" in text
+
+
+def test_forgot_password_via_telegram(db):
+    """Забыли пароль администратора: /пароль из чата администратора — «да» — временный пароль, при входе
+    программа попросит свой; без «да» ничего не меняется."""
+    import re
+    boss = db.add_user("boss", "Ольга", "secret", is_admin=True)
+    db.add_user("anna", "Анна", "1")
+    handler, logged = BotHandler(), []
+    ctx = make_ctx(db, audit=lambda action, details: logged.append((action, details)))
+    question = handler.handle("/пароль", ctx, chat="111")  # админ один — понятно, чей
+    assert "«boss»" in question and "да" in question and db.authenticate("boss", "secret") is not None
+    assert "Отменено" in handler.handle("нет", ctx, chat="111") and db.authenticate("boss", "secret") is not None
+    handler.handle("/password boss", ctx, chat="111")
+    assert handler.handle("да", ctx, chat="222") is None  # другой чат не подтверждает чужой вопрос
+    answer = handler.handle("да", ctx, chat="111")
+    temp = re.search(r"пароль: (\d{6})", answer)[1]
+    assert db.authenticate("boss", "secret") is None and db.authenticate("boss", temp) is not None
+    assert db.must_change_password(boss.id) and logged[-1][0] == "Пароль сброшен" and temp not in logged[-1][1]
+    db.set_password(boss.id, "новый")  # придумал свой — больше не просим
+    assert not db.must_change_password(boss.id)
+    assert "Такого сотрудника нет" in handler.handle("/пароль мария", ctx, chat="111")

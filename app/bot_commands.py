@@ -6,6 +6,7 @@
 
 import calendar
 import re
+import secrets
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta
@@ -45,6 +46,7 @@ MENU = [
     ("sales", "Продажи: сегодня, вчера, неделя, месяц — выручка, чек, топ"),
     ("stock", "Остатки: что заканчивается; /stock Кения — сколько осталось"),
     ("order", "Что заказать поставщику"),
+    ("password", "Забыли пароль: /password логин — временный пароль"),
 ]
 ALIASES = {
     "помощь": "help", "start": "help", "старт": "help", "команды": "help",
@@ -69,6 +71,7 @@ ALIASES = {
     "санкция": "sanction", "санкции": "penalties", "штрафы": "penalties", "fines": "penalties",
     "продажи": "sales", "продажа": "sales", "остатки": "stock", "склад": "stock", "остаток": "stock",
     "заказать": "order", "заказ": "order",
+    "пароль": "password", "сброс": "password",
     "да": "yes", "yes": "yes", "ок": "yes", "нет": "no", "no": "no", "отмена": "no", "cancel": "no",
 }
 ADJUSTMENTS = {"advance": ("Аванс", -1, "аванс"), "bonus": ("Премия", 1, "премия"), "fine": ("Штраф", -1, "штраф")}
@@ -210,7 +213,8 @@ def cmd_help(ctx: BotContext, args: str) -> str:
               "Записать: /аванс Анна 5000 на ремонт, /премия Анна 3000 за праздники, "
                   "/штраф Анна 500 разбила вазу — сначала спрошу «да / нет». Штраф записывается санкцией "
                   "за последнюю смену и считается в лимит для премии.",
-              "Объявление сотрудникам: напишите сообщение, начав с «!»."]
+              "Объявление сотрудникам: напишите сообщение, начав с «!».",
+              "Забыли пароль от программы: /пароль (или /пароль логин) — пришлю временный, при входе попросит новый."]
     return "\n".join(lines)
 
 
@@ -832,6 +836,7 @@ COMMANDS: dict[str, Callable[[BotContext, str], str]] = {
     "shifts": cmd_shifts, "staff": cmd_staff, "salary": cmd_salary, "problems": cmd_problems,
     "deliveries": cmd_deliveries, "water": cmd_water, "duties": cmd_duties, "ann": cmd_ann,
     "status": cmd_status, "backup": cmd_backup, "sales": cmd_sales, "stock": cmd_stock, "order": cmd_order,
+    "password": lambda ctx, args: "Сброс пароля переспрашивает «да / нет» — напишите /пароль ещё раз.",  # BotHandler
     "week": lambda ctx, args: cmd_revenue(ctx, "неделя"),
     "month": lambda ctx, args: cmd_revenue(ctx, "месяц"),
 }
@@ -863,6 +868,8 @@ class BotHandler:
             return self._answer(name == "yes", ctx, chat)
         if name in ADJUSTMENTS:
             return self._ask_adjustment(name, args, ctx, chat, author)
+        if name == "password":
+            return self._ask_password(args, ctx, chat, author)
         if name in COMMANDS:
             try:
                 return COMMANDS[name](ctx, args)
@@ -909,6 +916,34 @@ class BotHandler:
         return (f"Записать: {title.lower()} {user.name or user.login} {'+' if sign > 0 else '−'}{money(amount)} "
                 f"за {MONTHS[int(month[5:]) - 1]} («{reason}»)?\nОтветьте «да» или «нет» (действует 5 минут).")
 
+
+    def _ask_password(self, args: str, ctx: BotContext, chat: str, author: str) -> str:
+        """Забыли пароль: временный пароль в этот чат (бот слушает только чаты администраторов).
+        Войти с ним можно один раз — программа сразу попросит придумать свой."""
+        if args.strip():
+            user, error = find_user(ctx.db, args)
+            if user is None:
+                return error
+        else:
+            admins = [u for u in ctx.db.users() if u.is_admin]
+            if len(admins) != 1:
+                return "Чей пароль сбросить? Например: /пароль " + (admins[0].login if admins else "логин")
+            user = admins[0]
+        db = ctx.db
+        source = f"из Telegram: {author}" if author else "из Telegram"
+
+        def run() -> str:
+            temp = f"{secrets.randbelow(10 ** 6):06d}"
+            db.set_password(user.id, temp, temporary=True)
+            if ctx.audit:
+                ctx.audit("Пароль сброшен", f"сотрудник: {user.name or user.login} ({source})")
+            return (f"🔑 Временный пароль — логин: {user.login}, пароль: {temp}\n"
+                    "Войдите с ним — программа сразу попросит придумать свой. Потом удалите это сообщение.")
+
+        self.pending[chat] = Pending(ctx.now + CONFIRM_FOR, run)
+        return (f"Сбросить пароль для «{user.login}» ({user.name or '—'}"
+                f"{', администратор' if user.is_admin else ''})? Старый перестанет подходить, я пришлю временный.\n"
+                "Ответьте «да» или «нет» (действует 5 минут).")
 
     def _ask_fine(self, user: User, amount: int, reason: str, ctx: BotContext, chat: str) -> str:
         """/штраф — это санкция за последнюю смену сотрудника: идёт в лимит санкций для премии, её можно

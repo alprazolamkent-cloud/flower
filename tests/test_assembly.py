@@ -425,3 +425,35 @@ def test_next_shift_confirms_duties(window, monkeypatch):
     w._after_shift_started(dlg.shift)
     text = next(t for t, key in w.queued if key == f"duty_check:{dlg.shift.id}")
     assert "Ольга" in text and "Протереть витрину — в разводах" in text and "Помыть вёдра" not in text
+
+
+def test_temporary_password_must_be_changed_on_login(window, monkeypatch):
+    """Вошли по временному паролю из Telegram — сначала свой пароль, иначе обратно на вход."""
+    w, db = window, window.db
+    boss = db.add_user("boss", "Ольга", "x", is_admin=True)
+    db.set_password(boss.id, "123456", temporary=True)
+    logins, asked = [], []
+
+    class Login:
+        def __init__(self, *a):
+            self.user = boss
+
+        def exec(self):
+            logins.append(1)
+            return mw.QDialog.Accepted if len(logins) <= 2 else mw.QDialog.Rejected
+
+    class Password:
+        def __init__(self, parent, database, user, need_old):
+            asked.append(need_old)
+
+        def exec(self):
+            if len(asked) == 1:
+                return mw.QDialog.Rejected  # закрыл окно нового пароля — не пускаем
+            db.set_password(boss.id, "свой")
+            return mw.QDialog.Accepted
+
+    monkeypatch.setattr(mw, "LoginDialog", Login)
+    monkeypatch.setattr(mw, "PasswordDialog", Password)
+    monkeypatch.setattr(w, "_shift_flow", lambda: True)
+    assert w.login() and len(logins) == 2 and asked == [False, False] and w.user.id == boss.id
+    assert not db.must_change_password(boss.id)
