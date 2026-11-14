@@ -5,6 +5,7 @@
 """
 
 import json
+from collections import deque
 import threading
 import traceback
 from dataclasses import dataclass
@@ -84,6 +85,10 @@ class Parsed:
     photo_id: str = ""  # фото, которое нужно скачать
     callback_id: str = ""  # нажата кнопка — Telegram ждёт ответа, иначе на ней крутятся «часики»
     unsupported: bool = False  # голосовое, видео, файл — вежливо попросить написать словами
+    key: str = ""  # однозначный номер сообщения: одно и то же дважды не обрабатываем
+
+    def __post_init__(self):
+        self.key = self.key or f"tg:{self.update_id}"
 
 
 def _name(user: dict) -> str:
@@ -98,6 +103,15 @@ def best_photo(sizes: list[dict]) -> str:
     fitting = [p for p in sizes if side(p) <= PHOTO_MAX_SIDE]
     pick = max(fitting, key=side) if fitting else min(sizes, key=side)
     return pick.get("file_id", "")
+
+
+CONFLICT_TEXT = ("Этот бот запущен ещё на одном компьютере (или в другой программе) — клиенты будут получать "
+                 "ответы по нескольку раз. Оставьте программу с ботом на одном компьютере.")
+
+
+def is_conflict(error: str) -> bool:
+    """Telegram: «Conflict: terminated by other getUpdates request» — бот опрашивают двое."""
+    return "conflict" in error.lower() or "terminated by other" in error.lower()
 
 
 def parse_update(update: dict) -> Parsed:
@@ -141,6 +155,7 @@ class ClientBot(QObject):
     identified = Signal(str)  # логин бота — из фонового потока
     event = Signal(object)  # событие разговора для главного окна: ("order", id), ("message", id)…
     queued = Signal()  # поставили сообщение в очередь — пусть и второй бот проверит свою часть
+    conflict = Signal()  # этот же бот запущен ещё где-то (на другом компьютере) — ответы задвоятся
 
     OFFSET_KEY = "client_offset"
     USERNAME_KEY = "client_bot_username"
@@ -154,6 +169,8 @@ class ClientBot(QObject):
         self.last_error = ""
         self._known_token = ""
         self.link_tries: dict[str, int] = {}  # подбор кода сотрудника — пока программа работает
+        self._seen: deque[str] = deque(maxlen=2000)  # уже обработанные сообщения — повтор не отвечаем дважды
+        self._seen_set: set[str] = set()
         self.staff_state: dict[str, dict] = {}  # флорист добавляет букет на витрину: на каком он шаге
         self.fetched.connect(self._on_fetched)
         self.sent.connect(self._on_sent)
@@ -207,18 +224,32 @@ class ClientBot(QObject):
         self.fetched.emit(parsed, "", max(p.update_id for p in parsed) + 1 if parsed else None)
 
     def _on_fetched(self, parsed: list, error: str, offset):
-        self.polling = False
         if error:
+            self.polling = False
             self.last_error = error
+            if is_conflict(error):  # тот же бот опрашивает другая программа — каждое сообщение получат обе
+                self.last_error = CONFLICT_TEXT
+                self.conflict.emit()
             QTimer.singleShot(RETRY_MS, self.poll)
             return
         self.last_error = ""
-        QTimer.singleShot(200, self.poll)  # сразу ждём следующие сообщения
-        if parsed:
-            self.process(parsed, datetime.now())
+        # сначала запомнить, что эти сообщения получены, и только потом отвечать: если во время ответа
+        # программа отвлечётся (окно, сбой), те же сообщения не придут ещё раз
         if offset is not None and offset != self._offset():
             _settings().setValue(self.OFFSET_KEY, offset)
-        if parsed:
+        fresh = [p for p in parsed if p.key not in self._seen_set]
+        for p in fresh:
+            if len(self._seen) == self._seen.maxlen:
+                self._seen_set.discard(self._seen[0])
+            self._seen.append(p.key)
+            self._seen_set.add(p.key)
+        try:
+            if fresh:
+                self.process(fresh, datetime.now())
+        finally:
+            self.polling = False
+            QTimer.singleShot(200, self.poll)  # сразу ждём следующие сообщения
+        if fresh:
             self.flush()
 
     def process(self, parsed: list[Parsed], now: datetime):
@@ -275,7 +306,8 @@ class ClientBot(QObject):
                 else:
                     telegram.send_message(token, chat, text[:telegram.MAX_TEXT], buttons)
             except telegram.TelegramError as e:
-                result.update(error=str(e), permanent=e.permanent, wait=e.retry_after)
+                if not e.maybe_sent:  # не дождались ответа — скорее всего дошло: второй раз не шлём
+                    result.update(error=str(e), permanent=e.permanent, wait=e.retry_after)
             results.append(result)
             if result["error"] and not result["permanent"]:
                 break  # нет связи или «слишком часто» — порядок сообщений не путаем, остальное позже

@@ -18,6 +18,7 @@ from PySide6.QtCore import QSettings
 
 from .client_bot import MAX_IMAGE_FILE, MAX_PREFIX, ClientBot, Parsed, client_settings, max_settings
 from .client_flow import Incoming
+from .telegram import timed_out
 
 API = "https://platform-api2.max.ru"  # Bot API v2 (официальный клиент MAX)
 OLD_API = "https://platform-api.max.ru"  # прежний адрес — на случай, если новый недоступен
@@ -29,11 +30,13 @@ NOT_READY_RETRIES = 3  # фото только что загрузили — MAX
 
 
 class MaxError(Exception):
-    def __init__(self, message: str, permanent: bool = False, retry_after: int = 0, code: str = ""):
+    def __init__(self, message: str, permanent: bool = False, retry_after: int = 0, code: str = "",
+                 maybe_sent: bool = False):
         super().__init__(message)
         self.permanent = permanent
         self.retry_after = retry_after
         self.code = code
+        self.maybe_sent = maybe_sent  # не дождались ответа — скорее всего дошло, повтор задвоит
 
 
 def _base() -> str:
@@ -64,7 +67,7 @@ def _call(token: str, method: str, path: str, query: dict | None = None, body: d
         raise MaxError(message, permanent=e.code in (400, 401, 403, 404), code=payload.get("code", ""),
                        retry_after=5 if e.code == 429 else 0) from None
     except OSError as e:
-        raise MaxError(f"Нет связи с MAX: {e}") from None
+        raise MaxError(f"Нет связи с MAX: {e}", maybe_sent=timed_out(e)) from None
 
 
 def max_requisites() -> str:
@@ -99,7 +102,7 @@ def download(url: str) -> bytes:
         with urllib.request.urlopen(url, timeout=60) as response:
             data = response.read(MAX_IMAGE_FILE + 1)
     except OSError as e:
-        raise MaxError(f"Нет связи с MAX: {e}") from None
+        raise MaxError(f"Нет связи с MAX: {e}", maybe_sent=timed_out(e)) from None
     if len(data) > MAX_IMAGE_FILE:
         raise MaxError("файл слишком большой", permanent=True)
     return data
@@ -119,7 +122,7 @@ def upload_image(token: str, data: bytes) -> dict:
     except urllib.error.HTTPError as e:
         raise MaxError(f"MAX не принял фото ({e.code})", permanent=400 <= e.code < 500) from None
     except OSError as e:
-        raise MaxError(f"Нет связи с MAX: {e}") from None
+        raise MaxError(f"Нет связи с MAX: {e}", maybe_sent=timed_out(e)) from None
     try:
         result = json.loads(raw)
     except ValueError:
@@ -207,13 +210,15 @@ def parse_update(update: dict, index: int = 0) -> Parsed:
         user = update.get("user") or {}
         payload = (update.get("payload") or "").strip()
         return Parsed(index, Incoming(f"{MAX_PREFIX}{user.get('user_id')}", "/start" + (f" {payload}" if payload else ""),
-                                      _name(user), user.get("username") or ""))
+                                      _name(user), user.get("username") or ""),
+                      key=f"max:start:{user.get('user_id')}:{update.get('timestamp', '')}")
     if kind == "message_callback":
         callback = update.get("callback") or {}
         user = callback.get("user") or {}
         return Parsed(index, Incoming(f"{MAX_PREFIX}{user.get('user_id')}", name=_name(user),
                                       username=user.get("username") or "", callback=callback.get("payload") or ""),
-                      callback_id=callback.get("callback_id", ""))
+                      callback_id=callback.get("callback_id", ""),
+                      key=f"max:cb:{callback.get('callback_id') or update.get('timestamp', '')}")
     if kind != "message_created":
         return Parsed(index, None)
     message = update.get("message") or {}
@@ -225,7 +230,7 @@ def parse_update(update: dict, index: int = 0) -> Parsed:
     body = message.get("body") or {}
     msg = Incoming(f"{MAX_PREFIX}{sender.get('user_id')}", (body.get("text") or "").strip(), _name(sender),
                    sender.get("username") or "")
-    parsed = Parsed(index, msg)
+    parsed = Parsed(index, msg, key=f"max:msg:{body.get('mid') or (sender.get('user_id'), message.get('timestamp'))}")
     attachments = body.get("attachments") or []
     kinds = {a.get("type") for a in attachments}
     for a in attachments:
@@ -321,7 +326,8 @@ class MaxBot(ClientBot):
                 result["file_id"] = send(token, chat[len(MAX_PREFIX):], text,
                                          json.loads(markup) if markup else None, image)
             except MaxError as e:
-                result.update(error=str(e), permanent=e.permanent, wait=e.retry_after)
+                if not e.maybe_sent:  # не дождались ответа — скорее всего дошло: второй раз не шлём
+                    result.update(error=str(e), permanent=e.permanent, wait=e.retry_after)
             results.append(result)
             if result["error"] and not result["permanent"]:
                 break

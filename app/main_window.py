@@ -217,6 +217,7 @@ class MainWindow(QMainWindow):
         self.client_bot.event.connect(self._on_client_event)
         self.max_bot = MaxBot(db, self)  # тот же бот в MAX: заказы и переписка — в том же окне «Клиенты»
         self.max_bot.event.connect(self._on_client_event)
+        self.client_bot.conflict.connect(self._bot_conflict)
         self.client_bot.queued.connect(self.max_bot.flush)  # сообщение клиенту из MAX уходит через бота MAX
         self.client_center: ClientCenter | None = None
         self.future_orders: FutureOrdersDialog | None = None
@@ -1757,6 +1758,16 @@ class MainWindow(QMainWindow):
         self.tray.showMessage(title, text, QSystemTrayIcon.Information, 60_000)
         QApplication.beep()
         QApplication.alert(self)
+
+    def _bot_conflict(self):
+        """Бот для клиентов запущен ещё где-то — сказать один раз в день: из-за этого ответы приходят дважды."""
+        text = ("⚠ Бот для клиентов запущен ещё на одном компьютере (или в другой программе) — клиенты получают "
+                "ответы по нескольку раз. Закройте программу на лишнем компьютере.")
+        if getattr(self, "_conflict_day", None) == date.today():
+            return
+        self._conflict_day = date.today()
+        self.telegram.queue(text, key=f"bot_conflict:{date.today():%Y-%m-%d}")
+        self.tray.showMessage("Бот запущен дважды", text, QSystemTrayIcon.Warning, 30_000)
 
     def _on_client_event(self, ev: tuple):
         kind = ev[0]

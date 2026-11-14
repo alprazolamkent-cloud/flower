@@ -16,7 +16,7 @@ from .delivery_dialog import money
 from .shifts import Shift
 
 API = "https://api.telegram.org/bot{token}/{method}"
-TIMEOUT = 15
+TIMEOUT = 30  # медленный интернет: ждём ответа подольше, чтобы не отправлять одно и то же дважды
 FLUSH_EVERY_MS = 60_000
 MAX_TEXT = 4000  # предел Telegram — 4096 знаков
 POLL_EVERY_MS = 30_000  # запасной таймер: если опрос оборвался, запустить заново
@@ -28,10 +28,18 @@ class TelegramError(Exception):
     """permanent=True — Telegram отказал по существу (бот заблокирован, чат не найден): повторять бесполезно.
     Нет связи — не permanent, попробуем позже."""
 
-    def __init__(self, message: str, permanent: bool = False, retry_after: int = 0):
+    def __init__(self, message: str, permanent: bool = False, retry_after: int = 0, maybe_sent: bool = False):
         super().__init__(message)
         self.permanent = permanent
         self.retry_after = retry_after  # Telegram попросил подождать (слишком много сообщений подряд)
+        # не дождались ответа: запрос, скорее всего, дошёл — повтор пришлёт сообщение второй раз
+        self.maybe_sent = maybe_sent
+
+
+def timed_out(error: OSError) -> bool:
+    """Не дождались ответа (медленный интернет), а не «нет связи вообще»."""
+    reason = getattr(error, "reason", error)
+    return isinstance(reason, TimeoutError) or "timed out" in str(error).lower()
 
 
 def _call(token: str, method: str, params: dict | None = None, timeout: float = TIMEOUT,
@@ -49,7 +57,7 @@ def _call(token: str, method: str, params: dict | None = None, timeout: float = 
         except ValueError:
             raise TelegramError(f"Telegram ответил ошибкой {e.code}") from None
     except OSError as e:
-        raise TelegramError(f"Нет связи с Telegram: {e}") from None
+        raise TelegramError(f"Нет связи с Telegram: {e}", maybe_sent=timed_out(e)) from None
     if not payload.get("ok"):
         raise TelegramError(payload.get("description") or "Telegram вернул ошибку",
                             permanent=payload.get("error_code") in (400, 403),
@@ -81,7 +89,7 @@ def send_photo(token: str, chat_id: str, caption: str = "", photo: bytes | None 
         result = _call(token, "sendPhoto", {**fields, "photo": file_id}).get("result", {})
     else:
         body, content_type = multipart(fields, "photo", "photo.jpg", photo or b"", "image/jpeg")
-        result = _call(token, "sendPhoto", timeout=60, body=body, content_type=content_type).get("result", {})
+        result = _call(token, "sendPhoto", timeout=120, body=body, content_type=content_type).get("result", {})
     sizes = result.get("photo") or []
     return max(sizes, key=lambda p: p.get("width", 0)).get("file_id", "") if sizes else ""
 
@@ -104,7 +112,7 @@ def download_file(token: str, file_id: str) -> bytes:
         with urllib.request.urlopen(FILE_URL.format(token=token.strip(), path=path), timeout=60) as response:
             data = response.read(MAX_DOWNLOAD + 1)
     except OSError as e:
-        raise TelegramError(f"Нет связи с Telegram: {e}") from None
+        raise TelegramError(f"Нет связи с Telegram: {e}", maybe_sent=timed_out(e)) from None
     if len(data) > MAX_DOWNLOAD:
         raise TelegramError("файл слишком большой", permanent=True)
     return data
@@ -482,11 +490,21 @@ class TelegramSender(QObject):
     def _send(self, token: str, chats: list[str], items: list[tuple[int, str, str | None]]):
         """results: (id, текст ошибки, окончательная ли ошибка)."""
         results = []
+        progress = self.__dict__.setdefault("_delivered", {})  # сообщение → кому из администраторов уже дошло
         for message_id, text, chat in items:
+            done = progress.setdefault(message_id, set())
             try:
                 for target in ([chat] if chat else chats):  # chat=None — старое сообщение, уходит всем
-                    send_message(token, target, text)
+                    if target in done:
+                        continue  # повтор после сбоя — тем, кто уже получил, второй раз не шлём
+                    try:
+                        send_message(token, target, text)
+                    except TelegramError as e:
+                        if not e.maybe_sent:
+                            raise
+                    done.add(target)
                 results.append((message_id, "", False))
+                progress.pop(message_id, None)
             except TelegramError as e:
                 results.append((message_id, str(e), e.permanent))
                 if not e.permanent:

@@ -595,3 +595,66 @@ def test_phone_assemble_and_writeoff_in_program(window, store):
     sent = [t for c, t, _, _ in outbox(db) if c == chat]
     assert "🗑 Списано (Анна): Кения × 2 шт — Разбито (160 ₽)" in sent
     assert db.shift_sales(db.current_shift(w.user.id).id).writeoffs == {"Завяло": 1200, "Разбито": 160}
+
+
+def test_bot_does_not_answer_twice(db, store, app, monkeypatch):
+    """Бот отвечал по нескольку раз: одно и то же сообщение пришло повторно, ответ «не дождались» слали снова,
+    бот запущен на двух компьютерах. Теперь: повтор не обрабатывается, «не дождались» не переотправляется,
+    второй компьютер — предупреждение."""
+    import socket
+    import urllib.error
+    bot = ClientBot(db)
+    hello = parse_update({"update_id": 41, "message": {"chat": {"id": 5, "type": "private"}, "from": {},
+                                                       "text": "/start"}})
+    monkeypatch.setattr(QSettings, "value", lambda self, key, default=None: store.get(key, default))
+    handled = []
+    monkeypatch.setattr(bot, "process", lambda parsed, now: handled.append((len(parsed), store.get(bot.OFFSET_KEY))))
+    bot._on_fetched([hello], "", 42)
+    bot._on_fetched([hello], "", 42)  # то же сообщение ещё раз (например, опрос повторился)
+    assert handled == [(1, 42)]  # обработано один раз; «получено» запомнено до ответа
+
+    assert telegram.timed_out(urllib.error.URLError(socket.timeout("timed out")))
+    assert not telegram.timed_out(urllib.error.URLError(ConnectionRefusedError()))
+    db.queue_client("5", "Передал флористу", NOW)
+
+    def slow(token, chat, text, markup=None):
+        raise telegram.TelegramError("Нет связи с Telegram: timed out", maybe_sent=True)
+
+    monkeypatch.setattr(telegram, "send_message", slow)
+    got = []
+    bot.sent.disconnect()
+    bot.sent.connect(got.append)
+    bot._send("tok", db.unsent_client())
+    bot._on_sent(got[0])
+    assert db.unsent_client() == []  # Telegram, скорее всего, доставил — второй раз не шлём
+
+    warned = []
+    bot.conflict.connect(lambda: warned.append(1))
+    bot._on_fetched([], "Conflict: terminated by other getUpdates request", None)
+    assert warned and "ещё на одном компьютере" in bot.last_error
+    bot.deleteLater()
+
+
+def test_admin_broadcast_not_repeated_to_those_who_got_it(db, monkeypatch):
+    monkeypatch.setattr(telegram, "configured", lambda: True)
+    monkeypatch.setattr(telegram, "settings", lambda: {"chats": ["111", "222"], "token": "t"})
+    monkeypatch.setattr(telegram.QTimer, "singleShot", lambda *a: None)
+    sender = telegram.TelegramSender.__new__(telegram.TelegramSender)
+    sender.db, sender.busy, sender.last_error = db, False, ""
+    db.queue_message("итоги", datetime.now(), None)  # старое сообщение без чата — всем
+    delivered, fail = [], {"222": 1}
+
+    def send(token, chat, text):
+        if fail.get(chat):
+            fail[chat] -= 1
+            raise telegram.TelegramError("Нет связи с Telegram: connection reset")
+        delivered.append(chat)
+
+    monkeypatch.setattr(telegram, "send_message", send)
+    results = []
+    sender.done = type("S", (), {"emit": lambda self, r: results.append(r)})()
+    sender._send("t", ["111", "222"], db.unsent_messages())
+    sender._on_done(results[-1])
+    sender._send("t", ["111", "222"], db.unsent_messages())  # повтор после сбоя
+    sender._on_done(results[-1])
+    assert delivered == ["111", "222"] and db.unsent_messages() == []  # первый получил один раз
