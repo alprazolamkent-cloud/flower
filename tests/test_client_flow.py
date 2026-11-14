@@ -221,7 +221,7 @@ def test_dates_in_past_rejected(db):
     flow = ClientFlow(db, "")
     say(flow, CUSTOM)
     say(flow, "Розы")
-    assert "Не понял дату" in texts(say(flow, (NOW - timedelta(days=3)).strftime("%d.%m.%Y") + " 10:00"))
+    assert "уже прошло" in texts(say(flow, (NOW - timedelta(days=3)).strftime("%d.%m.%Y") + " 10:00"))
 
 
 def test_address_by_location(db):
@@ -400,7 +400,7 @@ def test_single_bouquet_hides_after_order(db):
     order_id = first(SEND).events[0][1]
     assert not db.get_showcase_item(item_id).active  # заказан — с витрины пропал
     late = second(SEND)
-    assert late.events == [] and "только что заказали" in texts(late)  # второй не закажет тот же букет
+    assert late.events == [] and "уже нет" in texts(late)  # второй не закажет тот же букет
     assert "уже нет" in texts(ClientFlow(db, "").handle(Incoming("3", callback=f"pick:{item_id}"), NOW))
     db.set_client_order_status(order_id, "rejected", NOW, "")
     assert db.get_showcase_item(item_id).active  # отказ — снова на витрине
@@ -588,3 +588,39 @@ def test_work_phone_assemble_and_stock(db):
     reasons = say(flow, "5").replies[0].markup["inline_keyboard"]
     assert reasons[0][0] == {"text": "Завяло", "callback_data": "wr:0"}
     assert say(flow, callback="wr:0").events == [("stock_writeoff", None, CHAT_ID, "product", rose, 5.0, "Завяло")]
+
+
+def test_bot_logic_fixes(db):
+    """Проверка логики бота: даты без года в прошлом, «только время», букет убрали пока оформляли,
+    устаревшие кнопки у флориста."""
+    from app.client_flow import NO_CARD, PICKUP, SELF, SEND, parse_when
+    today = date(2026, 11, 14)
+    assert parse_when("13.11 к 12", today)[0] == date(2026, 11, 13)  # вчера — не «через год»
+    assert parse_when("13 ноября", today)[0] == date(2026, 11, 13)
+    assert parse_when("05.01 к 10", date(2026, 12, 20))[0] == date(2027, 1, 5)  # в декабре — следующий год
+
+    flow = ClientFlow(db, "")
+    say(flow, CUSTOM)
+    say(flow, "Розы")
+    assert "уже прошло" in texts(say(flow, (NOW - timedelta(days=1)).strftime("%d.%m") + " к 12"))
+    assert "Куда доставить" in texts(say(flow, "к 15:00"))  # только время — сегодня
+    assert db.client_chat(CHAT_ID).data["day"] == NOW.date().isoformat()
+    say(flow, "/start")
+    say(flow, CUSTOM)
+    say(flow, "Розы")
+    assert "время уже прошло" in texts(say(flow, "к 9:00"))  # сейчас 12:00
+
+    item = db.save_showcase_item(ShowcaseItem(0, "Нежность", "", 3000))
+    say(flow, "/start")
+    say(flow, callback=f"pick:{item}")
+    for answer in ("завтра к 12", PICKUP, SELF, "+79991234567", NO_CARD):
+        say(flow, answer)
+    shown = db.get_showcase_item(item)
+    shown.active = False  # флорист отметил «нет в наличии», пока клиент оформлял
+    db.save_showcase_item(shown)
+    late = say(flow, SEND)
+    assert late.events == [] and "уже нет" in texts(late) and db.client_orders() == []
+
+    db.link_work_phone(db.work_phone_code(), "555", NOW)
+    phone = flow.handle(Incoming("555", callback="wr:0"), NOW)  # старая кнопка «Почему?» без начатого списания
+    assert "устарела" in texts(phone)

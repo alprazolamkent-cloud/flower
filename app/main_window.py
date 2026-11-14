@@ -1949,6 +1949,9 @@ class MainWindow(QMainWindow):
             if kind == "stock_assemble":
                 _, _, _, recipe_id, qty, photo = ev
                 recipe = self.db.get_recipe(recipe_id)
+                if recipe is None or not recipe.active:
+                    self.client_bot.queue(chat, "Этой техкарты уже нет — выберите заново: «💐 Собрал букет».")
+                    return
                 if photo:
                     self.db.set_photo("recipe", recipe_id, photo)
                 short = self.db.shortages([CartLine(recipe.title, qty, 0, recipe_id=recipe_id)]) \
@@ -1966,6 +1969,9 @@ class MainWindow(QMainWindow):
                 return
             else:
                 _, _, _, what, ident, qty, reason = ev
+                if (self.db.get_product(ident) if what == "product" else self.db.get_recipe(ident)) is None:
+                    self.client_bot.queue(chat, "Этого уже нет в программе — найдите заново: «📦 Склад» → «🗑 Списать».")
+                    return
                 if what == "product":
                     p = self.db.get_product(ident)
                     self.db.write_off(ident, qty, reason, user.id if user else None, shift_id, now)

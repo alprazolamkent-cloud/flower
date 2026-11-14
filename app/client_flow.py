@@ -22,6 +22,7 @@ STAFF_MENU = {"keyboard": [[{"text": STAFF_TODAY}, {"text": STAFF_TOMORROW}],
                            [{"text": STAFF_SHOWCASE}, {"text": STAFF_ADD}],
                            [{"text": STAFF_ASSEMBLE}, {"text": STAFF_STOCK}]], "resize_keyboard": True}
 STAFF_LIST_MAX = 10
+STALE_BUTTON = "Эта кнопка уже устарела — начните заново кнопками внизу."
 SHOWCASE_PAGE = 5  # столько букетов витрины клиент видит за раз
 STAFF_HELP = ("Кнопки внизу: «Сегодня» и «Завтра» — доставки («Собрал», «Доставлено»), «Витрина» — что видят "
               "клиенты, «Новый букет» — добавить на витрину фото с подписью «Название цена», «Собрал букет» — "
@@ -66,6 +67,7 @@ assert set(CLIENT_STATUS) == set(ORDER_STATUS)
 WEEKDAYS = {"понедельник": 0, "вторник": 1, "сред": 2, "четверг": 3, "пятниц": 4, "суббот": 5, "воскресень": 6}
 MONTHS = ("январ", "феврал", "март", "апрел", "ма", "июн", "июл", "август", "сентябр", "октябр", "ноябр", "декабр")
 MONTH_RE = re.compile(r"\b(\d{1,2})\s+(январ|феврал|март|апрел|ма[яй]|июн|июл|август|сентябр|октябр|ноябр|декабр)\w*")
+PAST_GRACE = timedelta(days=90)  # дата без года чуть раньше сегодняшней — ошиблись, а не «через год»
 ORDER_STEPS = ("when", "when_time", "address", "address_detail", "recipient", "phone", "card", "confirm")
 
 
@@ -116,7 +118,7 @@ def parse_when(text: str, today: date) -> tuple[date | None, str]:
                 day = date(today.year, month, int(words.group(1)))
             except ValueError:
                 return None, text
-            if day < today:
+            if day < today - PAST_GRACE:  # «5 января» в декабре — следующий год; «13 ноября» 14-го — уже прошло
                 day = day.replace(year=day.year + 1)
             rest = low[:words.start()] + low[words.end():]
         elif m:
@@ -126,8 +128,8 @@ def parse_when(text: str, today: date) -> tuple[date | None, str]:
                 day = date(year, int(m.group(2)), int(m.group(1)))
             except ValueError:
                 return None, text
-            if not m.group(3) and day < today:
-                day = day.replace(year=day.year + 1)  # «05.01» в декабре — это следующий год
+            if not m.group(3) and day < today - PAST_GRACE:
+                day = day.replace(year=day.year + 1)  # «05.01» в декабре — следующий год; «13.11» 14-го — прошло
             rest = low[:m.start()] + low[m.end():]
         else:
             for word, weekday in WEEKDAYS.items():
@@ -303,7 +305,15 @@ class ClientFlow:
             return res
         if state == "when":
             day, rest = parse_when(text, now.date())
-            if day is None or day < now.date() or day > now.date() + timedelta(days=365):
+            if day is None and parse_deadline_time(text) is not None:  # только время («к 15:00») — значит, сегодня
+                if self._time_passed(text, now):
+                    res.say("Сегодня это время уже прошло 🙈 Напишите дату, например «завтра к 15:00».")
+                    return res
+                day, rest = now.date(), re.sub(r"\s+", " ", text).strip()
+            if day is not None and day < now.date():
+                res.say(f"{day:%d.%m} уже прошло 🙈 Напишите другую дату, например «завтра к 15:00».")
+                return res
+            if day is None or day > now.date() + timedelta(days=365):
                 res.say("Не понял дату 🙈 Напишите, например: «завтра к 15:00» или «25.10 с 12 до 14».")
                 return res
             if day == now.date() and self._time_passed(rest, now):
@@ -382,11 +392,11 @@ class ClientFlow:
                 res.say("Нажмите «✅ Отправить заказ» или «↩ Начать заново».")
                 return res
             item = self.db.get_showcase_item(data["showcase_id"]) if data.get("showcase_id") else None
-            if item is not None and ((item.single and not item.active)  # пока оформляли, его заказал другой
-                                     or (item.stock is not None and item.stock <= 0)):  # собранные разобрали
+            # пока оформляли: заказал другой, собранные разобрали, флорист убрал «нет в наличии» или удалил
+            if data.get("showcase_id") and (item is None or not item.visible):
                 go("", {})
-                res.say("Ох, этот букет только что заказали 😔 Готовых больше нет. Посмотрите другие "
-                        "на витрине или опишите свой — соберём похожий.", self.MENU)
+                res.say("Ох, этого букета уже нет 😔 Пока вы оформляли, его заказали или убрали с витрины. "
+                        "Посмотрите другие на витрине или опишите свой — соберём похожий.", self.MENU)
                 return res
             order = self.db.add_client_order(
                 msg.chat_id, now, date.fromisoformat(data["day"]), data.get("time", ""), data["items"],
@@ -421,6 +431,8 @@ class ClientFlow:
             kind, _, value = msg.callback.partition(":")
             if kind in ("sa", "sd") and value.isdigit():  # собрал / доставлено — программа сама решит и ответит
                 res.events.append(("staff_assembled" if kind == "sa" else "staff_delivered", staff.id, int(value)))
+            else:
+                res.say(STALE_BUTTON, STAFF_MENU)
         elif msg.photo is not None:
             res.events.append(("staff_photo", staff.id, msg.photo, msg.album))
         elif text in (STAFF_TODAY, STAFF_TOMORROW):
@@ -443,6 +455,8 @@ class ClientFlow:
                 if what in ("a", "d") and delivery.isdigit() and user.isdigit():
                     res.events.append(("work_assembled" if what == "a" else "work_delivered", chat,
                                        int(delivery), int(user)))
+            else:
+                res.say(STALE_BUTTON, STAFF_MENU)
         elif msg.photo is not None:
             res.events.append(("work_photo", chat, msg.photo, msg.album))
         elif text in (STAFF_TODAY, STAFF_TOMORROW):
@@ -789,7 +803,7 @@ class ClientFlow:
                 res.say("Оплата уже подтверждена, заказ принят ✅")
             elif order.status == "rejected":
                 res.say(f"Заказ №{order.id} отменён — оплачивать его не нужно. Если есть вопросы, напишите флористу.",
-                        MENU)
+                        self.MENU)
 
     def _preset(self, data: dict) -> bool:
         """Есть дата предзаказа на праздник, и она ещё впереди."""
