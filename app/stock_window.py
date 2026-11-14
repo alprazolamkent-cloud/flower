@@ -29,7 +29,7 @@ from .labels import (
     tspl_probe,
 )
 from .stock_settings import (
-    SCAN_ONLY, direct_checked, label_direct, label_offset, label_printer, label_size, scan_required,
+    SCAN_ONLY, fresh_days, price_markup, direct_checked, label_direct, label_offset, label_printer, label_size, scan_required,
     set_direct_checked, set_label_direct, set_label_printer, set_label_setup,
 )
 from .stock import (
@@ -178,9 +178,9 @@ class DataTable(QTableView):
         header.setResizeContentsPrecision(60)
         for col in range(len(headers)):
             header.setSectionResizeMode(col, QHeaderView.Stretch if col == stretch else QHeaderView.ResizeToContents)
-        if wrap:  # высота строк по тексту — тоже только по видимым
+        if wrap:  # высота строк по тексту всех колонок (строк немного: поставки — последние 200, техкарты)
             self.verticalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
-            self.verticalHeader().setResizeContentsPrecision(1)
+            self.verticalHeader().setResizeContentsPrecision(-1)
         self.doubleClicked.connect(self._double_clicked)
 
     def _double_clicked(self, index):
@@ -1335,7 +1335,7 @@ class LabelsDialog(QDialog):
         mark_all.clicked.connect(self._mark_shown)
         top.addWidget(mark_all)
         layout.addLayout(top)
-        self.items = [("recipe", r.id, "💐 " + r.title, r.price, r.barcode, r.label_text or short_label(r.title))
+        self.items = [("recipe", r.id, "💐 " + r.title, r.sell_price, r.barcode, r.label_text or short_label(r.title))
                       for r in db.recipes()]
         self.items += [("product", p.id, p.name, p.price, p.barcode, p.label_text or short_label(p.name))
                        for p in db.products()]
@@ -1613,6 +1613,113 @@ class LabelsDialog(QDialog):
             f.write(labels_html(labels, layout))
         QDesktopServices.openUrl(QUrl.fromLocalFile(path))
         self.accept()
+
+
+class PriceRiseDialog(QDialog):
+    """После поставки: закупка выросла — новая цена продажи по наценке; и какие букеты стали дешевле себе в минус."""
+
+    def __init__(self, parent, db, rises: list, markup: float):
+        super().__init__(parent)
+        self.db, self.rises, self.changed = db, rises, []
+        self.setWindowTitle("Подорожало в поставке")
+        fit_to_screen(self, 820, 520)
+        layout = QVBoxLayout(self)
+        layout.addWidget(_gray(f"Закупка выросла, а цена продажи прежняя. Предлагаю новую: закупка × {markup:g}, "
+                               "вверх до 10 ₽. Снимите галочку, чтобы оставить, или поправьте цену (двойной щелчок)."))
+        self.table = _table(["", "Товар", "Закупка: было → стало", "Цена сейчас", "Новая цена"], stretch=1)
+        self.table.setEditTriggers(QAbstractItemView.DoubleClicked | QAbstractItemView.SelectedClicked
+                                   | QAbstractItemView.EditKeyPressed | QAbstractItemView.AnyKeyPressed)
+        self.checks, self.prices = [], []
+        self.table.setItemDelegateForColumn(4, _SpinDelegate(self.table, self.prices, 0, 10_000_000))
+        self.table.setRowCount(len(rises))
+        for i, r in enumerate(rises):
+            check = QTableWidgetItem()
+            check.setFlags(Qt.ItemIsSelectable | Qt.ItemIsEnabled | Qt.ItemIsUserCheckable)
+            check.setCheckState(Qt.Checked)
+            self.table.setItem(i, 0, check)
+            self.table.setItem(i, 1, _item(r.product.name))
+            grew = 100 * (r.new_cost - r.old_cost) / r.old_cost
+            self.table.setItem(i, 2, _item(f"{money(round(r.old_cost))} → {money(round(r.new_cost))} (+{grew:.0f} %)",
+                                           align_right=True))
+            now_markup = r.product.price / r.new_cost if r.new_cost else 0
+            current = _item(f"{money(r.product.price)} (× {now_markup:.1f})", align_right=True)
+            current.setForeground(QColor(C.red if now_markup < 1.5 else C.orange))
+            self.table.setItem(i, 3, current)
+            price = _NumberCell(QTableWidgetItem(), lambda v: money(int(v)))
+            price.setValue(r.suggested)
+            self.table.setItem(i, 4, price.item)
+            self.checks.append(_CheckCell(check))
+            self.prices.append(price)
+        layout.addWidget(self.table, 1)
+        ids = {r.product.id for r in rises}
+        names = {p.id: p for p in db.products(active_only=False, ids={pid for rc in db.recipes() for pid, _ in rc.items})}
+        hit = []
+        for rc in db.recipes():
+            if any(pid in ids for pid, _ in rc.items):
+                cost = sum(q * names[pid].avg_cost for pid, q in rc.items if pid in names)
+                margin = rc.price / cost if cost else 0
+                hit.append(f"{html.escape(rc.title)} — себестоимость {money(round(cost))}, цена {money(rc.price)} "
+                           f"(<b style='color:{C.red if margin < 2 else C.green}'>× {margin:.1f}</b>)")
+        if hit:
+            label = QLabel("<b>Букеты с этими цветами</b> (цену букета меняют в «📋 Техкартах»):<br>"
+                           + "<br>".join(hit[:8]) + ("<br>…" if len(hit) > 8 else ""))
+            label.setWordWrap(True)
+            layout.addWidget(label)
+        buttons = _buttons(self, "Поставить новые цены")
+        buttons.button(QDialogButtonBox.Cancel).setText("Оставить как есть")
+        layout.addWidget(buttons)
+
+    def accept(self):
+        for r, check, price in zip(self.rises, self.checks, self.prices):
+            if check.isChecked() and int(price.value()) != r.product.price:
+                self.db.set_price(r.product.id, int(price.value()))
+                self.changed.append((r.product.name, r.product.price, int(price.value())))
+        super().accept()
+
+
+class PromoDialog(QDialog):
+    """Уценить собранные букеты: −10 / −20 / −30 % или своя цена; снять уценку."""
+
+    def __init__(self, parent, recipe: Recipe, since: datetime | None):
+        super().__init__(parent)
+        self.recipe, self.new_price = recipe, recipe.promo_price
+        self.setWindowTitle(f"Уценить — {recipe.title}")
+        layout = QVBoxLayout(self)
+        days = (date.today() - since.date()).days if since else None
+        layout.addWidget(QLabel(f"<b>{html.escape(recipe.title)}</b> · на витрине {qty_text(recipe.ready)} шт"
+                                + (f", стоит {days} дн." if days else ", собран сегодня" if days == 0 else "")
+                                + f"<br>Обычная цена: <b>{money(recipe.price)}</b>"))
+        quick = QHBoxLayout()
+        for pct in (10, 20, 30, 50):
+            b = QPushButton(f"−{pct} %")
+            b.setProperty("pct", pct)
+            b.clicked.connect(self._quick)
+            quick.addWidget(b)
+        layout.addLayout(quick)
+        form = QFormLayout()
+        self.price_box = money_box()
+        self.price_box.setValue(recipe.promo_price or round(recipe.price * 0.8 / 10) * 10)
+        form.addRow("Цена со скидкой:", self.price_box)
+        layout.addLayout(form)
+        layout.addWidget(_gray("Скидка — только на уже собранные: в продаже, на этикетке и в ботах («🔥 было … — "
+                               "сейчас …»). Раскупят — снимется сама, новые соберутся по обычной цене."))
+        buttons = _buttons(self, "🏷 Уценить")
+        if recipe.promo_price:
+            remove = buttons.addButton("Снять уценку", QDialogButtonBox.ResetRole)
+            remove.clicked.connect(self._remove)
+        layout.addWidget(buttons)
+
+    def _quick(self):
+        pct = self.sender().property("pct")
+        self.price_box.setValue(int(self.recipe.price * (100 - pct) / 100 // 10 * 10))
+
+    def _remove(self):
+        self.new_price = None
+        super().accept()
+
+    def accept(self):
+        self.new_price = self.price_box.value()
+        super().accept()
 
 
 class ReorderDialog(QDialog):
@@ -1932,7 +2039,7 @@ class StockWindow(QDialog):
         self.tabs.setTabVisible(self.analytics_index, self.admin)
         for widget in (self.add_product_btn, self.edit_product_btn, self.count_btn, self.archive_btn, self.import_btn,
                        self.inventory_btn,
-                       self.add_recipe_btn, self.edit_recipe_btn, self.archive_recipe_btn):
+                       self.add_recipe_btn, self.edit_recipe_btn, self.archive_recipe_btn, self.promo_btn):
             widget.setVisible(self.admin)
         page = self.tabs.currentIndex()
         if page == 0:
@@ -2131,9 +2238,11 @@ class StockWindow(QDialog):
             title = item.title if kind == "recipe" else item.name
             if query and query not in title.lower() and (kind == "recipe" or query not in item.category.lower()):
                 continue
-            stock = (f"готово: {qty_text(item.ready)}" if item.ready > 0 else "") if kind == "recipe" else \
+            stock = (f"готово: {qty_text(item.ready)}" + (" 🔥" if item.sell_price != item.price else "")
+                     if item.ready > 0 else "") if kind == "recipe" else \
                 f"{qty_text(item.stock)} {item.unit}"
-            tiles.append((kind, ident, title, item.price, stock, kind == "product" and item.low, item.has_photo))
+            price = item.sell_price if kind == "recipe" else item.price  # уценённые букеты — по скидке
+            tiles.append((kind, ident, title, price, stock, kind == "product" and item.low, item.has_photo))
         self.grid.set_tiles(tiles)
 
     def _photo(self, kind: str, ident: int) -> QPixmap:
@@ -2205,7 +2314,7 @@ class StockWindow(QDialog):
     def _add_tile(self, kind: str, ident: int):
         if kind == "recipe":
             r = self.db.get_recipe(ident)
-            self._add_line(CartLine(r.title, 1, r.price, recipe_id=r.id))
+            self._add_line(CartLine(r.title, 1, r.sell_price, recipe_id=r.id))
         else:
             p = self.db.get_product(ident)
             self._add_line(CartLine(p.name, 1, p.price, product_id=p.id), unit=p.unit)
@@ -2372,13 +2481,20 @@ class StockWindow(QDialog):
         for c in CATEGORIES:
             self.category_filter.addItem(c, c)
         self.category_filter.currentIndexChanged.connect(self._fill_stock)
+        self._fresh_limit = 5
         filters.addWidget(self.category_filter)
         self.low_only = QCheckBox("Только заканчивается")
         self.low_only.toggled.connect(self._fill_stock)
         filters.addWidget(self.low_only)
+        self.stale_only = QCheckBox("🥀 Залежались")
+        self.stale_only.setToolTip("Цветы и зелень, которые лежат дольше, чем задано в настройках (по умолчанию "
+                                   "5 дней), — пора в букеты или в уценку")
+        self.stale_only.toggled.connect(self._fill_stock)
+        filters.addWidget(self.stale_only)
         layout.addLayout(filters)
-        self.stock_table = DataTable(["Товар", "Раздел", "Остаток", "Цена", "Себестоимость", "Мало, если ≤"])
+        self.stock_table = DataTable(["Товар", "Раздел", "Остаток", "Цена", "Себестоимость", "Мало, если ≤", "Лежит"])
         self._stock_products: list[Product] = []
+        self._stock_ages: dict[int, tuple[int, float]] = {}
         self.stock_table.itemDoubleClicked.connect(self._stock_double_clicked)
         layout.addWidget(self.stock_table, 1)
         buttons_box = flow_policy(QWidget())
@@ -2430,8 +2546,13 @@ class StockWindow(QDialog):
     def _refresh_stock(self):
         """Перечитать склад из базы (после поставки, продажи…) и показать с текущими фильтрами."""
         self._stock_products = self.db.products()
+        self._fresh_limit = fresh_days()
+        self._stock_ages = self.db.stock_ages(datetime.now(), self._fresh_limit)
         low = sum(p.low for p in self._stock_products)
+        stale = sum(1 for _, old in self._stock_ages.values() if old > 0)
         text = f"Заканчивается: <b style='color:{C.red if low else C.green}'>{low}</b>"
+        if stale:
+            text += f" · 🥀 залежались: <b style='color:{C.orange}'>{stale}</b>"
         if self.admin:
             text += f" · на складе на <b>{money(self.db.stock_value())}</b> (по себестоимости)"
         self.stock_summary.setText(text)
@@ -2442,17 +2563,24 @@ class StockWindow(QDialog):
         self._stock_timer.stop()
         query = self.stock_search.text().strip().lower()
         category = self.category_filter.currentData()
-        low_only = self.low_only.isChecked()
-        admin = self.admin
+        low_only, stale_only = self.low_only.isChecked(), self.stale_only.isChecked()
+        admin, ages, limit = self.admin, self._stock_ages, getattr(self, "_fresh_limit", 5)
         rows = []
         for p in self._stock_products:
+            age, old = ages.get(p.id, (None, 0))
             if (query and query not in p.name.lower() and query not in p.barcode) or \
-                    (category and p.category != category) or (low_only and not p.low):
+                    (category and p.category != category) or (low_only and not p.low) or (stale_only and not old):
                 continue
             cells = [p.name, p.category, f"{qty_text(p.stock)} {p.unit}", money(p.price),
                      money(round(p.avg_cost)) if admin and p.avg_cost else "—",
-                     f"{qty_text(p.min_stock)} {p.unit}" if p.min_stock else ""]
+                     f"{qty_text(p.min_stock)} {p.unit}" if p.min_stock else "",
+                     "" if age is None or p.stock <= 0 else ("сегодня" if age == 0 else f"{age} дн.")
+                     + (" 🥀" if old else "")]
             colors, tips = {}, {}
+            if old:
+                colors[6] = C.orange
+                tips[6] = (f"Дольше {limit} дн. лежит {qty_text(old)} {p.unit} — пора в букеты или в уценку"
+                           if old < p.stock else f"Всё лежит дольше {limit} дн. — пора в букеты или в уценку")
             if admin and not p.avg_cost:
                 tips[4] = "Поставок с закупочной ценой не было — себестоимость неизвестна"
             if p.low:
@@ -2669,6 +2797,29 @@ class StockWindow(QDialog):
             s = self.db.supplies(1)[0]
             self.main.audit("Поставка", f"№{s.id} от {s.supplier or '—'} на {money(s.total)}")
             self._refresh_supplies()
+            self._check_price_rises(s.id)
+
+    def _check_price_rises(self, supply_id: int):
+        """Подорожало — администратору предложить новые цены; сотрудник цены не меняет — сказать администраторам."""
+        markup = price_markup()
+        rises = self.db.price_rises(supply_id, markup)
+        if not rises:
+            return
+        if not self.admin:
+            telegram = getattr(self.main, "telegram", None)
+            if telegram is not None:
+                telegram.queue("📈 Подорожало в поставке, цена продажи прежняя:\n" + "\n".join(
+                    f"• {r.product.name}: закупка {money(round(r.old_cost))} → {money(round(r.new_cost))}, "
+                    f"цена {money(r.product.price)} — предлагаю {money(r.suggested)}" for r in rises)
+                    + "\nПоменять: «📦 Склад» → «Остатки» → «✏️ Изменить».", key=f"price_rise:{supply_id}")
+            return
+        dialog = PriceRiseDialog(self, self.db, rises, markup)
+        if dialog.exec() == QDialog.Accepted and dialog.changed:
+            self.main.audit("Цены после подорожания", ", ".join(f"{n}: {money(a)} → {money(b)}"
+                                                                for n, a, b in dialog.changed))
+            QMessageBox.information(self, "Цены", f"Новые цены поставлены ({len(dialog.changed)}). Не забудьте "
+                                    "перепечатать этикетки: «🏷 Этикетки».")
+            self._fresh.clear()
 
     # ----- техкарты -----
 
@@ -2693,6 +2844,9 @@ class StockWindow(QDialog):
         writeoff_btn.clicked.connect(self._write_off_ready)
         history_btn = QPushButton("📜 История")
         history_btn.clicked.connect(self._recipe_history)
+        self.promo_btn = QPushButton("🏷 Уценить")
+        self.promo_btn.setToolTip("Собранный букет стоит не первый день — скидка, и она сразу видна в ботах")
+        self.promo_btn.clicked.connect(self._promo)
         self.add_recipe_btn = QPushButton("➕ Техкарта")
         self.add_recipe_btn.clicked.connect(lambda: self._edit_recipe(new=True))
         self.edit_recipe_btn = QPushButton("✏️ Изменить")
@@ -2706,7 +2860,7 @@ class StockWindow(QDialog):
             b.setMinimumHeight(32)
             buttons.addWidget(b)
         admin = FlowLayout(admin_box, align_right=True)
-        for b in (self.add_recipe_btn, self.edit_recipe_btn, self.archive_recipe_btn):
+        for b in (self.promo_btn, self.add_recipe_btn, self.edit_recipe_btn, self.archive_recipe_btn):
             b.setMinimumHeight(32)
             admin.addWidget(b)
         row = QHBoxLayout()
@@ -2725,6 +2879,7 @@ class StockWindow(QDialog):
         used = {pid for r in recipes for pid, _ in r.items}  # один запрос на все техкарты, а не на каждую
         names = {p.id: p for p in self.db.products(active_only=False, ids=used)}
         order = {c: i for i, c in enumerate(CATEGORIES)}
+        since, today = self.db.ready_since(), date.today()
         rows = []
         for r in recipes:
             cost = sum(q * names[pid].avg_cost for pid, q in r.items if pid in names)
@@ -2738,16 +2893,43 @@ class StockWindow(QDialog):
             parts = "\n".join(f"{g}: {', '.join(items)}"
                                for g, items in sorted(groups.items(), key=lambda g: order.get(g[0], len(order))))
             reserved = self.db.reserved_of(r.id)
-            ready = qty_text(r.ready) + (f" (заказано в боте: {reserved})" if reserved else "") if r.ready else "—"
-            cells = [r.title + ("" if r.in_bot else "\n(не в боте)"), parts, money(r.price), ready,
+            days = (today - since[r.id].date()).days if r.ready > 0 and r.id in since else None
+            stands = "" if days is None else ", собран сегодня" if days == 0 else ", со вчера" if days == 1 \
+                else f", стоит {days} дн."
+            ready = qty_text(r.ready) + stands + (f" (заказано в боте: {reserved})" if reserved else "") \
+                if r.ready else "—"
+            price = f"{money(r.price)}\n🔥 {money(r.sell_price)}" if r.sell_price != r.price else money(r.price)
+            cells = [r.title + ("" if r.in_bot else "\n(не в боте)"), parts, price, ready,
                      money(round(cost)) if self.admin else "—", f"{margin:.0f} %" if self.admin else "—"]
             colors = {}
+            if r.sell_price != r.price:
+                colors[2] = C.pink
             if r.ready:
-                colors[3] = C.green
+                colors[3] = C.green if not days else C.orange
             if self.admin:
                 colors[5] = C.green if margin >= 50 else C.orange if margin >= 30 else C.red
             rows.append(Row(cells, r.id, colors))
         self.recipes_table.set_rows(rows, select=selected)
+
+    def _promo(self):
+        r = self._selected_recipe()
+        if r is None:
+            return
+        if r.ready <= 0 and not r.promo_price:
+            QMessageBox.information(self, "Уценить", "Уценить можно только собранные букеты — этого на витрине нет. "
+                                    "Соберите: «💐 Собрать на витрину».")
+            return
+        dialog = PromoDialog(self, r, self.db.ready_since().get(r.id))
+        if dialog.exec() != QDialog.Accepted:
+            return
+        try:
+            self.db.set_promo(r.id, dialog.new_price)
+        except UserError as e:
+            QMessageBox.warning(self, "Уценить", str(e))
+            return
+        self.main.audit("Уценка букета" if dialog.new_price else "Уценка снята",
+                        f"{r.title}: {money(r.price)}" + (f" → {money(dialog.new_price)}" if dialog.new_price else ""))
+        self._refresh_recipes()
 
     def _selected_recipe_id(self) -> int | None:
         row = self.recipes_table.currentRow()

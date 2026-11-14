@@ -28,8 +28,8 @@ from .reports import parse_time
 from .salary_dialog import EmployeeTiersDialog, HolidaysDialog, PenaltyCatalogEditor, TiersEditor
 from .shifts import DEFAULT_CHANGE, DEFAULT_GRACE_MINUTES, WaterSchedule
 from .templates_dialog import TemplatesDialog
-from .stock_settings import (WEEKDAYS, SCAN_ACTIONS, scan_required, set_scan_required, set_weekly_count_day,
-                             weekly_count_day)
+from .stock_settings import (WEEKDAYS, SCAN_ACTIONS, fresh_days, price_markup, scan_required, set_scan_required,
+                             set_stock_rules, set_weekly_count_day, weekly_count_day)
 from .theme import C, fit_to_screen, primary_ok, scrollable
 
 DEFAULT_LEAD_MINUTES = 20
@@ -880,6 +880,26 @@ class SettingsDialog(QDialog):
         row.addStretch(1)
         weekly_form.addLayout(row)
         layout.addWidget(weekly)
+        rules = QGroupBox("Свежесть и цены")
+        rules_form = QFormLayout(rules)
+        self.fresh_box = QSpinBox()
+        self.fresh_box.setRange(1, 60)
+        self.fresh_box.setSuffix(" дн.")
+        self.fresh_box.setValue(fresh_days())
+        rules_form.addRow("Цветы и зелень несвежие, если лежат:", self.fresh_box)
+        self.markup_box = QDoubleSpinBox()
+        self.markup_box.setRange(1, 10)
+        self.markup_box.setSingleStep(0.1)
+        self.markup_box.setDecimals(1)
+        self.markup_box.setPrefix("× ")
+        self.markup_box.setValue(price_markup())
+        rules_form.addRow("Наценка, когда подорожала закупка:", self.markup_box)
+        rules_hint = _gray_label("Залежавшиеся видно в «Остатках» (колонка «Лежит», фильтр «🥀 Залежались») и в "
+                                 "утреннем отчёте. Приняли поставку, а закупка выросла — программа предложит "
+                                 "новую цену продажи: закупка × наценка, вверх до 10 ₽.")
+        rules_hint.setWordWrap(True)
+        rules_form.addRow(rules_hint)
+        layout.addWidget(rules)
         layout.addStretch(1)
         return page
 
@@ -1054,6 +1074,8 @@ class SettingsDialog(QDialog):
               for action, title in SCAN_ACTIONS.items()),
             ("инвентаризация раз в неделю", _weekday_name(weekly_count_day()),
              _weekday_name(self.weekly_box.currentData()), False),
+            ("цветы несвежие через (дн.)", fresh_days(), self.fresh_box.value(), False),
+            ("наценка для новой цены", price_markup(), round(self.markup_box.value(), 1), False),
             ("напоминание накануне праздника", holiday_eve_time().strftime("%H:%M") if holiday_eve_time() else "выкл",
              self.eve_edit.time().toString("HH:mm") if self.eve_check.isChecked() else "выкл", False),
             ("пересменка", shift_change().strftime("%H:%M"), self.change_edit.time().toString("HH:mm"), False),
@@ -1137,6 +1159,7 @@ class SettingsDialog(QDialog):
         for action, check in self.scan_checks.items():
             set_scan_required(action, check.isChecked())
         set_weekly_count_day(self.weekly_box.currentData())
+        set_stock_rules(self.fresh_box.value(), self.markup_box.value())
         settings.setValue("holiday_eve_time", self.eve_edit.time().toString("HH:mm") if self.eve_check.isChecked()
                           else "off")
         settings.setValue("shift_change", self.change_edit.time().toString("HH:mm"))

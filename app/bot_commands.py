@@ -328,6 +328,27 @@ def low_stock_text(ctx: BotContext, limit: int = 12) -> str:
     return f"📦 Заканчивается ({len(low)}): {shown}" + (" …" if len(low) > limit else "") + "\nЧто заказать: /заказать"
 
 
+def fresh_text(ctx: BotContext, limit: int = 10) -> str:
+    """Утром: какие цветы залежались и какие собранные букеты стоят не первый день — в букеты, в уценку."""
+    from .stock import qty_text
+    from .stock_settings import fresh_days
+    days = fresh_days()
+    stale = ctx.db.stale_flowers(ctx.now, days)
+    since = ctx.db.ready_since()
+    standing = [(r, (ctx.now.date() - since[r.id].date()).days) for r in ctx.db.recipes()
+                if r.ready > 0 and r.id in since and (ctx.now.date() - since[r.id].date()).days >= 2]
+    lines = []
+    if stale:
+        lines.append(f"🥀 Лежат дольше {days} дн. ({len(stale)}): " + ", ".join(
+            f"{p.name} {qty_text(old)} {p.unit} ({age} дн.)" for p, age, old in stale[:limit])
+            + (" …" if len(stale) > limit else "") + " — пора в букеты или в уценку")
+    if standing:
+        lines.append("💐 Собранные стоят не первый день: " + ", ".join(
+            f"{r.title} × {qty_text(r.ready)} ({d} дн.)" + (" 🔥 уценён" if r.sell_price != r.price else "")
+            for r, d in standing) + " — уценить: «📋 Техкарты» → «🏷 Уценить»")
+    return "\n".join(lines)
+
+
 def cmd_stock(ctx: BotContext, args: str) -> str:
     """/остатки — что заканчивается и сколько всего на складе; /остатки кения — найти товар."""
     from .stock import qty_text

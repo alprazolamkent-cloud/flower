@@ -812,7 +812,10 @@ class ClientFlow:
                     "под понравившимся:", self.MENU)
         page = items[offset:offset + SHOWCASE_PAGE]
         for item in page:
-            caption = (f"{item.title} — {money(item.price)}" + (f"\n{item.description}" if item.description else "")
+            sale = item.full_price and item.price < item.full_price  # уценили собранные
+            caption = (f"{item.title} — " + (f"🔥 {money(item.price)} (было {money(item.full_price)})" if sale
+                                             else money(item.price))
+                       + (f"\n{item.description}" if item.description else "")
                        + ("\n✨ В одном экземпляре — готов прямо сейчас" if item.single else "")
                        + (("\n✨ Готов прямо сейчас" + (f" — в наличии {item.stock}" if item.stock > 1 else ""))
                           if item.stock is not None else ""))

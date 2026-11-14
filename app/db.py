@@ -442,6 +442,7 @@ class ShowcaseItem:
     single: bool = False  # готовый букет в одном экземпляре: заказали — прячется с витрины сам
     recipe_id: int | None = None  # собирается по техкарте: показывается, пока есть собранные
     stock: int | None = None  # собрано минус забронировано заказами (только у букетов по техкарте)
+    full_price: int | None = None  # обычная цена букета по техкарте — если сейчас уценён, она выше price
 
     @property
     def visible(self) -> bool:
@@ -522,10 +523,11 @@ class ClientStore:
                " s.recipe_id, CASE WHEN s.recipe_id IS NULL THEN NULL ELSE"
                " COALESCE((SELECT SUM(m.qty) FROM ready_moves m WHERE m.recipe_id = s.recipe_id), 0)"
                " - (SELECT COUNT(*) FROM client_orders o WHERE o.showcase_id = s.id"
-               "    AND o.status IN ('new', 'priced', 'paid_claimed')) END FROM showcase s")
+               "    AND o.status IN ('new', 'priced', 'paid_claimed')) END,"
+               " (SELECT r.price FROM recipes r WHERE r.id = s.recipe_id) FROM showcase s")
         rows = self.conn.execute(sql + " ORDER BY s.position, s.id").fetchall()
         items = [ShowcaseItem(r[0], r[1], r[2], r[3], r[4], r[5], bool(r[6]), r[7], bool(r[8]), r[9],
-                              None if r[10] is None else int(r[10])) for r in rows]
+                              None if r[10] is None else int(r[10]), r[11]) for r in rows]
         return [i for i in items if i.visible] if only_active else items
 
     def get_showcase_item(self, item_id: int) -> ShowcaseItem | None:

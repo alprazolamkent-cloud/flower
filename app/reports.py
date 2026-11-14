@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 
 from .bot_commands import (
-    MONTHS, BotContext, cmd_deliveries, low_stock_text, penalties_text, ranking_text, revenue_text, sales_text,
+    MONTHS, BotContext, cmd_deliveries, fresh_text, low_stock_text, penalties_text, ranking_text, revenue_text, sales_text,
     salary_overview, staff_text, writeoff_text,
 )
 from .shifts import business_day, window
@@ -60,6 +60,9 @@ def report_text(report: Report, ctx: BotContext) -> str:
                  writeoff_text(ctx, first, last, title)]
         if ctx.db.products() or ctx.db.sales_report(*(ctx.now - timedelta(days=2), ctx.now)).count:
             parts += [sales_text(ctx, first, last, title), low_stock_text(ctx)]  # если склад ведут в программе
+            fresh = fresh_text(ctx)
+            if fresh:
+                parts.append(fresh)
         deliveries = cmd_deliveries(ctx, "")
         if deliveries:
             parts.append(deliveries)

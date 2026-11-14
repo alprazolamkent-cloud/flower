@@ -129,6 +129,7 @@ STOCK_MIGRATIONS = {  # (таблица, столбец) → как добави
     ("products", "barcode"): "ALTER TABLE products ADD COLUMN barcode TEXT NOT NULL DEFAULT ''",
     ("products", "label_text"): "ALTER TABLE products ADD COLUMN label_text TEXT NOT NULL DEFAULT ''",
     ("recipes", "label_text"): "ALTER TABLE recipes ADD COLUMN label_text TEXT NOT NULL DEFAULT ''",
+    ("recipes", "promo_price"): "ALTER TABLE recipes ADD COLUMN promo_price INTEGER",  # уценка собранных
 }
 OUTGOING = "('sale', 'assembly', 'writeoff', 'return', 'disassembly')"  # расход со склада (возвраты — минусом)
 OPEN_ORDER = "('new', 'priced', 'paid_claimed')"  # заказ из бота ещё не принят — букет забронирован
@@ -198,6 +199,25 @@ class StockError(Exception):
     """Ошибка с понятным пользователю текстом (в db.py она же — UserError)."""
 
 
+def _batches(rows) -> dict[int, list[tuple[datetime, float]]]:
+    """(что, когда пришло, сколько, сколько всего сейчас) новые первыми → что осталось: последние приходы
+    на весь остаток (первыми уходят самые старые). Пришедшее раньше и уже ушедшее не считается."""
+    left: dict[int, float] = {}
+    result: dict[int, list[tuple[datetime, float]]] = {}
+    for ident, at, qty, total in rows:
+        rest = left.setdefault(ident, max(total or 0, 0))
+        if rest <= 0:
+            continue
+        take = min(qty, rest)
+        left[ident] = rest - take
+        result.setdefault(ident, []).append((datetime.fromisoformat(at), take))
+    return result
+
+
+def _oldest_left(rows) -> dict[int, datetime]:
+    return {ident: batches[-1][0] for ident, batches in _batches(rows).items()}
+
+
 def _ts(moment: datetime) -> str:
     return moment.isoformat(timespec="seconds")
 
@@ -240,6 +260,21 @@ class Recipe:
     in_bot: bool = True  # собранные показывать в витрине ботов
     barcode: str = ""  # штрихкоды через запятую
     label_text: str = ""  # короткая подпись сверху на этикетке
+    promo_price: int | None = None  # уценка собранных на витрине (снимается сама, когда их раскупят)
+
+    @property
+    def sell_price(self) -> int:
+        """По какой цене продавать сейчас: уценённые — пока есть собранные на витрине."""
+        return self.promo_price if self.promo_price and self.ready > 0 else self.price
+
+
+@dataclass
+class PriceRise:
+    """Подорожало в поставке, а цена продажи осталась прежней."""
+    product: "Product"
+    old_cost: float  # закупка в прошлой поставке
+    new_cost: float  # в этой
+    suggested: int  # цена продажи по наценке, округлённая вверх до 10 ₽
 
 
 @dataclass
@@ -604,14 +639,14 @@ class StockStore:
         sql = ("SELECT r.id, r.title, r.price, r.active, r.photo IS NOT NULL, r.in_bot,"
                " COALESCE((SELECT SUM(m.qty) FROM ready_moves m WHERE m.recipe_id = r.id), 0),"
                " COALESCE((SELECT GROUP_CONCAT(b.code, ', ') FROM barcodes b WHERE b.kind = 'recipe'"
-               " AND b.ident = r.id), ''), r.label_text FROM recipes r"
+               " AND b.ident = r.id), ''), r.label_text, r.promo_price FROM recipes r"
                + (" WHERE r.active = 1" if active_only else ""))
         result = []
         for r in self.conn.execute(sql + " ORDER BY title COLLATE NOCASE").fetchall():
             items = self.conn.execute("SELECT product_id, qty FROM recipe_items WHERE recipe_id=? ORDER BY rowid",
                                       (r[0],)).fetchall()
             result.append(Recipe(r[0], r[1], r[2], bool(r[3]), [tuple(x) for x in items], bool(r[4]),
-                                 round(r[6], 3), bool(r[5]), r[7], r[8]))
+                                 round(r[6], 3), bool(r[5]), r[7], r[8], r[9]))
         return result
 
     def get_recipe(self, recipe_id: int) -> Recipe | None:
@@ -631,7 +666,10 @@ class StockStore:
             self.conn.execute("UPDATE recipes SET title=?, price=?, active=?, in_bot=? WHERE id=?",
                               (title, r.price, int(r.active), int(r.in_bot), r.id))
             self.conn.execute("DELETE FROM recipe_items WHERE recipe_id=?", (r.id,))
-            self.conn.execute("UPDATE showcase SET price=? WHERE recipe_id=?", (r.price, r.id))  # цена и в боте
+            # уценка дороже новой цены — уже не уценка
+            self.conn.execute("UPDATE recipes SET promo_price=NULL WHERE id=? AND promo_price >= ?", (r.id, r.price))
+            self.conn.execute("UPDATE showcase SET price=COALESCE((SELECT promo_price FROM recipes WHERE id=?), ?)"
+                              " WHERE recipe_id=?", (r.id, r.price, r.id))  # цена и в боте
             if not r.in_bot:
                 self.conn.execute("UPDATE showcase SET active=0 WHERE recipe_id=?", (r.id,))
         else:
@@ -713,6 +751,90 @@ class StockStore:
                           (recipe.title, description, recipe.price, self.photo_of("recipe", recipe.id), position,
                            recipe.id))
 
+    # ----- уценка собранных и сколько они стоят на витрине -----
+
+    def set_promo(self, recipe_id: int, price: int | None):
+        """Уценить собранные букеты (price — новая цена) или снять уценку (None). Цена сразу и в ботах."""
+        recipe = self.get_recipe(recipe_id)
+        if recipe is None:
+            raise StockError("Такой техкарты нет.")
+        if price is not None:
+            if recipe.ready <= 0:
+                raise StockError("Уценить можно только собранные букеты — на витрине их нет.")
+            if price <= 0 or price >= recipe.price:
+                raise StockError(f"Цена со скидкой должна быть меньше обычной ({recipe.price} ₽) и больше нуля.")
+        self.conn.execute("UPDATE recipes SET promo_price=? WHERE id=?", (price, recipe_id))
+        self.conn.execute("UPDATE showcase SET price=? WHERE recipe_id=?", (price or recipe.price, recipe_id))
+        self.conn.commit()
+
+    def _ready_changed(self, recipe_id: int):
+        """Уценённые раскупили (списали, разобрали) — уценка снимается, в боте снова обычная цена."""
+        if self.ready_of(recipe_id) <= 0:
+            row = self.conn.execute("SELECT price, promo_price FROM recipes WHERE id=?", (recipe_id,)).fetchone()
+            if row and row[1] is not None:
+                self.conn.execute("UPDATE recipes SET promo_price=NULL WHERE id=?", (recipe_id,))
+                self.conn.execute("UPDATE showcase SET price=? WHERE recipe_id=?", (row[0], recipe_id))
+
+    def ready_since(self) -> dict[int, datetime]:
+        """Букет → когда собран самый старый из стоящих на витрине (продаются первыми самые старые)."""
+        return _oldest_left(self.conn.execute(
+            "SELECT m.recipe_id, m.at, m.qty, (SELECT SUM(x.qty) FROM ready_moves x WHERE x.recipe_id = m.recipe_id)"
+            " FROM ready_moves m WHERE m.qty > 0 ORDER BY m.recipe_id, m.at DESC, m.id DESC").fetchall())
+
+    # ----- свежесть цветов -----
+
+    def stock_ages(self, now: datetime, days: int, categories=FLOWER_CATEGORIES) -> dict[int, tuple[int, float]]:
+        """Цветы и зелень: товар → (сколько дней лежит самое старое, сколько штук лежит дольше days).
+        Считаем, что первыми уходят самые старые: остаток — это последние поставки."""
+        rows = self.conn.execute(
+            "SELECT m.product_id, m.at, m.qty, (SELECT SUM(x.qty) FROM stock_moves x WHERE x.product_id = m.product_id)"
+            " FROM stock_moves m JOIN products p ON p.id = m.product_id"
+            f" WHERE m.kind = 'supply' AND m.qty > 0 AND p.active = 1 AND p.category IN ({','.join('?' * len(categories))})"
+            " ORDER BY m.product_id, m.at DESC, m.id DESC", tuple(categories)).fetchall()
+        result: dict[int, tuple[int, float]] = {}
+        for pid, batches in _batches(rows).items():
+            oldest, old_qty = None, 0.0
+            for at, qty in batches:
+                age = (now.date() - at.date()).days
+                oldest = age
+                if age >= days:
+                    old_qty += qty
+            if oldest is not None:
+                result[pid] = (oldest, round(old_qty, 3))
+        return result
+
+    def stale_flowers(self, now: datetime, days: int) -> list[tuple["Product", int, float]]:
+        """Залежавшиеся цветы: (товар, сколько дней лежит самое старое, сколько штук старше days)."""
+        ages = self.stock_ages(now, days)
+        names = {p.id: p for p in self.products(ids=ages)}
+        found = [(names[pid], age, old) for pid, (age, old) in ages.items() if old > 0 and pid in names]
+        return sorted(found, key=lambda x: -(x[2] * x[0].avg_cost))
+
+    # ----- подорожание в поставке -----
+
+    def price_rises(self, supply_id: int, markup: float, min_rise: float = 0.03) -> list[PriceRise]:
+        """Что в поставке подорожало (больше чем на 3 % к прошлой поставке), а цена продажи не догоняет
+        наценку: предложить новую цену (закупка × наценка, вверх до 10 ₽)."""
+        lines = self.conn.execute("SELECT id, product_id, cost FROM stock_moves WHERE kind='supply' AND ref=?"
+                                  " ORDER BY id", (supply_id,)).fetchall()
+        rises = []
+        for move_id, pid, cost in lines:
+            prev = self.conn.execute("SELECT cost FROM stock_moves WHERE product_id=? AND kind='supply' AND cost > 0"
+                                     " AND id < ? ORDER BY id DESC LIMIT 1", (pid, move_id)).fetchone()
+            if not prev or cost <= prev[0] * (1 + min_rise):
+                continue
+            suggested = int(-(-cost * markup // 10) * 10)
+            p = self.get_product(pid)
+            if p is not None and p.price < suggested:
+                rises.append(PriceRise(p, prev[0], cost, suggested))
+        return rises
+
+    def set_price(self, product_id: int, price: int):
+        if price < 0:
+            raise StockError("Цена не может быть отрицательной.")
+        self.conn.execute("UPDATE products SET price=? WHERE id=?", (price, product_id))
+        self.conn.commit()
+
     def reserved_of(self, recipe_id: int) -> int:
         """Сколько собранных забронировано заказами из бота (ещё не принятыми)."""
         return self.conn.execute(
@@ -732,6 +854,7 @@ class StockStore:
         self._check_ready(recipe_id, qty)
         self._ready_move(recipe_id, -qty, "writeoff", self.ready_cost(recipe_id), now, reason=reason or "Другое",
                          shift_id=shift_id, user_id=user_id)
+        self._ready_changed(recipe_id)
         self.conn.commit()
 
     def disassemble(self, recipe_id: int, qty: float, broken: dict[int, float], reason: str, user_id: int | None,
@@ -742,6 +865,7 @@ class StockStore:
         recipe = self.get_recipe(recipe_id)
         self._ready_move(recipe_id, -qty, "disassemble", self.ready_cost(recipe_id), now, shift_id=shift_id,
                          user_id=user_id)
+        self._ready_changed(recipe_id)
         for pid, q in recipe.items:
             self._move(pid, q * qty, "disassembly", self._avg_cost(pid), now, ref=recipe_id, shift_id=shift_id,
                        user_id=user_id)
@@ -829,6 +953,7 @@ class StockStore:
                     cost += ready * unit
                     self._ready_move(line.recipe_id, -ready, "sale", unit, now, ref=sale_id, shift_id=shift_id,
                                      user_id=user_id)
+                    self._ready_changed(line.recipe_id)
                 rest = line.qty - ready  # не было собранных — цветы списываются по техкарте сейчас
                 for pid, qty in recipe.items if recipe and rest else []:
                     unit = self._avg_cost(pid)

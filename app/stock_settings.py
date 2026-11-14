@@ -82,3 +82,24 @@ def set_direct_checked(printer: str):
 def set_label_direct(direct: bool, flip: bool):
     _settings().setValue("label_direct_v2", "true" if direct else "false")
     _settings().setValue("label_flip", "true" if flip else "false")
+
+
+def fresh_days() -> int:
+    """Цветы и зелень лежат дольше — «залежались» (в остатках, в утреннем отчёте)."""
+    try:
+        return max(int(_settings().value("fresh_days", 5)), 1)
+    except (TypeError, ValueError):
+        return 5
+
+
+def price_markup() -> float:
+    """Наценка для новой цены, когда подорожала закупка: цена = закупка × наценка."""
+    try:
+        return max(float(_settings().value("price_markup", 2.5)), 1.0)
+    except (TypeError, ValueError):
+        return 2.5
+
+
+def set_stock_rules(days: int, markup: float):
+    _settings().setValue("fresh_days", int(days))
+    _settings().setValue("price_markup", float(markup))

@@ -5,9 +5,9 @@ from datetime import date, datetime, time, timedelta
 import pytest
 from PySide6.QtWidgets import QDialog, QMessageBox, QWidget
 
-from app.db import Database
+from app.db import Database, UserError
 from app.shift_dialogs import CloseShiftDialog
-from app.stock import Product, Recipe
+from app.stock import CartLine, Product, Recipe
 from app import stock_window
 from app.stock_window import StockWindow, delta_text, period_range, previous_range
 
@@ -166,7 +166,7 @@ def test_assemble_disassemble_from_window(main, db, monkeypatch):
     monkeypatch.setattr(AssembleDialog, "exec", lambda self: (self.qty_box.setValue(2), QDialog.Accepted)[1])
     w._assemble()
     assert db.ready_of(recipe.id) == 2 and db.stock_of(rose.id) == 30 - 18
-    assert w.recipes_table.item(0, 3).text() == "2" and main.log[-1] == ("Букет собран на витрину",
+    assert w.recipes_table.item(0, 3).text() == "2, собран сегодня" and main.log[-1] == ("Букет собран на витрину",
                                                                           "Букет из 9 роз × 2")
     assert "Цветы: Роза × 9" in w.recipes_table.item(0, 1).text()
     shown = db.showcase(only_active=True)
@@ -389,3 +389,56 @@ def test_big_stock_stays_fast(main, db, monkeypatch):
     w._fill_stock()
     assert calls and "4 шт" in next(w.stock_table.item(r, 2).text() for r in range(w.stock_table.rowCount())
                                      if w.stock_table.item(r, 0).text() == "Товар 0")
+
+
+def test_freshness_price_rise_and_promo(main, db, monkeypatch):
+    """Свежесть цветов, новая цена при подорожании закупки, уценка собранных букетов (и в боте)."""
+    from app.bot_commands import fresh_text
+    from app.stock_window import PriceRiseDialog, PromoDialog
+    now = datetime.now()
+    rose = db.products()[1].id  # «Роза»: 30 шт по 90 ₽ час назад
+    db.add_supply("База", [(rose, 20, 90)], None, now - timedelta(days=9))  # старая партия — продали первой
+    db.add_supply("База", [(rose, 10, 90)], None, now - timedelta(days=7))
+    db.add_sale([CartLine("Роза", 25, 250, product_id=rose)], "cash", None, None, now)
+    ages = db.stock_ages(now, 5)
+    assert ages[rose] == (7, 5.0)  # из 35 осталось: 30 свежих и 5 из поставки недельной давности
+
+    w = StockWindow(main)
+    w.tabs.setCurrentIndex(1)
+    w.stale_only.setChecked(True)
+    assert w.stock_table.rowCount() == 1 and "7 дн. 🥀" in w.stock_table.item(0, 6).text()
+    assert "залежались: <b" in w.stock_summary.text()
+    from tests.test_bot import make_ctx
+    assert "Роза 5 шт (7 дн.)" in fresh_text(make_ctx(db, now=now))
+
+    # подорожало: закупка 90 → 120, цена 250 — предлагаю 120 × 2,5 = 300
+    supply = db.add_supply("База", [(rose, 10, 120)], None, now)
+    rises = db.price_rises(supply, 2.5)
+    assert [(r.product.name, r.old_cost, r.new_cost, r.suggested) for r in rises] == [("Роза", 90, 120, 300)]
+    dialog = PriceRiseDialog(None, db, rises, 2.5)
+    assert "Букет из 9 роз" in dialog.findChildren(stock_window.QLabel)[-1].text()  # букет стал менее выгодным
+    dialog.prices[0].setValue(290)
+    dialog.accept()
+    assert db.get_product(rose).price == 290 and dialog.changed == [("Роза", 250, 290)]
+    assert db.price_rises(db.add_supply("База", [(rose, 1, 121)], None, now), 2.5) == []  # +1 % — не тревожим
+
+    # уценка: собрали 2, стоят — −20 %; в продаже, в боте; раскупили — уценка снялась
+    recipe = db.recipes()[0]
+    db.assemble(recipe.id, 2, None, None, now - timedelta(days=2))
+    promo = PromoDialog(None, db.get_recipe(recipe.id), db.ready_since()[recipe.id])
+    next(b for b in promo.findChildren(stock_window.QPushButton) if b.text() == "−20 %").click()
+    promo.accept()
+    assert promo.new_price == 2320  # 2 900 − 20 %, вниз до 10 ₽
+    db.set_promo(recipe.id, promo.new_price)
+    item = next(i for i in db.showcase() if i.recipe_id == recipe.id)
+    assert (item.price, item.full_price) == (2320, 2900)
+    w.tabs.setCurrentIndex(3)
+    assert "🔥 2 320 ₽" in w.recipes_table.item(0, 2).text() and "стоит 2 дн." in w.recipes_table.item(0, 3).text()
+    w.tabs.setCurrentIndex(0)
+    w._add_tile("recipe", recipe.id)
+    assert w.rows[0].line().price == 2320
+    with pytest.raises(UserError):
+        db.set_promo(recipe.id, 3000)  # дороже обычной — не уценка
+    db.add_sale([CartLine(recipe.title, 2, 2320, recipe_id=recipe.id)], "card", None, None, now)
+    assert db.get_recipe(recipe.id).promo_price is None
+    assert next(i for i in db.showcase() if i.recipe_id == recipe.id).price == 2900
