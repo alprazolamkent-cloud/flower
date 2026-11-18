@@ -17,7 +17,10 @@ EXCLUDES = [
 ]
 # файлы, которые Qt кладёт «на всякий случай»: программный OpenGL (~20 МБ), шейдеры Direct3D, PDF, QML
 DROP = ("opengl32sw", "d3dcompiler", "qt6pdf", "qt6qml", "qt6quick", "qt6opengl", "qt6virtualkeyboard",
-        "qtuiotouchplugin")
+        "qtuiotouchplugin", "qdirect2d",  # запасной способ рисовать окна — хватает обычного qwindows
+        # своё шифрование Qt (~6 МБ): из Qt-сети программа берёт только «уже запущена?», в интернет ходит через
+        # Python (у него свои libcrypto-3-x64 / libssl-3-x64 — их не трогаем)
+        "qopensslbackend", "qschannelbackend", "libcrypto-3.dll", "libssl-3.dll")
 IMAGE_FORMATS = {"qjpeg", "qgif", "qico", "qsvg", "qwebp"}  # фото — JPEG, остальное — на всякий случай
 
 

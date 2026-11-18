@@ -92,6 +92,17 @@ def run(out_path: str) -> int:
         found, default = names()
         return f"{len(found)} принтеров"
 
+    def single_instance():
+        from PySide6.QtNetwork import QLocalServer, QLocalSocket
+        name = f"aloflorist-selftest-{os.getpid()}"
+        server = QLocalServer()
+        assert server.listen(name), server.errorString()
+        sock = QLocalSocket()
+        sock.connectToServer(name)
+        assert sock.waitForConnected(2000), "вторая копия не видит первую"
+        sock.disconnectFromServer()
+        server.close()
+
     def tls():
         import ssl
         ssl.create_default_context()
@@ -113,7 +124,7 @@ def run(out_path: str) -> int:
 
     for name, check in (("окна Windows (qwindows.dll)", windows_plugin), ("главное окно", window), ("склад, все вкладки", stock), ("настройки", settings),
                         ("фото JPEG", photos), ("этикетки и PDF", labels), ("список принтеров", printers),
-                        ("https", tls), ("перевод", translations)):
+                        ("второй запуск", single_instance), ("https", tls), ("перевод", translations)):
         if check in (stock, settings) and "window" not in state:
             continue  # без главного окна их не открыть — поломка уже в отчёте
         step(name, check)
