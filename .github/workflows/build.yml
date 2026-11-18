@@ -26,7 +26,17 @@ jobs:
         shell: bash
         run: echo 'VERSION = "1.${{ github.run_number }}"' > app/version.py
       - name: Build exe
-        run: python -m PyInstaller --noconfirm --onefile --windowed --name AloFlorist main.py
+        # что выкинуто из сборки, чтобы быстрее открывалась, — в AloFlorist.spec
+        run: python -m PyInstaller --noconfirm AloFlorist.spec
+      - name: Self-test the exe
+        # собранную программу запускаем на временной базе: окна, склад, фото, этикетки. Не прошла — версия не выходит
+        shell: bash
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          timeout 300 ./dist/AloFlorist.exe --selftest "$PWD/selftest.txt" || true
+          cat selftest.txt
+          head -1 selftest.txt | grep -qx OK
       - name: Copy under the old name
         shell: bash
         # Версии программы до переименования ищут в релизе файл FlowerDeliveries.exe — без копии они перестали бы обновляться.

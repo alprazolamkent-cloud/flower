@@ -55,6 +55,10 @@ def main():
     # Тему выбирает админ в настройках; свои подсветки программы перекрашиваются вместе с ней.
     theme.apply(app, theme_mode())
     app.setQuitOnLastWindowClosed(False)  # при закрытии окна остаёмся в трее ради напоминаний
+    if "--selftest" in sys.argv:  # проверка сборки перед выпуском версии (на временной базе)
+        from app.selftest import run
+        args = sys.argv[sys.argv.index("--selftest") + 1:]
+        return run(args[0] if args else "selftest.txt")
 
     if getattr(sys, "frozen", False):
         cleanup_old(sys.executable)  # остатки прежней версии после обновления

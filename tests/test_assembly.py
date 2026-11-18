@@ -457,3 +457,14 @@ def test_temporary_password_must_be_changed_on_login(window, monkeypatch):
     monkeypatch.setattr(w, "_shift_flow", lambda: True)
     assert w.login() and len(logins) == 2 and asked == [False, False] and w.user.id == boss.id
     assert not db.must_change_password(boss.id)
+
+
+def test_selftest_of_the_build(app, monkeypatch, tmp_path):
+    """Та же самопроверка, что запускается у собранного .exe перед выпуском версии."""
+    from app.selftest import run
+    store = {}
+    monkeypatch.setattr(QSettings, "value", lambda self, key, default=None: store.get(key, default))
+    monkeypatch.setattr(QSettings, "setValue", lambda self, key, value: store.__setitem__(key, value))
+    out = tmp_path / "selftest.txt"
+    assert run(str(out)) == 0, out.read_text(encoding="utf-8")
+    assert out.read_text(encoding="utf-8").startswith("OK")
