@@ -1093,6 +1093,7 @@ class MainWindow(QMainWindow):
         self._check_reports(now)
         self._maybe_send_backup(now)
         self._check_clients(now)
+        self._check_loyalty(now)
         self._check_holiday_eve(now)
         self._flush_admin_photos()
         if self._photos_pruned != now.date():  # раз в день
@@ -1839,6 +1840,19 @@ class MainWindow(QMainWindow):
             self._client_alert("🛍 Клиент ждёт ответа",
                                f"Заказ №{waiting[0].id}: {order_status_text(waiting[0])}. Откройте «🛍 Клиенты».")
         self.update_clients_button()
+
+    def _check_loyalty(self, now: datetime):
+        """Бонусы: сжечь просроченные и разослать напоминания в бот клиентов."""
+        loyalty = self.db.loyalty()
+        for phone, amount in loyalty.expire(now):
+            self.audit("Бонусы сгорели", f"{phone}: −{amount} баллов")
+            for chat in self.db.client_chat_ids_by_phone(phone):
+                self._to_client(chat, f"🎁 {amount} бонусов сгорели — срок действия истёк. "
+                                      "Новая покупка продлит срок для остальных баллов.")
+        for reminder in loyalty.due_reminders(now):
+            for chat in self.db.client_chat_ids_by_phone(reminder.phone):
+                self._to_client(chat, reminder.text)
+            self.audit("Напоминание о бонусах", f"{reminder.phone}: {reminder.kind}")
 
     def _after_assembled(self, d: Delivery, user: User | None = None, chat: str = ""):
         """Букет собран: клиенту из бота — весточка, флористу с привязанным телефоном — просьба прислать фото.

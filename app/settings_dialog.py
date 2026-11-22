@@ -23,6 +23,7 @@ from .salary import DEFAULT_PENALTY_KINDS, WRITEOFF_BASES, PenaltyKind, SalaryRu
 from .holidays import DEFAULT_TEXT as DEFAULT_HOLIDAYS
 from .holidays import Holidays, parse_holidays
 from .heartbeat import watch_enabled
+from .loyalty import load_config
 from .photos import pick_photo, pixmap
 from .reports import parse_time
 from .salary_dialog import EmployeeTiersDialog, HolidaysDialog, PenaltyCatalogEditor, TiersEditor
@@ -211,6 +212,11 @@ def set_last_backup(moment: datetime):
     _settings().setValue("last_backup", moment.isoformat(timespec="seconds"))
 
 
+def loyalty_config() -> dict[str, int]:
+    """Правила бонусной программы (из QSettings, с значениями по умолчанию)."""
+    return load_config()
+
+
 def _gray_label(text: str) -> QLabel:
     """Подсказка с переносами строк, расставленными вручную (автоперенос в форме обрезается)."""
     label = QLabel(text)
@@ -274,6 +280,7 @@ class SettingsDialog(QDialog):
         self.tabs.addTab(self._penalty_tab(), "Санкции")
         self.tabs.addTab(self._telegram_tab(), "Telegram")
         self.tabs.addTab(self._clients_tab(), "Клиенты")
+        self.tabs.addTab(self._loyalty_tab(), "Лояльность")
         self.tabs.addTab(self._reports_tab(), "Отчёты")
         self.tabs.addTab(self._backup_tab(), "Копии")
         self.tabs.addTab(self._stock_tab(), "Склад")
@@ -487,6 +494,49 @@ class SettingsDialog(QDialog):
         dlg = HolidaysDialog(self, self.holidays_text)
         if dlg.exec() == QDialog.Accepted:
             self.holidays_text = dlg.text()
+
+    def _loyalty_tab(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        cfg = loyalty_config()
+        self.loyalty_boxes: dict[str, QSpinBox] = {}
+
+        rules = QGroupBox("Баллы за покупки (1 балл = 1 ₽)")
+        form = QFormLayout(rules)
+
+        def spin(key: str, label: str, low: int, high: int, suffix: str = ""):
+            box = QSpinBox()
+            box.setRange(low, high)
+            box.setValue(int(cfg[key]))
+            if suffix:
+                box.setSuffix(suffix)
+            form.addRow(label, box)
+            self.loyalty_boxes[key] = box
+
+        spin("rate_base", "Базовый процент", 0, 50, " %")
+        spin("tier_mid", "Средний уровень: покупок за 12 мес. от", 0, 10_000_000, " ₽")
+        spin("rate_mid", "…начислять", 0, 50, " %")
+        spin("tier_high", "Высокий уровень: покупок за 12 мес. от", 0, 10_000_000, " ₽")
+        spin("rate_high", "…начислять", 0, 50, " %")
+        form.addRow(_gray_label("Уровень считается по скользящим 12 месяцам. Уценённые букеты не участвуют."))
+        layout.addWidget(rules)
+
+        pay = QGroupBox("Оплата баллами и срок действия")
+        pay_form = QFormLayout(pay)
+        spin("pay_percent", "Можно оплатить баллами не больше", 0, 100, " %")
+        spin("expire_months", "Баллы сгорают через (мес. без покупки)", 1, 24)
+        spin("welcome", "Приветственные баллы при первом телефоне в боте", 0, 100_000)
+        self.loyalty_double = QCheckBox("Двойные баллы: доставка на памятную дату ±1 день")
+        self.loyalty_double.setChecked(bool(cfg["double_dates"]))
+        pay_form.addRow(self.loyalty_double)
+        self.loyalty_reminders = QCheckBox(" Предупреждать в боте за 30 и 7 дней до сгорания")
+        self.loyalty_reminders.setChecked(bool(cfg["expire_reminders"]))
+        pay_form.addRow(self.loyalty_reminders)
+        pay_form.addRow(_gray_label("Срок отсчитывается от последней покупки (или регистрации). "
+                                    "Новая покупка продлевает все баллы."))
+        layout.addWidget(pay)
+        layout.addStretch(1)
+        return page
 
     def _reports_tab(self) -> QWidget:
         page = QWidget()
@@ -1064,6 +1114,7 @@ class SettingsDialog(QDialog):
         """Что именно поменяли в настройках — в журнал действий (секреты не пишем)."""
         rules, schedule = salary_rules(), water_schedule()
         old_tg = telegram.settings()
+        old_loyalty = loyalty_config()
         rows = [
             ("напоминать о доставке за (мин)", lead_minutes(), self.lead_box.value(), False),
             ("доставка не отмечена через (мин)", late_minutes(), self.late_box.value(), False),
@@ -1115,6 +1166,12 @@ class SettingsDialog(QDialog):
             ("QR-код для оплаты", "", "изменён" if self._qr_changed else "", False),
             ("флешка / папка для копий", backup_dir(), self.backup_edit.text().strip(), False),
             ("хранить копий", backup_keep(), self.keep_box.value(), False),
+            *((f"лояльность: {key}", old_loyalty[key], box.value(), False)
+              for key, box in self.loyalty_boxes.items()),
+            ("лояльность: двойные баллы в даты", old_loyalty["double_dates"],
+             int(self.loyalty_double.isChecked()), False),
+            ("лояльность: напоминания о сгорании", old_loyalty["expire_reminders"],
+             int(self.loyalty_reminders.isChecked()), False),
         ]
         changes = [f"{title}: изменено" if hidden else f"{title}: {old} → {new}"
                    for title, old, new, hidden in rows if str(old) != str(new)]
@@ -1196,6 +1253,10 @@ class SettingsDialog(QDialog):
         QTimer.singleShot(0, self.main.heartbeat.beat)  # сразу обновить (или поставить на паузу) сообщение
         settings.setValue("backup_dir", self.backup_edit.text().strip())
         settings.setValue("backup_keep", self.keep_box.value())
+        for key, box in self.loyalty_boxes.items():
+            settings.setValue(f"loyalty/{key}", box.value())
+        settings.setValue("loyalty/double_dates", int(self.loyalty_double.isChecked()))
+        settings.setValue("loyalty/expire_reminders", int(self.loyalty_reminders.isChecked()))
         if sys.platform == "win32":
             autostart.set_enabled(self.autostart_check.isChecked())
         new_theme = self.theme_box.currentData()

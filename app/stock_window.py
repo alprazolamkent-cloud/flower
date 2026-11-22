@@ -22,6 +22,7 @@ from .db import UserError
 from .delivery_dialog import money, money_box
 from .flow_layout import FlowLayout, flow_policy
 from .icon import flower_icon
+from .loyalty import norm_phone
 from .photos import pick_photo, pixmap
 from .shifts import WRITEOFF_REASONS
 from .labels import (
@@ -2132,6 +2133,9 @@ class StockWindow(QDialog):
         self.rows: list[CartRow] = []
         self.adjust = 0  # больше нуля — скидка, меньше — наценка
         self.adjust_note = ""  # почему
+        self.client_phone = ""
+        self.bonus_limit = 0
+        self.bonus_spent = 0
 
         self.sum_label = QLabel()
         self.adjust_row = QHBoxLayout()
@@ -2152,6 +2156,20 @@ class StockWindow(QDialog):
         self.total_label = QLabel()
         total_row.addWidget(self.total_label)
         right.addLayout(total_row)
+        loyalty_row = QHBoxLayout()
+        self.phone_edit = QLineEdit()
+        self.phone_edit.setPlaceholderText("📱 Телефон клиента — бонусы")
+        self.phone_edit.setClearButtonEnabled(True)
+        self.phone_edit.editingFinished.connect(self._refresh_loyalty)
+        loyalty_row.addWidget(self.phone_edit, 1)
+        self.bonus_btn = QPushButton("🎁 Списать")
+        self.bonus_btn.setToolTip("Оплатить баллами до 30% подходящей суммы")
+        self.bonus_btn.clicked.connect(self._toggle_bonus)
+        loyalty_row.addWidget(self.bonus_btn)
+        right.addLayout(loyalty_row)
+        self.loyalty_info = _gray("")
+        self.loyalty_info.setWordWrap(True)
+        right.addWidget(self.loyalty_info)
         pay_box = flow_policy(QWidget())
         pay = FlowLayout(pay_box)
         self.pay_buttons = []
@@ -2351,6 +2369,8 @@ class StockWindow(QDialog):
     def _clear_cart(self):
         for row in list(self.rows):
             self._remove_row(row)
+        self.phone_edit.clear()
+        self.bonus_spent = 0
         self.set_adjust(0)
 
     def cart_lines(self) -> list[CartLine]:
@@ -2394,6 +2414,50 @@ class StockWindow(QDialog):
         shift_id = self.main.sale_shift_id()
         self.shift_hint.setText("" if shift_id else "⚠ Смена не начата — продажа не попадёт в выручку смены.")
         self.shift_hint.setStyleSheet(f"color: {C.orange}")
+        self._refresh_loyalty()
+
+    def _eligible_total(self) -> int:
+        """Сумма корзины без уценённых букетов — по ним баллы не начисляются и не тратятся."""
+        total = 0
+        for line in self.cart_lines():
+            if line.recipe_id:
+                promo = self.db.conn.execute("SELECT promo_price FROM recipes WHERE id=?",
+                                             (line.recipe_id,)).fetchone()
+                if promo and promo[0]:
+                    continue
+            total += line.amount
+        return total
+
+    def _refresh_loyalty(self):
+        phone = norm_phone(self.phone_edit.text())
+        self.client_phone = phone
+        loyalty = self.db.loyalty()
+        if not phone:
+            self.bonus_limit = 0
+            self.bonus_spent = 0
+            self.loyalty_info.setText("")
+            self.bonus_btn.setText("🎁 Списать")
+            self.bonus_btn.setEnabled(False)
+            return
+        eligible = self._eligible_total()
+        self.bonus_limit = min(loyalty.max_spend(phone, eligible), max(0, self.gross() - self.adjust))
+        self.bonus_spent = min(self.bonus_spent, self.bonus_limit)
+        tier = loyalty.tier_info(phone)
+        balance = loyalty.balance(phone)
+        self.loyalty_info.setText(
+            f"{balance} баллов · {tier['rate']}%"
+            + (f" · до {tier['next_rate']}% осталось {tier['left']:,} ₽".replace(",", " ")
+               if tier["next_rate"] else " · максимальный уровень")
+            + (f" · можно списать {self.bonus_limit}" if self.bonus_limit else " · пока нечем платить"))
+        self.bonus_btn.setText(f"🎁 Списать {self.bonus_spent}" if self.bonus_spent else "🎁 Списать")
+        self.bonus_btn.setEnabled(self.bonus_limit > 0)
+
+    def _toggle_bonus(self):
+        self._refresh_loyalty()
+        if not self.bonus_limit:
+            return
+        self.bonus_spent = self.bonus_limit - self.bonus_spent  # второе нажатие — отменить
+        self._update_cart()
 
     def _sell(self, payment: str):
         lines = self.cart_lines()
@@ -2402,17 +2466,34 @@ class StockWindow(QDialog):
                                   + "\n\nПроверьте количество в корзине. Если на самом деле товар есть — значит, "
                                   "не внесли поставку, остаток уйдёт в минус.\n\nВсё равно продать?"):
             return
+        now = datetime.now()
+        loyalty = self.db.loyalty()
+        phone = self.client_phone
+        eligible = self._eligible_total()
+        bonus_spent = min(self.bonus_spent, self.bonus_limit)
+        rate = loyalty.rate(phone, now)
         try:
-            sale_id = self.db.add_sale(lines, payment, self.user_id, self.main.sale_shift_id(), datetime.now(),
-                                       discount=self.adjust, adjust_note=self.adjust_note)
+            sale_id = self.db.add_sale(lines, payment, self.user_id, self.main.sale_shift_id(), now,
+                                       discount=self.adjust, adjust_note=self.adjust_note,
+                                       client_phone=phone, bonus_spent=bonus_spent, loyalty_rate=rate)
         except UserError as e:
             QMessageBox.warning(self, "Продажа", str(e))
             return
-        total = sum(line.amount for line in lines) - self.adjust
+        if bonus_spent:
+            loyalty.spend(phone, bonus_spent, now=now, source=f"Продажа №{sale_id}",
+                          author=self.main.user.name if self.main.user else "")
+        points = loyalty.accrue(phone, max(0, eligible - bonus_spent), now=now,
+                                source=f"Продажа №{sale_id}",
+                                author=self.main.user.name if self.main.user else "")
+        if points:
+            self.db.set_sale_bonus(sale_id, points, rate)
+        total = sum(line.amount for line in lines) - self.adjust - bonus_spent
         adjust = ("скидка" if self.adjust > 0 else "наценка") + f" {money(abs(self.adjust))} — {self.adjust_note}"
         self.main.audit("Продажа", f"№{sale_id}: {money(total)}, {PAYMENTS[payment]} — "
                         + ", ".join(f"{x.title} × {qty_text(x.qty)}" for x in lines)
-                        + (f"; {adjust}" if self.adjust else ""))
+                        + (f"; {adjust}" if self.adjust else "")
+                        + (f"; бонусами {bonus_spent} ₽" if bonus_spent else "")
+                        + (f"; начислено {points} баллов" if points else ""))
         self._clear_cart()
         self._refresh_chips()
         self._refresh_catalog()

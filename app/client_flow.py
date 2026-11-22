@@ -8,11 +8,13 @@ import re
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 
-from .db import ORDER_STATUS, ClientOrder, Database, ShowcaseItem
+from .db import ORDER_STATUS, ClientOrder, Database, ShowcaseItem, UserError
 from .delivery_dialog import money
+from .loyalty import norm_phone
 from .reminders import parse_deadline_time
 
 SHOWCASE, CUSTOM, CHAT, ORDERS = "💐 Витрина", "✍️ Свой букет", "💬 Написать флористу", "📦 Мои заказы"
+BONUSES, LOYALTY_DATES = "🎁 Бонусы", "📅 Памятные даты"
 TO_MENU, RESTART, SEND = "⬅ В меню", "↩ Начать заново", "✅ Отправить заказ"
 PICKUP, SELF, NO_CARD = "🏪 Заберу сам", "Себе", "Без открытки"
 STAFF_TODAY, STAFF_TOMORROW = "📋 Сегодня", "📅 Завтра"  # меню флориста: видно только в привязанном чате
@@ -36,7 +38,8 @@ def bouquets_word(n: int) -> str:
     return "букета" if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14 else "букетов"
 
 
-MENU = {"keyboard": [[{"text": SHOWCASE}, {"text": CUSTOM}], [{"text": CHAT}, {"text": ORDERS}]],
+MENU = {"keyboard": [[{"text": SHOWCASE}, {"text": CUSTOM}], [{"text": CHAT}, {"text": ORDERS}],
+                     [{"text": BONUSES}, {"text": LOYALTY_DATES}]],
         "resize_keyboard": True}
 PREORDER = "🌷 Предзаказ на "  # кнопка перед праздником: «🌷 Предзаказ на 8 Марта»
 PREORDER_DAYS = 14  # за сколько дней до праздника бот предлагает предзаказ
@@ -236,6 +239,13 @@ class ClientFlow:
 
         chat = self.db.touch_client(msg.chat_id, msg.name, msg.username, now)
         state, data = chat.state, dict(chat.data)
+        loyalty = self.db.loyalty()
+        phone_key = norm_phone(chat.phone)
+        if phone_key and not loyalty.has_welcome(phone_key):
+            welcome_points = loyalty.welcome(phone_key, now)
+            if welcome_points:
+                res.say(f"🎁 Добро пожаловать! Начислили {welcome_points} бонусов (= {welcome_points} ₽) "
+                        "за то, что указали телефон.")
 
         def go(new_state: str, new_data: dict | None = None, phone: str | None = None):
             self.db.save_client_state(msg.chat_id, new_state, data if new_data is None else new_data, phone)
@@ -273,6 +283,46 @@ class ClientFlow:
         if text == ORDERS:
             go("", {})
             self._orders(msg.chat_id, res)
+            return res
+        if text == BONUSES:
+            go("", {})
+            if not phone_key:
+                res.say("Чтобы видеть бонусы, укажите телефон при оформлении первого заказа — "
+                        "за это сразу начислим приветственные баллы.", self.MENU)
+            else:
+                res.say(loyalty.summary(phone_key, now), self.MENU)
+            return res
+        if text == LOYALTY_DATES:
+            go("loyalty_date", {})
+            saved = loyalty.dates(phone_key) if phone_key else []
+            lines = ["Напишите подпись и дату, например «жена 14.02» или «годовщина 12.09».",
+                     "За 3 дня напомню заказать букет, а за доставку на этот день ±1 начислю двойные баллы."]
+            if saved:
+                lines.append("Сейчас сохранено:\n" + "\n".join(
+                    f"• {d['label']} — {d['day']}" for d in saved))
+            if not phone_key:
+                lines.append("Сначала укажите телефон при заказе — иначе некуда сохранить дату.")
+            res.say("\n\n".join(lines), keyboard([TO_MENU]))
+            return res
+        if state == "loyalty_date":
+            if not text:
+                return res
+            if not phone_key:
+                res.say("Нужен телефон — укажите его при оформлении заказа.", self.MENU)
+                go("", {})
+                return res
+            parts = text.rsplit(" ", 1)
+            if len(parts) != 2:
+                res.say("Напишите так: «жена 14.02» — подпись, потом дата через точку.", keyboard([TO_MENU]))
+                return res
+            label, day = parts
+            try:
+                loyalty.set_date(phone_key, label, day, now=now)
+            except ValueError as e:
+                res.say(str(e) + "\nНапример: «жена 14.02».", keyboard([TO_MENU]))
+                return res
+            go("", {})
+            res.say(f"Запомнил: {label} — {day}. Напомню за 3 дня и начислю двойные баллы 🎁", self.MENU)
             return res
         if text == RESTART:
             go("", {})
@@ -378,6 +428,10 @@ class ClientFlow:
                 return res
             data["phone"] = phone
             go("card", data, phone=phone)
+            points = loyalty.welcome(phone, now)
+            if points:
+                res.say(f"🎁 Добро пожаловать! Начислили {points} бонусов (= {points} ₽) "
+                        "за то, что указали телефон.")
             self._ask_card(res)
             return res
         if state == "card":
@@ -788,6 +842,29 @@ class ClientFlow:
             self._ask_when(res)
         elif kind == "more" and value.isdigit():
             self._showcase(res, int(value))
+        elif kind == "bonus" and ":" in value:
+            order_id, _, points_text = value.partition(":")
+            if not order_id.isdigit() or not points_text.isdigit():
+                return
+            order = self.db.get_client_order(int(order_id))
+            if order is None or order.chat_id != str(msg.chat_id) or order.status != "priced":
+                return
+            loyalty = self.db.loyalty()
+            eligible = max(0, order.amount - order.delivery_fee)
+            can = loyalty.max_spend(order.client_phone, eligible, now)
+            points = min(int(points_text), can)
+            if points <= 0 or order.amount - points <= 0:
+                res.say("Сейчас списать баллы нельзя — измените заказ или оплатите обычным способом.")
+                return
+            spent = loyalty.spend(order.client_phone, points, now=now,
+                                  source=f"Заказ №{order.id}", author="Клиент")
+            try:
+                self.db.price_client_order(order.id, order.amount - spent, order.delivery_fee, now)
+            except UserError:
+                return
+            self.db.set_order_bonus(order.id, spent, order.bonus_accrued, order.loyalty_rate)
+            res.say(f"Списали {spent} бонусов (−{spent} ₽). К оплате осталось "
+                    f"{money(order.amount - spent)}. Нажмите «✅ Я оплатил(а)», когда переведёте деньги.")
         elif kind == "paid" and value.isdigit():
             order = self.db.get_client_order(int(value))
             if order is None or order.chat_id != str(msg.chat_id):

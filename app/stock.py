@@ -11,6 +11,8 @@ import sqlite3
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta
 
+from .loyalty import Loyalty, norm_phone
+
 STOCK_SCHEMA = """
 CREATE TABLE IF NOT EXISTS products (
     id        INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -130,6 +132,10 @@ STOCK_MIGRATIONS = {  # (таблица, столбец) → как добави
     ("products", "label_text"): "ALTER TABLE products ADD COLUMN label_text TEXT NOT NULL DEFAULT ''",
     ("recipes", "label_text"): "ALTER TABLE recipes ADD COLUMN label_text TEXT NOT NULL DEFAULT ''",
     ("recipes", "promo_price"): "ALTER TABLE recipes ADD COLUMN promo_price INTEGER",  # уценка собранных
+    ("sales", "client_phone"): "ALTER TABLE sales ADD COLUMN client_phone TEXT NOT NULL DEFAULT ''",
+    ("sales", "bonus_spent"): "ALTER TABLE sales ADD COLUMN bonus_spent INTEGER NOT NULL DEFAULT 0",
+    ("sales", "bonus_accrued"): "ALTER TABLE sales ADD COLUMN bonus_accrued INTEGER NOT NULL DEFAULT 0",
+    ("sales", "loyalty_rate"): "ALTER TABLE sales ADD COLUMN loyalty_rate INTEGER NOT NULL DEFAULT 0",
 }
 OUTGOING = "('sale', 'assembly', 'writeoff', 'return', 'disassembly')"  # расход со склада (возвраты — минусом)
 OPEN_ORDER = "('new', 'priced', 'paid_claimed')"  # заказ из бота ещё не принят — букет забронирован
@@ -308,6 +314,10 @@ class Sale:
     cancel_reason: str
     lines: list[tuple[str, float, int]] = field(default_factory=list)  # (что, сколько, цена)
     adjust_note: str = ""
+    client_phone: str = ""
+    bonus_spent: int = 0
+    bonus_accrued: int = 0
+    loyalty_rate: int = 0
 
     @property
     def adjust_text(self) -> str:
@@ -915,7 +925,9 @@ class StockStore:
         return problems
 
     def add_sale(self, lines: list[CartLine], payment: str, user_id: int | None, shift_id: int | None, now: datetime,
-                 discount: int = 0, note: str = "", flowers: bool = False, adjust_note: str = "") -> int:
+                 discount: int = 0, note: str = "", flowers: bool = False, adjust_note: str = "",
+                 client_phone: str = "", bonus_spent: int = 0, bonus_accrued: int = 0,
+                 loyalty_rate: int = 0) -> int:
         # discount < 0 — наценка (срочно, доставка до двери, сложная упаковка): прибавляется к сумме;
         # adjust_note — почему скидка или наценка (без причины их не делают)
         """Продажа: товары и цветы из техкарт списываются со склада сами. Остаток может уйти в минус —
@@ -929,17 +941,19 @@ class StockStore:
         gross = sum(line.amount for line in lines)
         if any(line.price < 0 for line in lines):
             raise StockError("Цена не может быть отрицательной.")
-        if discount > gross:
-            raise StockError("Скидка не может быть больше суммы.")
+        if discount + max(0, bonus_spent) > gross:
+            raise StockError("Скидка вместе с оплатой баллами не может быть больше суммы.")
         if discount and not adjust_note.strip():
             raise StockError(f"Напишите, почему {'скидка' if discount > 0 else 'наценка'}.")
-        total = gross - discount
+        total = gross - discount - max(0, bonus_spent)
         flowers_gross = 0
         sale_id = self.conn.execute(
-            "INSERT INTO sales (at, shift_id, user_id, total, discount, payment, note, adjust_note)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO sales (at, shift_id, user_id, total, discount, payment, note, adjust_note,"
+            " client_phone, bonus_spent, bonus_accrued, loyalty_rate)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (_ts(now), shift_id, user_id, total, discount, payment, note.strip(),
-             adjust_note.strip() if discount else "")).lastrowid
+             adjust_note.strip() if discount else "", client_phone, bonus_spent,
+             bonus_accrued, loyalty_rate)).lastrowid
         sale_cost = 0.0
         for line in lines:
             cost = 0.0
@@ -981,9 +995,17 @@ class StockStore:
         self.conn.commit()
         return sale_id
 
+    def set_sale_bonus(self, sale_id: int, accrued: int, rate: int):
+        """Добавить к продаже данные лояльности после начисления баллов."""
+        self.conn.execute("UPDATE sales SET bonus_accrued=?, loyalty_rate=? WHERE id=?",
+                          (accrued, rate, sale_id))
+        self.conn.commit()
+
     def cancel_sale(self, sale_id: int, reason: str, user_id: int | None, now: datetime):
         """Отмена (возврат): товары возвращаются на склад, в выручку продажа больше не идёт."""
-        r = self.conn.execute("SELECT cancelled_at, shift_id FROM sales WHERE id=?", (sale_id,)).fetchone()
+        r = self.conn.execute(
+            "SELECT cancelled_at, shift_id, COALESCE(client_phone, ''), bonus_accrued, bonus_spent"
+            " FROM sales WHERE id=?", (sale_id,)).fetchone()
         if r is None:
             raise StockError("Такой продажи нет.")
         if r[0]:
@@ -996,11 +1018,24 @@ class StockStore:
             self._ready_move(rid, -qty, "return", cost, now, ref=sale_id, reason=reason, shift_id=r[1], user_id=user_id)
         self.conn.execute("UPDATE sales SET cancelled_at=?, cancel_reason=? WHERE id=?", (_ts(now), reason.strip(), sale_id))
         self.conn.commit()
+        # возврат: снимаем начисленные баллы и возвращаем те, что были оплаты
+        phone, accrued, spent = norm_phone(r[2]), int(r[3] or 0), int(r[4] or 0)
+        if phone and (accrued or spent):
+            loyalty = Loyalty(self.conn)
+            if accrued:
+                take = min(accrued, loyalty.balance(phone))
+                if take:
+                    loyalty.adjust(phone, -take, note=f"Отмена продажи №{sale_id}",
+                                   author="Отмена продажи", now=now)
+            if spent:
+                loyalty.adjust(phone, spent, note=f"Возврат баллов за продажу №{sale_id}",
+                               author="Отмена продажи", now=now)
 
     def _sales(self, where: str, params: tuple) -> list[Sale]:
         rows = self.conn.execute(
             "SELECT s.id, s.at, s.shift_id, s.user_id, COALESCE(NULLIF(u.name, ''), u.login, ''), s.total, s.discount,"
-            " s.flowers, s.cost, s.payment, s.note, s.cancelled_at, s.cancel_reason, s.adjust_note"
+            " s.flowers, s.cost, s.payment, s.note, s.cancelled_at, s.cancel_reason, s.adjust_note,"
+            " s.client_phone, s.bonus_spent, s.bonus_accrued, s.loyalty_rate"
             f" FROM sales s LEFT JOIN users u ON u.id = s.user_id WHERE {where} ORDER BY s.at DESC, s.id DESC",
             params).fetchall()
         result = []
@@ -1009,7 +1044,7 @@ class StockStore:
                                       (r[0],)).fetchall()
             result.append(Sale(r[0], datetime.fromisoformat(r[1]), r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9],
                                r[10], datetime.fromisoformat(r[11]) if r[11] else None, r[12],
-                               [tuple(x) for x in lines], r[13]))
+                               [tuple(x) for x in lines], r[13], r[14], r[15], r[16], r[17]))
         return result
 
     def sales_between(self, start: datetime, end: datetime, include_cancelled: bool = True) -> list[Sale]:

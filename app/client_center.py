@@ -18,6 +18,7 @@ from .client_flow import MENU, inline, payment_text
 from .db import ORDER_STATUS, ClientOrder, ShowcaseItem, UserError
 from .delivery_dialog import money, money_box
 from .icon import flower_icon
+from .loyalty import norm_phone
 from .photos import PhotoViewer, pick_photo, pixmap
 from .theme import C, fit_to_screen, primary
 
@@ -40,7 +41,7 @@ def needs_action(db) -> int:
     return sum(o.status in NEEDS_ACTION for o in db.client_orders(open_only=True)) + db.client_unread()
 
 
-def order_html(o: ClientOrder, username: str = "") -> str:
+def order_html(o: ClientOrder, username: str = "", balance: int | None = None, rate: int = 0) -> str:
     color = getattr(C, STATUS_COLORS.get(o.status, "gray"))
     who = " ".join(x for x in (o.client_name, f"@{username}" if username else "") if x) or "—"
     who += " · MAX" if is_max(o.chat_id) else " · Telegram"
@@ -48,6 +49,10 @@ def order_html(o: ClientOrder, username: str = "") -> str:
             ("Что", o.items), ("Куда", o.address), ("Кому", o.recipient)]
     if o.card:
         rows.append(("Открытка", o.card))
+    if balance is not None:
+        rows.append(("Бонусы", f"{balance} баллов" + (f" · сейчас {rate}%" if rate else "")))
+    if o.bonus_spent:
+        rows.append(("Оплачено баллами", f"−{o.bonus_spent} ₽"))
     if o.amount:
         rows.append(("К оплате", money(o.amount) + (f" (из них доставка {money(o.delivery_fee)})"
                                                      if o.delivery_fee else "")))
@@ -244,7 +249,10 @@ class ClientCenter(QDialog):
             self.order_hint.setText("")
             return
         chat = self.db.client_chat(o.chat_id)
-        self.order_info.setText(order_html(o, chat.username if chat else ""))
+        phone = norm_phone(o.client_phone)
+        loyalty = self.db.loyalty()
+        self.order_info.setText(order_html(o, chat.username if chat else "",
+                                           loyalty.balance(phone), loyalty.rate(phone)))
         open_ = o.status in ("new", "priced", "paid_claimed")
         self.price_frame.setVisible(open_)
         self.price_btn.setVisible(open_)
@@ -308,10 +316,16 @@ class ClientCenter(QDialog):
         except UserError as e:
             QMessageBox.warning(self, "Сумма", str(e))
             return
+        loyalty = self.db.loyalty()
+        can_bonus = loyalty.max_spend(norm_phone(o.client_phone), max(0, o.amount - o.delivery_fee))
+        buttons = [("✅ Я оплатил(а)", f"paid:{o.id}")]
+        if can_bonus:
+            buttons.append((f"🎁 Списать {can_bonus} баллов", f"bonus:{o.id}:{can_bonus}"))
         self._to_client(o.chat_id, payment_text(o, requisites, bool(qr)), photo=qr,
-                        markup=inline(("✅ Я оплатил(а)", f"paid:{o.id}")))
+                        markup=inline(*buttons))
         self.main.audit("Клиенту отправлена сумма", f"заказ из бота №{o.id}: {money(o.amount)}"
-                        + (f" (доставка {money(o.delivery_fee)})" if o.delivery_fee else ""))
+                        + (f" (доставка {money(o.delivery_fee)})" if o.delivery_fee else "")
+                        + (f", можно списать {can_bonus} баллов" if can_bonus else ""))
         self._changed(o.id)
 
     def _confirm(self):
@@ -331,10 +345,29 @@ class ClientCenter(QDialog):
         except UserError as e:
             QMessageBox.warning(self, "Принять заказ", str(e))
             return
+        loyalty = self.db.loyalty()
+        phone = norm_phone(o.client_phone)
+        eligible = max(0, o.amount - o.delivery_fee - o.bonus_spent)
+        if o.showcase_id:  # уценённый букет в баллах не участвует
+            promo = self.db.conn.execute(
+                "SELECT r.promo_price FROM showcase s JOIN recipes r ON r.id=s.recipe_id WHERE s.id=?",
+                (o.showcase_id,)).fetchone()
+            if promo and promo[0]:
+                eligible = 0
+        rate = loyalty.rate(phone, now)
+        doubled = loyalty.is_occasion(phone, o.day)
+        points = loyalty.accrue(phone, eligible, now=now, source=f"Заказ №{o.id}",
+                                author=self.main.user.name if self.main.user else "", doubled=doubled)
+        if points:
+            self.db.set_order_bonus(o.id, o.bonus_spent, points, rate)
+            self.main.audit("Начислены бонусы", f"заказ №{o.id}: +{points} баллов "
+                                                f"({rate}%{', двойные' if doubled else ''})")
         then = ("Напишем, когда букет будет готов — можно будет забирать." if o.address == "Самовывоз"
                 else "Напишем, когда букет соберём и когда доставим.")
-        self._to_client(o.chat_id, f"Оплата получена ✅ Заказ №{o.id} принят: {o.day:%d.%m} {o.time}.\n{then}",
-                        markup=MENU)
+        bonus_line = (f"\n🎁 Начислили {points} бонусов. Баланс: {loyalty.balance(phone, now)}."
+                      if points else "")
+        self._to_client(o.chat_id, f"Оплата получена ✅ Заказ №{o.id} принят: {o.day:%d.%m} {o.time}.\n{then}"
+                        + bonus_line, markup=MENU)
         self.main.telegram.queue(f"✅ Заказ №{o.id} из бота принят — {self._author() or 'флорист'}\n"
                                  f"Оплачено {money(o.amount)}, доставка {o.day:%d.%m} {o.time}",
                                  key=f"client_ok:{o.id}")

@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta
 
 from .auth import hash_password, verify_password
+from .loyalty import LOYALTY_SCHEMA, Loyalty, norm_phone
 from .stock import STOCK_SCHEMA, CartLine, StockError, StockStore
 from .shifts import (
     KIND_TEXT, Adjustment, CashOp, ChecklistItem, Duty, Penalty, Shift, delivery_business_day,
@@ -318,6 +319,12 @@ PENALTY_MIGRATIONS = {
     "dispute_result": "ALTER TABLE penalties ADD COLUMN dispute_result TEXT NOT NULL DEFAULT ''",
 }
 
+CLIENT_ORDER_MIGRATIONS = {  # лояльность в заказах из бота
+    "bonus_spent": "ALTER TABLE client_orders ADD COLUMN bonus_spent INTEGER NOT NULL DEFAULT 0",
+    "bonus_accrued": "ALTER TABLE client_orders ADD COLUMN bonus_accrued INTEGER NOT NULL DEFAULT 0",
+    "loyalty_rate": "ALTER TABLE client_orders ADD COLUMN loyalty_rate INTEGER NOT NULL DEFAULT 0",
+}
+
 SHIFT_SELECT = """
 SELECT s.id, s.user_id, COALESCE(NULLIF(u.name, ''), u.login, ''), s.day, s.opened_at,
        s.opening_cash, s.closed_at, s.closing_cash, s.cash_sales, s.delivery_cash,
@@ -482,6 +489,9 @@ class ClientOrder:
     showcase_id: int | None = None
     note: str = ""
     client_name: str = ""
+    bonus_spent: int = 0
+    bonus_accrued: int = 0
+    loyalty_rate: int = 0
 
 
 @dataclass
@@ -499,7 +509,8 @@ class ClientMessage:
 ORDER_SELECT = (
     "SELECT o.id, o.chat_id, o.created_at, o.updated_at, o.day, o.time, o.items, o.address, o.recipient,"
     " o.client_phone, o.card, o.status, o.amount, o.delivery_fee, o.paid_photo IS NOT NULL, o.delivery_id,"
-    " o.showcase_id, o.note, COALESCE(NULLIF(c.name, ''), c.username, '')"
+    " o.showcase_id, o.note, COALESCE(NULLIF(c.name, ''), c.username, ''),"
+    " o.bonus_spent, o.bonus_accrued, o.loyalty_rate"
     " FROM client_orders o LEFT JOIN client_chats c ON c.chat_id = o.chat_id")
 
 
@@ -508,7 +519,8 @@ def _row_to_order(r) -> ClientOrder:
                        updated_at=datetime.fromisoformat(r[3]), day=date.fromisoformat(r[4]), time=r[5],
                        items=r[6], address=r[7], recipient=r[8], client_phone=r[9], card=r[10], status=r[11],
                        amount=r[12], delivery_fee=r[13], has_paid_photo=bool(r[14]), delivery_id=r[15],
-                       showcase_id=r[16], note=r[17], client_name=r[18])
+                       showcase_id=r[16], note=r[17], client_name=r[18],
+                       bonus_spent=r[19], bonus_accrued=r[20], loyalty_rate=r[21])
 
 
 class ClientStore:
@@ -606,6 +618,14 @@ class ClientStore:
             data = {}
         return ClientChat(r[0], r[1], r[2], r[3], r[4], data, datetime.fromisoformat(r[6]))
 
+    def client_chat_ids_by_phone(self, phone: str) -> list[str]:
+        """Все чаты бота, привязанные к этому номеру (для бонусных напоминаний)."""
+        key = norm_phone(phone)
+        if not key:
+            return []
+        return [r[0] for r in self.conn.execute("SELECT chat_id, phone FROM client_chats").fetchall()
+                if norm_phone(r[1]) == key]
+
     def touch_client(self, chat_id: str, name: str, username: str, now: datetime) -> ClientChat:
         self.conn.execute(
             "INSERT INTO client_chats (chat_id, name, username, last_seen) VALUES (?, ?, ?, ?)"
@@ -670,6 +690,13 @@ class ClientStore:
                           (amount, delivery_fee, _ts(now), order_id))
         self.conn.commit()
         return self.get_client_order(order_id)
+
+    def set_order_bonus(self, order_id: int, spent: int, accrued: int = 0, rate: int = 0):
+        """Сколько баллов потрачено/начислено по заказу из бота."""
+        self.conn.execute(
+            "UPDATE client_orders SET bonus_spent=?, bonus_accrued=?, loyalty_rate=? WHERE id=?",
+            (spent, accrued, rate, order_id))
+        self.conn.commit()
 
     def set_client_order_status(self, order_id: int, status: str, now: datetime, note: str | None = None,
                                 restore_single: bool = True):
@@ -890,6 +917,7 @@ class Database(ClientStore, StockStore):
         self.conn = sqlite3.connect(path)
         self.conn.executescript(SCHEMA)
         self.conn.executescript(STOCK_SCHEMA)
+        self.conn.executescript(LOYALTY_SCHEMA)
         self.migrate_stock()
         existing = {r[1] for r in self.conn.execute("PRAGMA table_info(deliveries)")}
         for column, sql in MIGRATIONS.items():
@@ -917,6 +945,10 @@ class Database(ClientStore, StockStore):
         for column, sql in PENALTY_MIGRATIONS.items():
             if column not in existing:
                 self.conn.execute(sql)
+        existing = {r[1] for r in self.conn.execute("PRAGMA table_info(client_orders)")}
+        for column, sql in CLIENT_ORDER_MIGRATIONS.items():
+            if column not in existing:
+                self.conn.execute(sql)
         existing = {r[1] for r in self.conn.execute("PRAGMA table_info(telegram_outbox)")}
         if "chat_id" not in existing:  # очередь, созданная до поддержки нескольких чатов
             self.conn.execute("ALTER TABLE telegram_outbox ADD COLUMN chat_id TEXT")
@@ -924,6 +956,10 @@ class Database(ClientStore, StockStore):
 
     def close(self):
         self.conn.close()
+
+    def loyalty(self, config: dict | None = None) -> Loyalty:
+        """Операции лояльности на том же соединении с базой."""
+        return Loyalty(self.conn, config)
 
     def backup(self, path: str):
         """Целостная копия базы (даже если с ней сейчас работают)."""
