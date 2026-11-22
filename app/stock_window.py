@@ -2150,6 +2150,9 @@ class StockWindow(QDialog):
         self.adjust_row.addWidget(self.adjust_clear)
         right.addWidget(self.sum_label)
         right.addLayout(self.adjust_row)
+        self.bonus_label = QLabel()
+        self.bonus_label.setWordWrap(True)
+        right.addWidget(self.bonus_label)
         total_row = QHBoxLayout()
         total_row.addWidget(QLabel("К оплате"))
         total_row.addStretch(1)
@@ -2160,7 +2163,7 @@ class StockWindow(QDialog):
         self.phone_edit = QLineEdit()
         self.phone_edit.setPlaceholderText("📱 Телефон клиента — бонусы")
         self.phone_edit.setClearButtonEnabled(True)
-        self.phone_edit.editingFinished.connect(self._refresh_loyalty)
+        self.phone_edit.editingFinished.connect(self._update_cart)
         loyalty_row.addWidget(self.phone_edit, 1)
         self.bonus_btn = QPushButton("🎁 Списать")
         self.bonus_btn.setToolTip("Оплатить баллами до 30% подходящей суммы")
@@ -2397,7 +2400,8 @@ class StockWindow(QDialog):
         if not lines:
             self.adjust = 0
         self.adjust = min(self.adjust, gross)
-        total = gross - self.adjust
+        self._refresh_loyalty()  # лимит и списание могут измениться после правки корзины/скидки
+        total = max(0, gross - self.adjust - self.bonus_spent)
         self.cart_empty.setVisible(not lines)
         self.sum_label.setText(f"Сумма: {money(gross)}" if self.adjust else "")
         self.sum_label.setVisible(bool(self.adjust))
@@ -2407,6 +2411,10 @@ class StockWindow(QDialog):
                                   + (f" — {html.escape(self.adjust_note)}" if self.adjust_note else ""))
         for widget in (self.adjust_label, self.adjust_clear):
             widget.setVisible(bool(self.adjust))
+        self.bonus_label.setText(
+            f"<span style='color:{C.green}'>Оплата баллами: −{money(self.bonus_spent)}</span>"
+            if self.bonus_spent else "")
+        self.bonus_label.setVisible(bool(self.bonus_spent))
         self.total_label.setText(f"<span style='font-size:20pt; font-weight:bold'>{money(total)}</span>")
         self.adjust_btn.setEnabled(bool(lines))
         for button in self.pay_buttons:
@@ -2414,7 +2422,6 @@ class StockWindow(QDialog):
         shift_id = self.main.sale_shift_id()
         self.shift_hint.setText("" if shift_id else "⚠ Смена не начата — продажа не попадёт в выручку смены.")
         self.shift_hint.setStyleSheet(f"color: {C.orange}")
-        self._refresh_loyalty()
 
     def _eligible_total(self) -> int:
         """Сумма корзины без уценённых букетов — по ним баллы не начисляются и не тратятся."""

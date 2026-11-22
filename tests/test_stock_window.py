@@ -6,6 +6,7 @@ import pytest
 from PySide6.QtWidgets import QDialog, QMessageBox, QWidget
 
 from app.db import Database, UserError
+from app.loyalty import norm_phone
 from app.shift_dialogs import CloseShiftDialog
 from app.stock import CartLine, Product, Recipe
 from app import stock_window
@@ -89,6 +90,30 @@ def test_sell_from_window_and_close_shift(main, db):
     assert dlg.flowers_box.value() == round(5800 * 5750 / 5950)  # цветы — букеты, без крафта
     assert dlg.writeoff_boxes["Завяло"].value() == round(p.avg_cost)
     dlg.deleteLater()
+    w.deleteLater()
+
+
+def test_bonus_payment_changes_total_on_cash_desk(main, db):
+    phone = "+7 (900) 123-45-67"
+    loyalty = db.loyalty()
+    assert loyalty.welcome(phone) == 200
+
+    w = StockWindow(main)
+    w.search_edit.setText("букет")
+    w._refresh_catalog()
+    w._add_selected()
+    assert "2 900" in w.total_label.text()
+
+    w.phone_edit.setText(phone)
+    w.phone_edit.editingFinished.emit()
+    assert w.bonus_limit == 200
+    w.bonus_btn.click()
+    assert "Оплата баллами: −200" in w.bonus_label.text()
+    assert "2 700" in w.total_label.text()
+
+    w._sell("card")
+    assert "бонусами 200 ₽" in main.log[-1][1] and "2 700" in main.log[-1][1]
+    assert loyalty.balance(norm_phone(phone)) == 135  # 200 приветственных − 200 оплаты + 5% с 2700
     w.deleteLater()
 
 
