@@ -15,7 +15,7 @@ from PySide6.QtWidgets import (
 
 from .db import Database, User, UserError
 from .delivery_dialog import MAX_MONEY, money, money_box
-from .salary import PenaltyKind, SalaryRules, calculate, forecast, monthly_ranking, shop_writeoff
+from .salary import PenaltyKind, SalaryRules, bonus_for_shift, calculate, forecast, monthly_ranking, pct, shop_writeoff
 from .shifts import (
     KIND_TEXT, PROBLEM_STATUSES, STATUS_TEXT, WRITEOFF_REASONS, ChecklistItem, Penalty, Shift, WaterSchedule,
     expected_cash, revenue_mismatch, window,
@@ -189,9 +189,10 @@ class CloseShiftDialog(QDialog):
     """Сдача смены: выручка за смену, касса, расчёт «должно быть» и разница, смена воды."""
 
     def __init__(self, parent, db: Database, shift: Shift, change: time, grace: int,
-                 water: WaterSchedule | None = None):
+                 water: WaterSchedule | None = None, rules: Callable[[int], SalaryRules] | None = None):
         super().__init__(parent)
         self.db, self.change, self.grace = db, change, grace
+        self.salary_rules = rules(shift.user_id) if rules is not None else None
         self.shift = db.get_shift(shift.id)  # свежие суммы расходов и изъятий
         s = self.shift
         delivery_sum, _ = db.delivery_cash_for_shift(s.day, change)
@@ -219,6 +220,9 @@ class CloseShiftDialog(QDialog):
         self.revenue_box = count_box("— введите —")
         self.revenue_box.setToolTip("Вся сумма за смену: наличные, терминал, QR-код — всё вместе")
         sales_form.addRow("Приход:", self.revenue_box)
+        self.bonus_label = QLabel()
+        if self.salary_rules is not None:
+            sales_form.addRow("Премия за смену:", self.bonus_label)
         self.flowers_box = count_box("— введите —")
         self.flowers_box.setToolTip("Сколько из прихода — продажа цветов")
         sales_form.addRow("Цветы:", self.flowers_box)
@@ -325,6 +329,12 @@ class CloseShiftDialog(QDialog):
             box.valueChanged.connect(self._update)
         self._update()
 
+    def _shift_bonus(self):
+        """Ступень и премия по выручке этой смены — та же шкала, что в зарплатном отчёте."""
+        if self.salary_rules is None:
+            return None, 0
+        return bonus_for_shift(max(self.revenue_box.value(), 0), self.salary_rules, self.shift.day)
+
     def expected(self) -> int:
         s = self.shift
         return expected_cash(s.opening_cash, max(self.sales_box.value(), 0), 0,
@@ -344,6 +354,10 @@ class CloseShiftDialog(QDialog):
 
     def _update(self):
         self.writeoff_total.setText(f"<b>{money(sum(b.value() for b in self.writeoff_boxes.values()))}</b>")
+        if self.salary_rules is not None:
+            tier, amount = self._shift_bonus()
+            hint = f" · {pct(tier.percent, None)} от выручки" if tier else " — ниже первой ступени"
+            self.bonus_label.setText(f"<b>{money(amount)}</b><br><span style='color:{C.gray}'>{hint}</span>")
         self.cash_sales_label.setText(money(max(self.sales_box.value(), 0)))
         self.expected_label.setText(f"<b>{money(self.expected())}</b>")
         diff = self.difference()
@@ -411,7 +425,7 @@ class CloseShiftDialog(QDialog):
                 self.courier_box.value(), self.note_edit.toPlainText(),
                 revenue=self.revenue_box.value(), flowers=self.flowers_box.value(),
                 terminal=self.terminal_box.value(), qr=self.qr_box.value(),
-                deliveries=self.delivery_box.value(),
+                deliveries=self.delivery_box.value(), bonus=self._shift_bonus()[1],
                 writeoff_items={r: b.value() for r, b in self.writeoff_boxes.items() if b.value()})
         except UserError as e:
             QMessageBox.warning(self, "Сдача смены", str(e))
@@ -750,7 +764,7 @@ class CabinetDialog(QDialog):
         rules = self.rules(person)
         sal = self._salary(person, self.shifts)
         today = date.today()
-        plan = forecast(sal, rules, today) if (self.year, self.month) == (today.year, today.month) else None
+        plan = forecast(sal, rules) if (self.year, self.month) == (today.year, today.month) else None
         self.salary_panel.show_person(sal, rules, name, plan, monthly_ranking(self.month_shifts, rules), reasons)
 
     def _salary(self, user_id: int, shifts: list[Shift]):

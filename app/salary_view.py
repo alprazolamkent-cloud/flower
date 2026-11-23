@@ -1,7 +1,7 @@
 """Блок «Зарплата за месяц» в личном кабинете: три карточки вместо сплошного текста.
 
 «Расчёт» — как чек: что начислено и удержано, внизу крупно «К выплате».
-«Премия» — средний приход, полоска до следующей ступени, условия премии.
+«Премия» — лучшая смена, полоска до следующей ступени, условия премии.
 «Месяц в магазине» — рейтинг, списания по причинам, праздничные смены, споры.
 """
 
@@ -40,14 +40,15 @@ def calc_html(sal: Salary, rules: SalaryRules) -> str:
         title = "Смены" if len(sal.base_parts) == 1 else f"{KIND_TITLES[kind].capitalize()} смены"
         rows.append(_row(f"{title}: {count} × {money(rate)}", money(count * rate)))
     if rules.active_tiers():
-        if sal.tier is None:
+        earned_parts = [(day, rev, tier, amount) for day, rev, tier, amount in sal.shift_bonuses if tier]
+        if not earned_parts:
             rows.append(_row("Премия: план не выполнен", money(0), C.gray))
         elif sal.blocked:
             rows.append(_row("Премия не начислена", money(0), C.red, f"было бы {money(sal.bonus_earned)}"))
         else:
-            source = "со сверх плана " if rules.above_plan_only else "с "
-            rows.append(_row(f"Премия: {pct(sal.tier.percent, None)} {source}{money(sal.bonus_base)}",
-                             f"+{money(sal.bonus)}", C.green))
+            note = "; ".join(f"{pct(tier.percent, None)} с {_money(rev)} ({day:%d.%m})"
+                             for day, rev, tier, _ in earned_parts)
+            rows.append(_row("Премия по сменам", f"+{money(sal.bonus)}", C.green, note))
     if sal.shortage:
         rows.append(_row("Недостача кассы", f"−{money(sal.shortage)}", C.red))
     for p in sal.penalties:
@@ -71,11 +72,11 @@ def bonus_top_html(sal: Salary, rules: SalaryRules) -> str:
     if not rules.active_tiers():
         return f"<span style='color:{C.gray}'>Премия от прихода не настроена.</span>"
     counted = f"за {shifts_word(sal.bonus_shifts)}" + (", без праздничных" if sal.holiday_shifts else "")
-    text = (f"<span style='color:{C.gray}'>Средний приход за смену</span><br>"
-            f"<b style='font-size:20px'>{money(round(sal.average))}</b> "
+    text = (f"<span style='color:{C.gray}'>Лучшая выручка за смену</span><br>"
+            f"<b style='font-size:20px'>{money(sal.best_revenue)}</b> "
             f"<span style='color:{C.gray}'>{counted}</span><br>")
     if sal.tier is None:
-        text += f"<span style='color:{C.red}'>План (от {money(sal.plan)}) пока не выполнен</span>"
+        text += f"<span style='color:{C.red}'>Ни одна смена не дотянула до плана (от {money(sal.plan)})</span>"
     else:
         text += (f"Ступень <b>от {money(sal.tier.per_shift)}</b> → "
                  f"<b style='color:{C.green}'>{pct(sal.tier.percent, None)}</b>")
@@ -91,18 +92,18 @@ def progress(sal: Salary, rules: SalaryRules) -> tuple[int, int, str] | None:
         return 1, 1, "высшая ступень — дальше некуда 🎉"
     low = sal.tier.per_shift if sal.tier else 0
     high = sal.next_tier.per_shift
-    done = min(max(round(sal.average) - low, 0), high - low)
+    done = min(max(sal.best_revenue - low, 0), high - low)
     goal = "план" if sal.tier is None else pct(sal.next_tier.percent, None)
     if not sal.bonus_shifts:
-        return 0, max(high - low, 1), f"до ступени «{goal}» — {_money(high)} в среднем"
-    return done, max(high - low, 1), f"до «{goal}» не хватает {_money(high - round(sal.average))} в среднем"
+        return 0, max(high - low, 1), f"до ступени «{goal}» — {_money(high)} выручки за смену"
+    return done, max(high - low, 1), f"до «{goal}» не хватает {_money(high - sal.best_revenue)} в одной смене"
 
 
 def bonus_bottom_html(sal: Salary, rules: SalaryRules, plan: Forecast | None) -> str:
     lines = []
     if plan is not None:
-        lines.append(f"🎯 Осталось ~{shifts_word(plan.remaining_shifts)}: для {pct(plan.target.percent, None)} "
-                     f"нужно в среднем <b>{money(plan.needed_average)}</b>")
+        lines.append(f"🎯 Для ступени {pct(plan.target.percent, None)} нужно "
+                     f"<b>{money(plan.needed_revenue)}</b> выручки за одну смену")
     if rules.max_penalties > 0:
         ok = len(sal.penalties) < rules.max_penalties
         lines.append(f"<span style='color:{C.green if ok else C.red}'>{'✓' if ok else '✗'} Санкций: "

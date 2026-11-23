@@ -449,20 +449,23 @@ def _salary_detail(ctx: BotContext, user: User, first: date, last: date, month: 
     if sal.holiday_shifts:
         lines.append(f"🎉 Праздничных смен {sal.holiday_shifts} (выручка {money(sal.holiday_revenue)} в премию не идёт)")
     if rules.active_tiers():
-        lines.append(f"Приход {money(sal.revenue)}, в среднем {money(round(sal.average))} за смену")
-        if sal.tier is None:
-            lines.append(f"План не выполнен (нужно от {money(sal.plan)} за смену) — премии нет")
-        else:
-            lines.append(f"Ступень «от {money(sal.tier.per_shift)}»: {pct(sal.tier.percent, None)} с "
-                         f"{money(sal.bonus_base)} = {money(sal.bonus_earned)}" + (" (не выплачивается)" if sal.blocked else ""))
-        if sal.next_tier is not None and sal.shifts:
+        lines.append(f"Приход по сменам: {money(sal.revenue)}")
+        if not sal.shift_bonuses:
+            lines.append("Сданных смен для премии нет")
+        for day, rev, tier, amount in sal.shift_bonuses:
+            if tier:
+                lines.append(f"{day:%d.%m}: {pct(tier.percent, None)} с {money(rev)} = {money(amount)}"
+                             + (" (не выплачивается)" if sal.blocked else ""))
+            else:
+                lines.append(f"{day:%d.%m}: {money(rev)} — до плана ({money(sal.plan)})")
+        if sal.next_tier is not None and sal.bonus_shifts:
             lines.append(f"До «от {money(sal.next_tier.per_shift)}» ({pct(sal.next_tier.percent, None)}) не хватает "
-                         f"{money(round(sal.next_tier.per_shift - sal.average))} в среднем за смену")
+                         f"{money(sal.next_tier.per_shift - sal.best_revenue)} в одной смене")
     today = ctx.now.date()
-    plan = forecast(sal, rules, today) if first <= today <= last else None
+    plan = forecast(sal, rules) if first <= today <= last else None
     if plan is not None:
-        lines.append(f"🎯 Прогноз: ещё ~{shifts_word(plan.remaining_shifts)}; для «от {money(plan.target.per_shift)}» нужно "
-                     f"в среднем {money(plan.needed_average)} за смену")
+        lines.append(f"🎯 Для «от {money(plan.target.per_shift)}» ({pct(plan.target.percent, None)}) нужно "
+                     f"{money(plan.needed_revenue)} выручки за одну смену")
     if sal.shortage:
         lines.append(f"Недостача: −{money(sal.shortage)}")
     for p in sal.penalties:

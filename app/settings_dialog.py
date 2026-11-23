@@ -182,7 +182,6 @@ def salary_rules(user_id: int | None = None) -> SalaryRules:
     return SalaryRules(
         shift_rate=int(s.value("salary_rate", 0)),
         tiers=tiers if tiers is not None else bonus_tiers(),
-        above_plan_only=str(s.value("bonus_above_plan", "false")) == "true",
         deduct_shortage=str(s.value("salary_deduct", "true")) == "true",
         holiday_rate=int(s.value("salary_holiday_rate", 0)),
         holidays=holidays_calendar(),
@@ -463,30 +462,23 @@ class SettingsDialog(QDialog):
         base_form.addRow(self.deduct_check)
         layout.addWidget(base)
 
-        bonus = QGroupBox("Премия от прихода — только при выполнении плана")
+        bonus = QGroupBox("Премия от выручки за смену")
         bonus_layout = QVBoxLayout(bonus)
         bonus_layout.addWidget(_gray_label(
-            "Берётся средний приход сотрудника за смену за месяц (приход ÷ сданные смены),\n"
-            "праздничные смены не считаются.\n"
-            "Срабатывает самая высокая ступень, до которой он дотянул.\n"
-            "Первая ступень — это план: не дотянул до неё — премии нет. Пустые (—) не считаются."))
+            "Для каждой сданной смены отдельно берётся её выручка (праздничные не считаются).\n"
+            "Срабатывает самая высокая ступень, и её процент начисляется со всей выручки этой смены.\n"
+            "Премия за месяц = сумма премий за смены. Первая ступень — план: смена ниже неё премии не даёт.\n"
+            "Например, при ступени «от 40 000 — 3%» смена на 41 000 ₽ даёт сразу 1 230 ₽. Пустые (—) не считаются."))
         self.tiers_editor = TiersEditor(bonus_tiers())
         bonus_layout.addWidget(self.tiers_editor)
-        form = QFormLayout()
-        self.above_box = QComboBox()
-        self.above_box.addItem("со всего прихода за месяц", False)
-        self.above_box.addItem("только с прихода сверх плана", True)
-        self.above_box.setCurrentIndex(1 if rules.above_plan_only else 0)
-        form.addRow("Процент считать:", self.above_box)
-        bonus_layout.addLayout(form)
         self.overrides = bonus_overrides()
         own = QPushButton("Свои ступени для сотрудника…")
         own.clicked.connect(self._employee_tiers)
         bonus_layout.addWidget(own)
         layout.addWidget(bonus)
-        layout.addWidget(_gray_label("Зарплата = смены × ставка + премия − недостачи − санкции ± аванс, премия, доплата.\n"
+        layout.addWidget(_gray_label("Зарплата = смены × ставка + премия по сменам − недостачи − санкции ± аванс, разовая премия, доплата.\n"
                                      "Ставка — за каждую смену, даже несданную; премия — только по сданным.\n"
-                                     "Аванс, премию, доплату — в личном кабинете (выбрав сотрудника) или в Telegram."))
+                                     "Аванс, разовую премию и доплату — в личном кабинете (выбрав сотрудника) или в Telegram."))
         layout.addStretch(1)
         return page
 
@@ -1143,7 +1135,6 @@ class SettingsDialog(QDialog):
             ("тревога о списании (раз)", writeoff_alert()[0], self.alert_factor.value(), False),
             ("тревога о списании от (₽)", writeoff_alert()[1], self.alert_min.value(), False),
             ("вычитать недостачу", rules.deduct_shortage, self.deduct_check.isChecked(), False),
-            ("процент сверх плана", rules.above_plan_only, bool(self.above_box.currentData()), False),
             ("премия, если санкций меньше", rules.max_penalties, self.max_pen_box.value(), False),
             ("премия, если списаний меньше (%)", rules.max_writeoff_percent, self.max_wo_box.value(), False),
             ("списания считать", rules.writeoff_base, self.wo_base_box.currentData(), False),
@@ -1234,7 +1225,7 @@ class SettingsDialog(QDialog):
         settings.setValue("writeoff_alert_min", self.alert_min.value())
         settings.setValue("salary_deduct", _bool(self.deduct_check.isChecked()))
         settings.setValue("bonus_tiers", json.dumps(_dump_tiers(self.tiers_editor.tiers())))
-        settings.setValue("bonus_above_plan", _bool(self.above_box.currentData()))
+        settings.remove("bonus_above_plan")  # старый режим «процент сверх плана» больше не используется
         settings.setValue("bonus_max_penalties", self.max_pen_box.value())
         settings.setValue("bonus_max_writeoff", self.max_wo_box.value())
         settings.setValue("writeoff_base", self.wo_base_box.currentData())

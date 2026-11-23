@@ -528,7 +528,7 @@ class MainWindow(QMainWindow):
                     self, "Сдача смены",
                     f"Смена закончилась в {pending.end(change):%H:%M}. Сдайте её до "
                     f"{pending.deadline(change, grace):%H:%M} — иначе она будет отмечена как не сданная.")
-                closing = CloseShiftDialog(self, self.db, pending, change, grace, water_schedule())
+                closing = CloseShiftDialog(self, self.db, pending, change, grace, water_schedule(), salary_rules)
                 if closing.exec() != QDialog.Accepted:
                     if self.user.is_admin:
                         self.shift = pending
@@ -799,7 +799,7 @@ class MainWindow(QMainWindow):
             self.shift = None
             self.update_shift_box()
             return
-        closing = CloseShiftDialog(self, self.db, self.shift, change, grace, water_schedule())
+        closing = CloseShiftDialog(self, self.db, self.shift, change, grace, water_schedule(), salary_rules)
         if closing.exec() != QDialog.Accepted:
             return
         self._after_shift_closed(closing.shift)

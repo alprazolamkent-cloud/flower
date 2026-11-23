@@ -267,6 +267,8 @@ def shift_closed_text(shift: Shift, change: time, late: bool, water: str | None,
     ]
     if reasons:
         lines.append("   " + ", ".join(f"{r} {money(a)}" for r, a in reasons.items()))
+    if getattr(shift, "bonus", 0):
+        lines.append(f"💰 Премия за смену: {money(shift.bonus)}")
     if alert:
         lines.append(alert)
     lines += [

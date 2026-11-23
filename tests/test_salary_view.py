@@ -27,7 +27,7 @@ def test_calc_lines_and_total():
     sal = calculate([fake(date(2026, 3, 6), 35000), fake(date(2026, 3, 8), 90000)], adj, RULES)
     html = text(calc_html(sal, RULES))
     assert "Обычные смены: 1 × 2 000 ₽" in html and "Праздничные смены: 1 × 3 000 ₽" in html
-    assert "Премия: 5% с 35 000 ₽" in html and "+1 750 ₽" in html
+    assert "Премия по сменам" in html and "5% с 35 000 ₽ (06.03)" in html and "+1 750 ₽" in html
     assert "Аванс" in html and "−5 000 ₽" in html and "Доплата из Telegram: Мария" in html
     assert "К выплате" in html and f"{sal.total:,}".replace(",", " ") + " ₽" in html
 

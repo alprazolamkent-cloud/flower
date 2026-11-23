@@ -78,17 +78,17 @@ def test_salary_calculation(db):
 
     shifts = db.shifts_between(date(2026, 10, 1), date(2026, 10, 31), anna.id)
     tiers = [Tier(30000, 7), Tier(20000, 3), Tier(25000, 5)]  # порядок не важен
-    sal = calculate(shifts, db.adjustments(anna.id, "2026-10"), SalaryRules(2000, tiers, False, True))
-    # ставка — за все три смены (несданную тоже оплачиваем), премия — по двум сданным
+    sal = calculate(shifts, db.adjustments(anna.id, "2026-10"), SalaryRules(2000, tiers, True))
+    # ставка — за все три смены (несданную тоже оплачиваем), премия — отдельно по двум сданным
     assert (sal.shifts, sal.base, sal.revenue, sal.average) == (3, 6000, 50000, 25000)
-    assert sal.tier == Tier(25000, 5) and sal.next_tier == Tier(30000, 7) and sal.plan == 20000
-    assert (sal.bonus_base, sal.bonus) == (50000, 2500)  # 5% со всего прихода
+    assert sal.tier == Tier(30000, 7) and sal.next_tier is None and sal.plan == 20000
+    assert (sal.bonus_base, sal.bonus) == (50000, 2700)  # 7% с 30 000 + 3% с 20 000
+    assert [(t.percent, amount) for _, _, t, amount in sal.shift_bonuses] == [(7, 2100), (3, 600)]
     assert (sal.shortage, sal.not_closed, sal.adjustments_total) == (300, 1, -4000)
-    assert sal.total == 6000 + 2500 - 300 - 4000
+    assert sal.total == 6000 + 2700 - 300 - 4000
 
-    above = calculate(shifts, [], SalaryRules(2000, tiers, True, False))
-    # сверх плана: 50 000 − 2 смены × 20 000 = 10 000, 5% = 500; недостачу не вычитаем
-    assert (above.bonus_base, above.bonus, above.shortage) == (10000, 500, 0)
+    no_deduct = calculate(shifts, [], SalaryRules(2000, tiers, False))
+    assert (no_deduct.bonus, no_deduct.shortage) == (2700, 0)
 
 
 def test_salary_plan_not_met_and_no_tiers(db):
@@ -283,4 +283,4 @@ def test_salary_rules_use_employee_tiers(monkeypatch):
     assert settings_dialog.salary_rules().tiers == [Tier(30000, 5)]
     assert settings_dialog.salary_rules(7).tiers == [Tier(20000, 3)]  # свои ступени
     assert settings_dialog.salary_rules(8).tiers == [Tier(30000, 5)]  # остальным — общие
-    assert settings_dialog.salary_rules(7).above_plan_only and settings_dialog.salary_rules().shift_rate == 2000
+    assert settings_dialog.salary_rules().shift_rate == 2000

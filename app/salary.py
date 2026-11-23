@@ -1,17 +1,16 @@
-"""Зарплата флориста за месяц: ставка за смену + премия ступенями − недостачи ± доплаты и удержания.
+"""Зарплата флориста за месяц: ставка за смену + премия по выручке каждой смены − недостачи ± доплаты.
 
-Премия: средний приход за смену (приход за месяц ÷ сданные смены) сравнивается со ступенями,
-срабатывает самая высокая достигнутая. Не дотянул до первой ступени (плана) — премии нет.
+Премия считается отдельно по каждой сданной смене: её выручка сравнивается со ступенями, срабатывает
+самая высокая достигнутая, и её процент начисляется со всей выручки этой смены. Премия за месяц — просто
+сумма премий за смены. Не дотянул до первой ступени (плана) — за эту смену премии нет.
 Кроме того, премия выдаётся только если за месяц штрафных санкций у сотрудника меньше заданного числа
 (по умолчанию 3) и списания цветов по магазину меньше заданного процента (по умолчанию 15%).
 Сами штрафные санкции вычитаются из зарплаты.
 
-Праздничные смены: выручка в расчёт премии не идёт (ни в сумму, ни в средний приход за смену), зато за них
-может платиться своя ставка. В обычные выходные (суббота, воскресенье) всё как в будни.
+Праздничные смены: выручка в расчёт премии не идёт, зато за них может платиться своя ставка.
+В обычные выходные (суббота, воскресенье) всё как в будни.
 """
 
-import calendar
-import math
 from dataclasses import dataclass, field
 from datetime import date
 
@@ -72,7 +71,7 @@ def shop_writeoff(shifts: list[Shift]) -> ShopWriteoff:
 
 @dataclass
 class Tier:
-    per_shift: int  # средний приход за смену — «от»
+    per_shift: int  # выручка одной смены — «от»
     percent: float
 
 
@@ -80,7 +79,6 @@ class Tier:
 class SalaryRules:
     shift_rate: int = 0  # ₽ за сданную смену
     tiers: list[Tier] = field(default_factory=list)
-    above_plan_only: bool = False  # процент только с прихода сверх плана (план — первая ступень)
     deduct_shortage: bool = True  # вычитать недостачу кассы
     max_penalties: int = 3  # премия, только если санкций за месяц МЕНЬШЕ этого числа (0 — не проверять)
     max_writeoff_percent: float = 15.0  # и списаний по магазину МЕНЬШЕ этого процента (0 — не проверять)
@@ -102,6 +100,14 @@ class SalaryRules:
         return sorted((t for t in self.tiers if t.percent > 0), key=lambda t: t.per_shift)
 
 
+def bonus_for_shift(revenue: int, rules: SalaryRules, day: date | None = None) -> tuple[Tier | None, int]:
+    """Ступень и премия за одну смену: процент с её выручки, а не со среднего прихода за месяц."""
+    if revenue <= 0 or (day is not None and rules.shift_kind(day) == "holiday"):
+        return None, 0
+    tier = next((t for t in reversed(rules.active_tiers()) if revenue >= t.per_shift), None)
+    return tier, round(revenue * tier.percent / 100) if tier else 0
+
+
 KIND_TITLES = {"normal": "обычные", "holiday": "праздничные"}
 
 
@@ -114,11 +120,13 @@ class Salary:
     holiday_revenue: int = 0
     bonus_shifts: int = 0  # смены, по которым считается премия (без праздничных)
     revenue: int = 0  # выручка, по которой считается премия (без праздничных смен)
-    average: float = 0.0
-    tier: Tier | None = None  # достигнутая ступень
+    average: float = 0.0  # справочно: средняя выручка за смену, в расчёте ступени не участвует
+    best_revenue: int = 0  # лучшая выручка одной смены — для подсказки до следующей ступени
+    shift_bonuses: list[tuple[date, int, Tier | None, int]] = field(default_factory=list)  # день, выручка, ступень, премия
+    tier: Tier | None = None  # самая высокая ступень, достигнутая хотя бы одной сменой
     next_tier: Tier | None = None  # следующая ступень — к чему стремиться
-    plan: int = 0  # первая ступень (средний приход за смену)
-    bonus_base: int = 0  # с какой суммы считали процент
+    plan: int = 0  # первая ступень (выручка смены)
+    bonus_base: int = 0  # сумма выручки смен, по которым начислена премия
     bonus: int = 0  # выплата: 0, если не выполнены условия
     bonus_earned: int = 0  # сколько было бы без условий — чтобы видеть, что потеряно
     blocked: list[str] = field(default_factory=list)  # почему премии нет (штрафы, списания)
@@ -158,15 +166,16 @@ def calculate(shifts: list[Shift], adjustments: list[Adjustment], rules: SalaryR
             base_parts.append((kind, len(group), rules.rate_for(group[0].day)))
     shortage = sum(-d for s in closed if (d := s.difference()) is not None and d < 0)
     tiers = rules.active_tiers()
-
-    tier = next((t for t in reversed(tiers) if counted and average >= t.per_shift), None)
-    next_tier = next((t for t in tiers if average < t.per_shift), None)
     plan = tiers[0].per_shift if tiers else 0
-    bonus_base = 0
-    if tier is not None:
-        bonus_base = max(0, revenue - plan * len(counted)) if rules.above_plan_only else revenue
 
-    earned = round(bonus_base * tier.percent / 100) if tier else 0
+    # Премия по каждой смене отдельно; месячная — просто сумма, без «среднего прихода» и плана на месяц.
+    shift_bonuses = [(s.day, s.revenue, *bonus_for_shift(s.revenue, rules, s.day)) for s in counted]
+    earned = sum(amount for _, _, _, amount in shift_bonuses)
+    reached = [tier for _, _, tier, _ in shift_bonuses if tier is not None]
+    tier = max(reached, key=lambda t: t.per_shift, default=None)
+    next_tier = next((t for t in tiers if tier is None or t.per_shift > tier.per_shift), None)
+    bonus_base = sum(rev for _, rev, t, _ in shift_bonuses if t is not None)
+    best_revenue = max((rev for _, rev, _, _ in shift_bonuses), default=0)
 
     blocked = []
     if rules.max_penalties > 0 and len(penalties) >= rules.max_penalties:
@@ -186,6 +195,8 @@ def calculate(shifts: list[Shift], adjustments: list[Adjustment], rules: SalaryR
         bonus_shifts=len(counted),
         revenue=revenue,
         average=average,
+        best_revenue=best_revenue,
+        shift_bonuses=shift_bonuses,
         tier=tier,
         next_tier=next_tier,
         plan=plan,
@@ -213,27 +224,15 @@ def shifts_word(n: int) -> str:
 
 @dataclass
 class Forecast:
-    remaining_shifts: int  # сколько смен ожидается до конца месяца при нынешнем темпе
-    target: Tier  # к какой ступени идём
-    needed_average: int  # сколько в среднем за смену нужно набрать на оставшихся сменах
+    target: Tier  # следующая ступень
+    needed_revenue: int  # выручка одной смены, которая даст эту ступень
 
 
-def forecast(sal: Salary, rules: SalaryRules, today: date) -> Forecast | None:
-    """Что нужно, чтобы к концу месяца выйти на следующую ступень премии. Только для идущего месяца."""
-    tiers = rules.active_tiers()
-    if not tiers or not sal.shifts:
+def forecast(sal: Salary, rules: SalaryRules) -> Forecast | None:
+    """Сколько нужно выручки за одну смену, чтобы получить следующую ступень премии."""
+    if not rules.active_tiers() or sal.next_tier is None:
         return None
-    target = sal.next_tier
-    if target is None:
-        return None  # уже на высшей ступени
-    first = today.replace(day=1)
-    last = today.replace(day=calendar.monthrange(today.year, today.month)[1])
-    pace = sal.shifts / ((today - first).days + 1)  # смен в день
-    remaining = round(pace * (last - today).days)
-    if remaining <= 0:
-        return None
-    needed = (target.per_shift * (sal.bonus_shifts + remaining) - sal.revenue) / remaining
-    return Forecast(remaining, target, max(0, math.ceil(needed)))
+    return Forecast(sal.next_tier, sal.next_tier.per_shift)
 
 
 @dataclass

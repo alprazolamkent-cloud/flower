@@ -298,7 +298,7 @@ CREATE TABLE IF NOT EXISTS shift_duties (
 # Столбцы смен, добавленные позже.
 SHIFT_MIGRATIONS = {
     column: f"ALTER TABLE shifts ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0"
-    for column in ("revenue", "flowers", "terminal", "qr", "deliveries", "writeoff")
+    for column in ("revenue", "flowers", "terminal", "qr", "deliveries", "writeoff", "bonus")
 }
 
 DUTY_MIGRATIONS = {  # проверка обязанностей тем, кто принимает смену
@@ -338,7 +338,7 @@ SELECT s.id, s.user_id, COALESCE(NULLIF(u.name, ''), u.login, ''), s.day, s.open
             ELSE (SELECT COUNT(*) FROM shift_duties sd WHERE sd.shift_id = s.id AND sd.done_at IS NOT NULL) END,
        CASE WHEN s.closed_at IS NULL THEN (SELECT COUNT(*) FROM duties WHERE active = 1)
             ELSE (SELECT COUNT(*) FROM shift_duties sd WHERE sd.shift_id = s.id) END,
-       s.writeoff
+       s.writeoff, s.bonus
 FROM shifts s LEFT JOIN users u ON u.id = s.user_id
 """
 
@@ -354,7 +354,7 @@ def _row_to_shift(r) -> Shift:
         closed_at=datetime.fromisoformat(r[6]) if r[6] else None, closing_cash=r[7],
         cash_sales=r[8], delivery_cash=r[9], courier_cash=r[10], note=r[11],
         expenses=r[12], withdrawals=r[13], revenue=r[14], flowers=r[15], terminal=r[16], qr=r[17],
-        deliveries=r[18], duties_done=r[19], duties_total=r[20], writeoff=r[21],
+        deliveries=r[18], duties_done=r[19], duties_total=r[20], writeoff=r[21], bonus=r[22],
     )
 
 # Столбцы, добавленные после первой версии: старые базы дополняются при запуске.
@@ -1223,22 +1223,22 @@ class Database(ClientStore, StockStore):
     def close_shift(self, shift_id: int, now: datetime, closing_cash: int, cash_sales: int,
                     courier_cash: int, note: str = "", revenue: int = 0, flowers: int = 0,
                     terminal: int = 0, qr: int = 0, deliveries: int = 0, writeoff: int = 0,
-                    writeoff_items: dict[str, int] | None = None) -> Shift:
+                    writeoff_items: dict[str, int] | None = None, bonus: int = 0) -> Shift:
         """writeoff_items — списания по причинам {«Завяло»: 2000}; если заданы, writeoff считается их суммой."""
         if writeoff_items is not None:
             if min(writeoff_items.values(), default=0) < 0:
                 raise UserError("Суммы не могут быть отрицательными.")
             writeoff = sum(writeoff_items.values())
-        if min(closing_cash, cash_sales, courier_cash, revenue, flowers, terminal, qr, deliveries, writeoff) < 0:
+        if min(closing_cash, cash_sales, courier_cash, revenue, flowers, terminal, qr, deliveries, writeoff, bonus) < 0:
             raise UserError("Суммы не могут быть отрицательными.")
         if flowers > revenue:
             raise UserError("Цветов не может быть продано больше, чем весь приход.")
         cur = self.conn.execute(
             "UPDATE shifts SET closed_at=?, closing_cash=?, cash_sales=?, delivery_cash=0, courier_cash=?,"
-            " note=?, revenue=?, flowers=?, terminal=?, qr=?, deliveries=?, writeoff=?"
+            " note=?, revenue=?, flowers=?, terminal=?, qr=?, deliveries=?, writeoff=?, bonus=?"
             " WHERE id=? AND closed_at IS NULL",
             (_ts(now), closing_cash, cash_sales, courier_cash, note.strip(), revenue, flowers,
-             terminal, qr, deliveries, writeoff, shift_id),
+             terminal, qr, deliveries, writeoff, bonus, shift_id),
         )
         self.conn.commit()
         if cur.rowcount == 0:

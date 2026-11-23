@@ -53,11 +53,11 @@ def test_holiday_shift_has_own_rate_and_no_bonus_revenue():
     assert rules.shift_kind(date(2026, 3, 7)) == "normal"
     assert sal.holiday_shifts == 1 and sal.holiday_revenue == 90000
     assert sal.revenue == 80000 and sal.bonus_shifts == 2 and sal.average == 40000
-    assert sal.bonus == 4000  # 5% только с 80 000, праздничные 90 000 не в счёт
+    assert sal.bonus == 4000  # по 2 000 с каждой обычной смены, праздничные 90 000 не в счёт
 
 
 def test_only_holiday_shifts_no_bonus():
-    rules = SalaryRules(2000, [Tier(30000, 5)], holidays=Holidays(yearly={(8, 3)}))
+    rules = SalaryRules(2000, [Tier(30000, 5), Tier(80000, 10)], holidays=Holidays(yearly={(8, 3)}))
     sal = calculate([fake(date(2026, 3, 8), 90000)], [], rules)
     assert sal.bonus == 0 and sal.tier is None and sal.base == 2000
 
@@ -66,13 +66,10 @@ def test_forecast_and_ranking():
     rules = SalaryRules(2000, [Tier(30000, 5), Tier(40000, 7)])
     shifts = [fake(date(2026, 10, d), 32000) for d in (1, 5, 10)]
     sal = calculate(shifts, [], rules)
-    plan = forecast(sal, rules, date(2026, 10, 15))
-    assert plan.target.per_shift == 40000 and plan.remaining_shifts == 3
-    # (40000 × 6 − 96000) / 3 = 48000
-    assert plan.needed_average == 48000
-    assert forecast(sal, rules, date(2026, 10, 31)) is None  # месяц кончился — оставшихся смен нет
+    plan = forecast(sal, rules)
+    assert plan.target.per_shift == 40000 and plan.needed_revenue == 40000  # ступень — по одной смене
     top = calculate([fake(date(2026, 10, 1), 45000)], [], rules)
-    assert forecast(top, rules, date(2026, 10, 15)) is None  # уже высшая ступень
+    assert forecast(top, rules) is None  # уже высшая ступень
     ranking = monthly_ranking([fake(date(2026, 10, 1), 50000), fake(date(2026, 10, 2), 30000)], rules)
     assert ranking.best_shift.revenue == 50000 and ranking.best_average == 40000
 

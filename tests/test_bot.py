@@ -121,7 +121,7 @@ def test_staff_and_salary(shop):
     assert "Смены: 2 × 2 000 ₽ = 4 000 ₽" in detail and "5% с 36 000 ₽ = 1 800 ₽" in detail
     assert "Итого: 5 800 ₽" in detail and "несданных смен 1" in detail and "До «от 40 000 ₽» (7%) не хватает 4 000 ₽" in detail
     oleg = ask(shop, "/зарплата Олег")
-    assert "План не выполнен" in oleg and "Недостача: −300 ₽" in oleg and "Итого: 1 700 ₽" in oleg
+    assert "до плана (30 000 ₽)" in oleg and "Недостача: −300 ₽" in oleg and "Итого: 1 700 ₽" in oleg
     assert "Такого сотрудника нет" in ask(shop, "/зарплата Мария")
 
 

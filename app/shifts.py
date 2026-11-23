@@ -168,6 +168,7 @@ class Shift:
     duties_done: int = 0
     duties_total: int = 0
     writeoff: int = 0  # списано цветов за смену, ₽ (завяли, разбились)
+    bonus: int = 0  # премия по ступеням за выручку этой смены, ₽
     expenses: int = 0
     withdrawals: int = 0
 
