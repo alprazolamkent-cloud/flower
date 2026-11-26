@@ -98,3 +98,56 @@ def test_server_roundtrip(db):
     thread.join()
     server.stop()
     assert "AloFlorist" in result["body"]
+
+
+NOW = datetime(2026, 11, 26, 12, 0)
+
+
+def test_bot_orders_on_site(db):
+    from datetime import timedelta
+    sent, admins = [], []
+    app = WebApp(db, send_to_client=lambda chat, text, photo=None, markup=None: sent.append((chat, text)),
+                 notify_admin=lambda text, key: admins.append(text), sale_shift_id=lambda: None)
+    cookies = login(app)
+    db.touch_client("555", "Иван", "ivan", NOW)
+    o = db.add_client_order("555", NOW, date.today() + timedelta(days=1), "к 15:00", "Нежность — 3 500 ₽",
+                            "ул. Ленина, 5", "Маша", "+79001112233", "", None)
+    _, _, body = app.handle("GET", "/orders", {}, cookies)
+    assert "Нежность" in body.decode() and "назначьте сумму" in body.decode()
+    _, _, body = app.handle("GET", "/order", {"id": str(o.id)}, cookies)
+    assert "Сумма к оплате" in body.decode()
+
+    status, _, _ = app.handle("POST", "/order/price",
+                              {"id": str(o.id), "amount": "4200", "fee": "700"}, cookies)
+    assert status == 303
+    order = db.get_client_order(o.id)
+    assert order.status == "priced" and order.amount == 4200
+    assert sent and "4 200" in sent[-1][1]  # клиенту ушли реквизиты
+
+    _, _, body = app.handle("GET", "/order/confirm", {"id": str(o.id)}, cookies)
+    assert "точно пришли" in body.decode()  # экран подтверждения от случайного касания
+    status, _, _ = app.handle("POST", "/order/confirm", {"id": str(o.id)}, cookies)
+    assert status == 303
+    order = db.get_client_order(o.id)
+    assert order.status == "confirmed" and order.delivery_id
+    assert any("Оплата получена" in text for _, text in sent)
+    assert admins and f"№{o.id}" in admins[-1]
+    assert db.loyalty().balance("79001112233") == 175  # 5% с 3500 (без доставки)
+
+
+def test_reject_returns_bonus_on_site(db):
+    sent = []
+    app = WebApp(db, send_to_client=lambda chat, text, photo=None, markup=None: sent.append(text))
+    cookies = login(app)
+    db.loyalty().adjust("79001112233", 500, note="тест")
+    db.touch_client("555", "Иван", "ivan", NOW)
+    o = db.add_client_order("555", NOW, date.today(), "к 15:00", "Букет", "ул. Ленина, 5", "Маша",
+                            "+79001112233", "", None)
+    db.price_client_order(o.id, 3000, 0, NOW)
+    db.loyalty().spend("79001112233", 300, now=NOW, source="Заказ", author="Клиент")
+    db.set_order_bonus(o.id, 300, 0, 0)
+    status, _, _ = app.handle("POST", "/order/reject", {"id": str(o.id), "reason": "нет цветов"}, cookies)
+    assert status == 303
+    assert db.get_client_order(o.id).status == "rejected"
+    assert db.loyalty().balance("79001112233") == 500  # списанные баллы вернулись
+    assert "нет цветов" in sent[-1]

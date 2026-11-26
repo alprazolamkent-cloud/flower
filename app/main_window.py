@@ -961,7 +961,8 @@ class MainWindow(QMainWindow):
             penalty_kinds=penalty_catalog(), penalty_changed=self._penalty_changed, dispute_kept=self._dispute_kept)
 
     def start_web_server(self):
-        """Сайт для телефона в Wi-Fi магазина: доставки и склад. Включается в Настройки → Программа."""
+        """Сайт для телефона в Wi-Fi магазина: доставки, заказы из бота и склад.
+        Включается в Настройки → Программа."""
         if self.web_server is not None:
             self.web_server.stop()
             self.web_server = None
@@ -970,12 +971,27 @@ class MainWindow(QMainWindow):
         app = WebApp(self.db,
                      on_assembled=lambda did: self._after_assembled(self.db.get_delivery(did)),
                      on_delivered=lambda did: self._after_delivered(self.db.get_delivery(did)),
-                     on_change=self.refresh_day)
+                     on_change=self._web_changed,
+                     send_to_client=self._web_to_client,
+                     notify_admin=lambda text, key: self.telegram.queue(text, key=key),
+                     sale_shift_id=self.sale_shift_id)
         self.web_server = WebServer(app, web_port(), self)
         try:
             self.web_server.start()
         except OSError:  # порт занят — адрес в настройках покажет «не запущен»
             self.web_server = None
+
+    def _web_to_client(self, chat_id: str, text: str, photo: bytes | None = None, markup: dict | None = None):
+        """Сообщение клиенту с сайта: уходит через бота и остаётся в переписке (как из окна «Клиенты»)."""
+        self.db.add_client_message(chat_id, False, text, datetime.now(), photo)
+        self.client_bot.queue(chat_id, text, photo, markup)
+
+    def _web_changed(self):
+        """С сайта что-то поменяли — обновить окно."""
+        self.refresh_day()
+        self.update_clients_button()
+        if self.client_center is not None:
+            self.client_center.refresh()
 
     def audit(self, action: str, details: str = ""):
         """Запись в журнал действий от имени вошедшего сотрудника."""

@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (
 from .client_bot import (
     QR_FILE, bot_link, chat_configured, client_configured, client_settings, is_max, max_settings,
 )
+from . import order_ops
 from .client_flow import MENU, inline, payment_text
 from .db import ORDER_STATUS, ClientOrder, ShowcaseItem, UserError
 from .delivery_dialog import money, money_box
@@ -296,33 +297,21 @@ class ClientCenter(QDialog):
         o = self._order()
         if o is None:
             return
-        requisites = client_settings()["requisites"].strip()
-        qr = self.db.get_file(QR_FILE)
-        if not requisites and not qr:
+        if not order_ops.payment_ready(self.db):
             QMessageBox.warning(self, "Оплата", "Не загружен QR-код и не вписаны реквизиты для оплаты.\n"
                                 "Администратор добавляет их: Настройки → Клиенты.")
             return
-        method = self.pay_box.currentData() or "both"
-        if method == "qr":
-            requisites = ""
-        elif method == "transfer":
-            qr = None
         if o.status == "paid_claimed" and QMessageBox.question(
                 self, "Новая сумма", "Клиент уже сообщил, что оплатил. Всё равно отправить новую сумму?",
                 QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
             return
         try:
-            o = self.db.price_client_order(o.id, self.amount_box.value(), self.fee_box.value(), datetime.now())
+            o, can_bonus = order_ops.send_price(self.db, o.id, self.amount_box.value(), self.fee_box.value(),
+                                                datetime.now(), self._to_client,
+                                                method=self.pay_box.currentData() or "both")
         except UserError as e:
             QMessageBox.warning(self, "Сумма", str(e))
             return
-        loyalty = self.db.loyalty()
-        can_bonus = loyalty.max_spend(norm_phone(o.client_phone), max(0, o.amount - o.delivery_fee))
-        buttons = [("✅ Я оплатил(а)", f"paid:{o.id}")]
-        if can_bonus:
-            buttons.append((f"🎁 Списать {can_bonus} баллов", f"bonus:{o.id}:{can_bonus}"))
-        self._to_client(o.chat_id, payment_text(o, requisites, bool(qr)), photo=qr,
-                        markup=inline(*buttons))
         self.main.audit("Клиенту отправлена сумма", f"заказ из бота №{o.id}: {money(o.amount)}"
                         + (f" (доставка {money(o.delivery_fee)})" if o.delivery_fee else "")
                         + (f", можно списать {can_bonus} баллов" if can_bonus else ""))
@@ -338,36 +327,16 @@ class ClientCenter(QDialog):
                 f"{o.day:%d.%m} {o.time}, клиенту придёт подтверждение.",
                 QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
             return
-        now = datetime.now()
         try:
-            d = self.db.confirm_client_order(o.id, self.main.user.id if self.main.user else None, now,
-                                             self.main.sale_shift_id())
+            d, points, rate, doubled = order_ops.confirm_paid(
+                self.db, o.id, self.main.user, self.main.sale_shift_id(), datetime.now(),
+                self._to_client, self.main.telegram.queue)
         except UserError as e:
             QMessageBox.warning(self, "Принять заказ", str(e))
             return
-        loyalty = self.db.loyalty()
-        phone = norm_phone(o.client_phone)
-        eligible = self.db.order_bonus_eligible(o)  # amount уже за вычетом списанных баллов
-        rate = loyalty.rate(phone, now)
-        doubled = loyalty.is_occasion(phone, o.day)
-        points = loyalty.accrue(phone, eligible, now=now, source=f"Заказ №{o.id}",
-                                author=self.main.user.name if self.main.user else "", doubled=doubled)
         if points:
-            self.db.set_order_bonus(o.id, o.bonus_spent, points, rate)
-            sale_id = self.db.get_client_order(o.id).sale_id
-            if sale_id:  # баллы — и в продаже, чтобы её отмена их сняла
-                self.db.set_sale_bonus(sale_id, points, rate)
             self.main.audit("Начислены бонусы", f"заказ №{o.id}: +{points} баллов "
                                                 f"({rate}%{', двойные' if doubled else ''})")
-        then = ("Напишем, когда букет будет готов — можно будет забирать." if o.address == "Самовывоз"
-                else "Напишем, когда букет соберём и когда доставим.")
-        bonus_line = (f"\n🎁 Начислили {points} бонусов. Баланс: {loyalty.balance(phone, now)}."
-                      if points else "")
-        self._to_client(o.chat_id, f"Оплата получена ✅ Заказ №{o.id} принят: {o.day:%d.%m} {o.time}.\n{then}"
-                        + bonus_line, markup=MENU)
-        self.main.telegram.queue(f"✅ Заказ №{o.id} из бота принят — {self._author() or 'флорист'}\n"
-                                 f"Оплачено {money(o.amount)}, доставка {o.day:%d.%m} {o.time}",
-                                 key=f"client_ok:{o.id}")
         self.main.audit("Заказ из бота принят", f"№{o.id}, оплачено {money(o.amount)} → доставка №{d.id}")
         self._changed(o.id)
         self.main.refresh_all()
@@ -387,14 +356,8 @@ class ClientCenter(QDialog):
             restore = QMessageBox.question(
                 self, "Букет с витрины", f"Вернуть «{item.title}» на витрину? Он был в одном экземпляре.\n\n"
                 "«Нет» — если его уже продали.", QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes) == QMessageBox.Yes
-        self.db.set_client_order_status(o.id, "rejected", datetime.now(), reason, restore_single=restore)
-        if o.bonus_spent:  # клиент списывал баллы — вернуть, заказ же не состоялся
-            self.db.loyalty().adjust(norm_phone(o.client_phone), o.bonus_spent,
-                                     note=f"Возврат баллов за отклонённый заказ №{o.id}",
-                                     author=self.main.user.name if self.main.user else "")
-            self.db.set_order_bonus(o.id, 0, o.bonus_accrued, o.loyalty_rate)
-        self._to_client(o.chat_id, f"К сожалению, заказ №{o.id} не можем принять" + (f": {reason}" if reason else ".")
-                        + "\nНапишите нам — подберём другой вариант 🌷", markup=MENU)
+        order_ops.reject(self.db, o.id, self._author(), reason, datetime.now(), self._to_client,
+                         restore_single=restore)
         self.main.audit("Заказ из бота отклонён", f"№{o.id}" + (f": {reason}" if reason else ""))
         if o.status == "paid_claimed":
             QMessageBox.information(self, "Отклонён", "Клиент сообщал, что оплатил. Если деньги пришли — "

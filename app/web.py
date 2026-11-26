@@ -8,7 +8,10 @@ import html
 import secrets
 from datetime import date, datetime, timedelta
 
-from .db import Database, User
+from . import order_ops
+from .client_bot import QR_FILE, client_settings
+from .db import ORDER_STATUS, Database, User
+from .delivery_dialog import money
 from .stock import qty_text
 
 SESSION_HOURS = 12
@@ -47,6 +50,18 @@ th {{ color: #d63384; }}
 tr.low td {{ color: #c0392b; font-weight: bold; }}
 .cat {{ background: #fbe9f1; font-weight: bold; }}
 .gray {{ color: #6b5560; font-size: 13px; }}
+a.card {{ display: block; text-decoration: none; color: inherit; }}
+select {{ font-size: 16px; padding: 10px 12px; border: 1px solid #e3b7c8; border-radius: 10px;
+         width: 100%; margin-bottom: 10px; background: #fff; }}
+a.btn {{ display: block; text-align: center; text-decoration: none; }}
+a.btn.del, button.del {{ background: #d63384; color: #fff; }}
+.here2 {{ background: #d63384; color: #fff; }}
+.st-new {{ color: #e67e22; font-weight: bold; }}
+.st-priced {{ color: #2980b9; font-weight: bold; }}
+.st-paid_claimed {{ color: #c0392b; font-weight: bold; }}
+.st-confirmed {{ color: #2e9e5b; font-weight: bold; }}
+.st-rejected {{ color: #6b5560; }}
+h3 {{ margin: 4px 0 10px; }}
 </style></head><body>{body}</body></html>"""
 
 
@@ -65,11 +80,16 @@ def _redirect(to: str, headers: dict | None = None) -> tuple[int, dict, bytes]:
 class WebApp:
     """Маршруты сайта. Все методы вызываются в главном потоке программы."""
 
-    def __init__(self, db: Database, on_assembled=None, on_delivered=None, on_change=None):
+    def __init__(self, db: Database, on_assembled=None, on_delivered=None, on_change=None,
+                 send_to_client=None, notify_admin=None, sale_shift_id=None):
         self.db = db
         self.on_assembled = on_assembled  # колбэки главного окна: сообщить клиенту, попросить фото
         self.on_delivered = on_delivered
         self.on_change = on_change  # обновить таблицу доставок в программе
+        # заказы из бота: отправка клиенту, уведомление администраторам, смена для продажи
+        self.send_to_client = send_to_client or (lambda *a, **k: None)
+        self.notify_admin = notify_admin
+        self.sale_shift_id = sale_shift_id
         self.sessions: dict[str, tuple[User, datetime]] = {}  # токен → (сотрудник, действует до)
 
     # ----- сессии -----
@@ -111,12 +131,40 @@ class WebApp:
             return _redirect("/login", {"Set-Cookie": f"{COOKIE}=; Path=/; Max-Age=0"})
         if path == "/toggle" and method == "POST":
             return self._toggle(user, form)
+        if path == "/orders":
+            return 200, {}, _page("Заказы", self._orders_page(user))
+        if path == "/order":
+            return 200, {}, _page("Заказ", self._order_page(user, form))
+        if path == "/order/price" and method == "POST":
+            return self._order_price(user, form)
+        if path == "/order/confirm":
+            return self._order_confirm(user, form, method)
+        if path == "/order/reject" and method == "POST":
+            return self._order_reject(user, form)
         if path == "/stock":
             return 200, {}, _page("Склад", self._stock_page(user, form.get("q", "")))
         if path == "/":
             return 200, {}, _page("Доставки", self._deliveries_page(user, form.get("day", "today")))
         return 404, {}, _page("Не найдено", '<main><div class="card">Такой страницы нет. '
                                            '<a href="/">На главную</a></div></main>')
+
+    # ----- общие куски страниц -----
+
+    def _header(self, user: User, here: str) -> str:
+        def tab(href, name, key):
+            cls = ' class="here"' if key == here else ""
+            return f'<a href="{href}"{cls}>{name}</a>'
+
+        open_orders = len(self.db.client_orders(open_only=True))
+        orders_name = f"Заказы ({open_orders})" if open_orders else "Заказы"
+        return (f'<header><b>🌸 AloFlorist</b>{tab("/", "Доставки", "deliveries")}'
+                f'{tab("/orders", orders_name, "orders")}{tab("/stock", "Склад", "stock")}'
+                f'<span class="who">{_esc(user.name or user.login)} · <a href="/logout">выйти</a></span></header>')
+
+    def _error_page(self, user: User, text: str, back: str) -> tuple[int, dict, bytes]:
+        body = (f'{self._header(user, "")}<main><div class="card">{_esc(text)}</div>'
+                f'<div class="row"><a class="btn" href="{back}">← Назад</a></div></main>')
+        return 200, {}, _page("Ошибка", body)
 
     # ----- доставки -----
 
@@ -172,16 +220,149 @@ class WebApp:
 {assembled_form}{delivered_form}</div>""")
         if not cards:
             cards.append('<div class="card">Доставок нет 🌷</div>')
-        tab_today = ' class="here"' if which != "tomorrow" else ""
-        tab_tomorrow = ' class="here"' if which == "tomorrow" else ""
         title = "Завтра" if which == "tomorrow" else "Сегодня"
-        return (f'<header><b>🌸 Доставки</b><a href="/?day=today"{tab_today}>Сегодня</a>'
-                f'<a href="/?day=tomorrow"{tab_tomorrow}>Завтра</a><a href="/stock">Склад</a>'
-                f'<span class="who">{_esc(user.name or user.login)} · <a href="/logout">выйти</a></span></header>'
-                f"<main><div class='gray' style='margin-bottom:8px'>{title}, {day:%d.%m.%Y} — "
+        tabs = (f'<div class="row" style="margin-bottom:10px">'
+                f'<a class="btn{" here2" if which != "tomorrow" else ""}" href="/?day=today">Сегодня</a>'
+                f'<a class="btn{" here2" if which == "tomorrow" else ""}" href="/?day=tomorrow">Завтра</a></div>')
+        return (self._header(user, "deliveries") + f"<main>{tabs}"
+                f"<div class='gray' style='margin-bottom:8px'>{title}, {day:%d.%m.%Y} — "
                 f"доставок: {len(items)}</div>{''.join(cards)}</main>")
 
+    # ----- заказы из бота -----
+
+    def _orders_page(self, user: User) -> str:
+        orders = self.db.client_orders(open_only=True)
+        cards = []
+        for o in orders:
+            status = ORDER_STATUS.get(o.status, o.status)
+            when = "сегодня" if o.day == date.today() else f"{o.day:%d.%m}"
+            cards.append(f'''<a class="card order" href="/order?id={o.id}">
+<div><b>№{o.id}</b> · <span class="st-{_esc(o.status)}">{_esc(status)}</span></div>
+<div class="items">{_esc(o.items.splitlines()[0] if o.items else "—")}</div>
+<div class="addr">{when} {o.time} · {_esc(o.client_name or o.client_phone or "клиент")}</div></a>''')
+        if not cards:
+            cards.append('<div class="card">Открытых заказов нет 🌷</div>')
+        return (self._header(user, "orders") + f"<main>{''.join(cards)}"
+                '<div class="gray">Заказы из бота для клиентов. Новый заказ ждёт суммы, '
+                '«оплата на проверке» — подтверждения.</div></main>')
+
+    def _order_page(self, user: User, form: dict) -> str:
+        try:
+            o = self.db.get_client_order(int(form.get("id", "0")))
+        except (TypeError, ValueError):
+            o = None
+        if o is None:
+            return self._error_page(user, "Такого заказа нет.", "/orders")[2].decode()
+        status = ORDER_STATUS.get(o.status, o.status)
+        rows = [("Статус", f'<span class="st-{_esc(o.status)}">{_esc(status)}</span>'),
+                ("Когда", f"{o.day:%d.%m.%Y} {o.time}"), ("Что", _esc(o.items)),
+                ("Куда", _esc(o.address)), ("Кому", _esc(o.recipient)),
+                ("Телефон", _esc(o.client_phone or "—"))]
+        if o.card:
+            rows.append(("Открытка", _esc(o.card)))
+        if o.bonus_spent:
+            rows.append(("Оплачено баллами", f"−{o.bonus_spent} ₽"))
+        if o.amount:
+            rows.append(("К оплате", money(o.amount) + (f" (из них доставка {money(o.delivery_fee)})"
+                                                         if o.delivery_fee else "")))
+        if o.has_paid_photo:
+            rows.append(("Оплата", "клиент прислал скриншот перевода — проверьте в банке"))
+        if o.note:
+            rows.append(("Причина отказа", _esc(o.note)))
+        body_rows = "".join(f'<tr><td class="gray" style="padding-right:12px" valign="top">{k}</td>'
+                            f"<td>{v}</td></tr>" for k, v in rows)
+        actions = []
+        open_ = o.status in ("new", "priced", "paid_claimed")
+        if open_:
+            amount = o.amount
+            if not amount and o.showcase_id:  # букет с витрины — подставить его цену
+                item = self.db.get_showcase_item(o.showcase_id)
+                amount = item.price if item else 0
+            method_row = ""
+            if client_settings()["requisites"].strip() and self.db.get_file(QR_FILE):
+                method_row = ('<select name="method"><option value="both">QR или перевод</option>'
+                              '<option value="qr">Только QR-код</option>'
+                              '<option value="transfer">Только перевод</option></select>')
+            actions.append(f'''<div class="card"><b>💳 Сумма к оплате</b>
+<form method="post" action="/order/price">
+<input type="hidden" name="id" value="{o.id}">
+<input name="amount" type="number" inputmode="numeric" min="1" value="{amount or ""}" placeholder="Сумма, ₽">
+<input name="fee" type="number" inputmode="numeric" min="0" value="{o.delivery_fee or ""}"
+ placeholder="Из них доставка, ₽">
+{method_row}
+<button class="del">Отправить сумму клиенту</button></form></div>''')
+        if o.status in ("priced", "paid_claimed"):
+            actions.append(f'''<div class="card"><b>✅ Оплата пришла?</b>
+<div class="gray">Проверьте поступление в банке — заказ попадёт в доставки, клиенту придёт подтверждение.</div>
+<div class="row"><a class="btn del" href="/order/confirm?id={o.id}">Оплата пришла — принять заказ</a></div></div>''')
+        if open_:
+            actions.append(f'''<div class="card"><b>🚫 Отклонить</b>
+<form method="post" action="/order/reject">
+<input type="hidden" name="id" value="{o.id}">
+<input name="reason" placeholder="Причина — её увидит клиент (можно пусто)">
+<button>Отклонить заказ</button></form></div>''')
+        if o.status == "confirmed":
+            actions.append('<div class="card">Заказ в доставках — отметки «собрано/доставлено» '
+                           'на вкладке «Доставки».</div>')
+        return (self._header(user, "orders") + f'<main><h3>Заказ №{o.id}</h3>'
+                f'<div class="card"><table>{body_rows}</table></div>{"".join(actions)}'
+                f'<div class="row"><a class="btn" href="/orders">← Все заказы</a></div></main>')
+
+    def _order_price(self, user: User, form: dict) -> tuple[int, dict, bytes]:
+        try:
+            o, can_bonus = order_ops.send_price(
+                self.db, int(form.get("id", "0") or 0), int(form.get("amount", "0") or 0),
+                int(form.get("fee", "0") or 0), datetime.now(), self.send_to_client,
+                method=form.get("method", "both"))
+        except (UserError, ValueError) as e:
+            return self._error_page(user, str(e), "/orders")
+        self.db.log_action(user, "Клиенту отправлена сумма (сайт)",
+                           f"заказ №{o.id}: {money(o.amount)}"
+                           + (f", можно списать {can_bonus} баллов" if can_bonus else ""))
+        return _redirect(f"/order?id={o.id}")
+
+    def _order_confirm(self, user: User, form: dict, method: str) -> tuple[int, dict, bytes]:
+        try:
+            o = self.db.get_client_order(int(form.get("id", "0")))
+        except (TypeError, ValueError):
+            o = None
+        if o is None:
+            return self._error_page(user, "Такого заказа нет.", "/orders")
+        if method != "POST":  # сначала экран подтверждения — защита от случайного касания
+            body = (f'{self._header(user, "orders")}<main><div class="card"><h3>Принять заказ №{o.id}?</h3>'
+                    f"<div>Деньги ({money(o.amount)}) точно пришли? Заказ попадёт в доставки на "
+                    f"{o.day:%d.%m} {o.time}, клиенту придёт подтверждение.</div>"
+                    f'<form method="post" action="/order/confirm"><input type="hidden" name="id" value="{o.id}">'
+                    '<div class="row"><button class="del">✅ Да, оплата пришла</button></div></form>'
+                    f'<div class="row"><a class="btn" href="/order?id={o.id}">Назад</a></div></div></main>')
+            return 200, {}, _page("Принять заказ", body)
+        try:
+            d, points, rate, doubled = order_ops.confirm_paid(
+                self.db, o.id, user, self.sale_shift_id() if self.sale_shift_id else None,
+                datetime.now(), self.send_to_client, self.notify_admin)
+        except UserError as e:
+            return self._error_page(user, str(e), f"/order?id={o.id}")
+        self.db.log_action(user, "Заказ из бота принят (сайт)",
+                           f"№{o.id}, оплачено {money(o.amount)} → доставка №{d.id}"
+                           + (f", +{points} баллов" if points else ""))
+        return _redirect("/orders")
+
+    def _order_reject(self, user: User, form: dict) -> tuple[int, dict, bytes]:
+        try:
+            oid = int(form.get("id", "0") or 0)
+        except ValueError:
+            oid = 0
+        reason = form.get("reason", "").strip()
+        try:
+            order_ops.reject(self.db, oid, user.name or user.login, reason, datetime.now(),
+                             self.send_to_client)
+        except UserError as e:
+            return self._error_page(user, str(e), "/orders")
+        self.db.log_action(user, "Заказ из бота отклонён (сайт)", f"№{oid}" + (f": {reason}" if reason else ""))
+        return _redirect("/orders")
+
     # ----- склад -----
+
 
     def _stock_page(self, user: User, query: str) -> str:
         needle = query.strip().casefold()
@@ -201,8 +382,7 @@ class WebApp:
             rows.append('<tr><td colspan="3">Ничего не найдено.</td></tr>')
         more = (f'<div class="gray" style="margin-top:8px">Показаны первые 300 из {total} — '
                 "уточните поиск.</div>" if total > 300 else "")
-        return (f'<header><b>🌸 Склад</b><a href="/">Доставки</a><a href="/stock" class="here">Склад</a>'
-                f'<span class="who">{_esc(user.name or user.login)} · <a href="/logout">выйти</a></span></header>'
+        return (self._header(user, "stock") +
                 f'<main><form method="get" action="/stock"><input name="q" value="{_esc(query)}" '
                 f'placeholder="Поиск: название или штрихкод" autofocus></form>'
                 f"<table><tr><th>Товар</th><th>Остаток</th><th>Цена</th></tr>{''.join(rows)}</table>"
