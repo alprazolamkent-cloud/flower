@@ -112,6 +112,8 @@ def main():
     server.newConnection.connect(on_connection)
     server.listen(INSTANCE_NAME)
     code = app.exec()
+    if window.web_server is not None:
+        window.web_server.stop()
     db.close()
     return code
 

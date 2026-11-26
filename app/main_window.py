@@ -59,6 +59,8 @@ from .reminders import assembly_due, assembly_escalations, due_reminders, overdu
 from .shift_plan import ShiftPlanDialog
 from .salary import pct, shop_writeoff
 from .users_dialog import LoginDialog, PasswordDialog, UserFormDialog, UsersDialog
+from .web import WebApp
+from .web_server import WebServer, web_enabled, web_port
 
 MONTHS_GENITIVE = [
     "января", "февраля", "марта", "апреля", "мая", "июня",
@@ -223,6 +225,8 @@ class MainWindow(QMainWindow):
         self.client_center: ClientCenter | None = None
         self.future_orders: FutureOrdersDialog | None = None
         self.stock_window: StockWindow | None = None
+        self.web_server = None  # сайт для телефона в Wi-Fi (Настройки → Программа)
+        self.start_web_server()
         self._photo_wanted: dict[str, list[int]] = {}  # чат флориста → доставки, к которым бот просил фото
         self._last_photo: dict[str, tuple[str, int, datetime]] = {}  # чат → (альбом, доставка, когда)
         self._client_nag_at: datetime | None = None
@@ -955,6 +959,23 @@ class MainWindow(QMainWindow):
             water=water_schedule(), rules=salary_rules, version=VERSION, last_backup=last_backup(),
             backup_now=self._bot_backup, decided=self._delete_decided, audit=self._audit_telegram,
             penalty_kinds=penalty_catalog(), penalty_changed=self._penalty_changed, dispute_kept=self._dispute_kept)
+
+    def start_web_server(self):
+        """Сайт для телефона в Wi-Fi магазина: доставки и склад. Включается в Настройки → Программа."""
+        if self.web_server is not None:
+            self.web_server.stop()
+            self.web_server = None
+        if not web_enabled():
+            return
+        app = WebApp(self.db,
+                     on_assembled=lambda did: self._after_assembled(self.db.get_delivery(did)),
+                     on_delivered=lambda did: self._after_delivered(self.db.get_delivery(did)),
+                     on_change=self.refresh_day)
+        self.web_server = WebServer(app, web_port(), self)
+        try:
+            self.web_server.start()
+        except OSError:  # порт занят — адрес в настройках покажет «не запущен»
+            self.web_server = None
 
     def audit(self, action: str, details: str = ""):
         """Запись в журнал действий от имени вошедшего сотрудника."""

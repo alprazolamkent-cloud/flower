@@ -17,6 +17,7 @@ from . import autostart, backup, max_bot, telegram, theme
 from .audit_dialog import AuditDialog
 from .client_bot import QR_FILE, bot_link, client_settings, max_settings
 from .client_flow import DEFAULT_POLICY
+from .web_server import local_ip, set_web, web_enabled, web_port
 from .client_center import WorkPhoneDialog
 from .db import UserError
 from .duties_dialog import DutiesEditor
@@ -1007,9 +1008,38 @@ class SettingsDialog(QDialog):
         layout.addWidget(self.autostart_check)
         layout.addWidget(_gray_label("Напоминания приходят, пока программа запущена.\n"
                                      "Крестик сворачивает её к часам, выход — через значок у часов."))
+        self.web_check = QCheckBox("Сайт для телефона в Wi-Fi магазина (доставки и склад)")
+        self.web_check.setChecked(web_enabled())
+        layout.addWidget(self.web_check)
+        web_row = QHBoxLayout()
+        web_row.addWidget(QLabel("Порт:"))
+        self.web_port_box = QSpinBox()
+        self.web_port_box.setRange(1024, 65535)
+        self.web_port_box.setValue(web_port())
+        web_row.addWidget(self.web_port_box)
+        self.web_url = QLabel()
+        web_row.addWidget(self.web_url, 1)
+        web_row.setContentsMargins(24, 0, 0, 0)
+        layout.addLayout(web_row)
+        layout.addWidget(_gray_label("Откройте этот адрес на телефоне (он должен быть в том же Wi-Fi).\n"
+                                     "Вход — логин и пароль сотрудника, как в программе. При первом запуске\n"
+                                     "Windows спросит разрешение для программы — нажмите «Разрешить»."))
+        self.web_check.toggled.connect(self._update_web_url)
+        self.web_port_box.valueChanged.connect(self._update_web_url)
+        self._update_web_url()
         layout.addWidget(self.main.updater.build_box())
         layout.addStretch(1)
         return page
+
+    def _update_web_url(self):
+        if not self.web_check.isChecked():
+            self.web_url.setText("выключен")
+            return
+        server = self.main.web_server
+        if server is not None and server.actual_port == self.web_port_box.value():
+            self.web_url.setText(f"адрес: http://{local_ip()}:{server.actual_port}")
+        else:
+            self.web_url.setText(f"будет: http://{local_ip()}:{self.web_port_box.value()}")
 
     # ----- действия -----
 
@@ -1261,6 +1291,9 @@ class SettingsDialog(QDialog):
         settings.setValue("loyalty/expire_reminders", int(self.loyalty_reminders.isChecked()))
         if sys.platform == "win32":
             autostart.set_enabled(self.autostart_check.isChecked())
+        set_web(self.web_check.isChecked(), self.web_port_box.value())
+        self.main.start_web_server()
+        self._update_web_url()
         new_theme = self.theme_box.currentData()
         changed_theme = new_theme != theme_mode()
         settings.setValue("theme", new_theme)
