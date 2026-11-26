@@ -6,6 +6,7 @@
 
 import faulthandler
 import os
+import re
 import threading
 import time
 from datetime import datetime
@@ -68,4 +69,10 @@ def unsent_report(path: str, settings: QSettings | None = None, limit: int = 350
     text = text.strip()
     if "\n=== " in "\n" + text:  # последнее зависание; самое важное (где застряла) — в его начале
         text = "=== " + ("\n" + text).rsplit("\n=== ", 1)[1]
-    return text[:limit]
+    # faulthandler печатает первым поток-наблюдатель (_watch → time.sleep) — он всегда одинаковый
+    # и при обрезке вытесняет главный стек, где и видно, на чём застряла программа.
+    blocks = re.split(r"(?=^(?:Current thread|Thread) )", text, flags=re.MULTILINE)
+    header = "" if blocks[0].startswith(("Current thread", "Thread")) else blocks.pop(0)
+    stacks = [b for b in blocks if "_watch" not in b]
+    stacks.sort(key=lambda b: "[MainThread]" not in b)  # главный поток — первым, его не обрежет лимит
+    return (header + "".join(stacks))[:limit] if stacks else text[:limit]
