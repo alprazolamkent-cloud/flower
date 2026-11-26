@@ -326,6 +326,11 @@ CLIENT_ORDER_MIGRATIONS = {  # лояльность в заказах из бо�
     "sale_id": "ALTER TABLE client_orders ADD COLUMN sale_id INTEGER",  # продажа по QR — чтобы отмена откатывала баллы
 }
 
+LOYALTY_ACCOUNT_MIGRATIONS = {  # согласие на обработку персональных данных
+    "consent_at": "ALTER TABLE loyalty_accounts ADD COLUMN consent_at TEXT NOT NULL DEFAULT ''",
+    "consent_source": "ALTER TABLE loyalty_accounts ADD COLUMN consent_source TEXT NOT NULL DEFAULT ''",
+}
+
 SHIFT_SELECT = """
 SELECT s.id, s.user_id, COALESCE(NULLIF(u.name, ''), u.login, ''), s.day, s.opened_at,
        s.opening_cash, s.closed_at, s.closing_cash, s.cash_sales, s.delivery_cash,
@@ -643,6 +648,16 @@ class ClientStore:
             self.conn.execute("UPDATE client_chats SET phone=? WHERE chat_id=?", (phone, str(chat_id)))
         self.conn.commit()
 
+    def forget_client(self, chat_id: str, phone: str):
+        """Клиент попросил удалить данные: бонусы и памятные даты, имя и телефон в боте,
+        личное в незавершённых заказах. Выполненные заказы остаются — это отчётность магазина."""
+        Loyalty(self.conn).forget(phone)
+        self.conn.execute("UPDATE client_chats SET name='', username='', phone='', state='', data='{}'"
+                          " WHERE chat_id=?", (str(chat_id),))
+        self.conn.execute("UPDATE client_orders SET client_phone='', recipient=''"
+                          " WHERE chat_id=? AND status IN ('new', 'priced', 'paid_claimed')", (str(chat_id),))
+        self.conn.commit()
+
     def client_chats(self) -> list[tuple[ClientChat, int, ClientMessage | None]]:
         """Переписки для окна «Клиенты»: (клиент, непрочитанных, последнее сообщение), свежие сверху."""
         result = []
@@ -936,6 +951,11 @@ class Database(ClientStore, StockStore):
         self.conn.executescript(SCHEMA)
         self.conn.executescript(STOCK_SCHEMA)
         self.conn.executescript(LOYALTY_SCHEMA)
+        existing = {r[1] for r in self.conn.execute("PRAGMA table_info(loyalty_accounts)")}
+        for column, sql in LOYALTY_ACCOUNT_MIGRATIONS.items():  # согласие на обработку данных
+            if column not in existing:
+                self.conn.execute(sql)
+        self.conn.commit()
         self.migrate_stock()
         existing = {r[1] for r in self.conn.execute("PRAGMA table_info(deliveries)")}
         for column, sql in MIGRATIONS.items():

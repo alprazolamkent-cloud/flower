@@ -644,3 +644,29 @@ def test_bonus_not_for_promo_bouquet(db):
     assert "нельзя" in texts(res)  # уценённый букет баллами не оплачивается
     assert db.get_client_order(order.id).bonus_spent == 0
     assert db.loyalty().balance("79161234567") == 1000
+
+
+def test_consent_policy_and_forget(db):
+    from app.client_flow import FORGET, POLICY
+    flow = ClientFlow(db, "Страна Чудес")
+    res = say(flow, POLICY)  # политика — стандартная, с именем магазина
+    assert "Страна Чудес" in texts(res) and "персональных данных" in texts(res)
+    assert "нет ваших сохранённых данных" in texts(say(flow, FORGET))  # телефон ещё не давали
+
+    item_id = db.save_showcase_item(ShowcaseItem(0, "Нежность", "", 3500))
+    say(flow, SHOWCASE)
+    say(flow, callback=f"pick:{item_id}")
+    say(flow, "завтра к 15:00")
+    say(flow, "ул. Ленина, 5")
+    res = say(flow, SELF)  # спрашивают телефон — рядом текст о согласии
+    assert "соглашаетесь" in texts(res)
+    say(flow, contact_phone="+79161234567")
+    assert db.loyalty().has_consent("79161234567")
+
+    res = say(flow, FORGET)  # сначала подтверждение
+    assert "forget:yes" in str(res.replies[0].markup)
+    res = say(flow, callback="forget:yes")
+    assert "удалены" in texts(res)
+    assert not db.loyalty().has_consent("79161234567")
+    assert db.loyalty().balance("79161234567") == 0
+    assert db.client_chat(CHAT_ID).phone == ""

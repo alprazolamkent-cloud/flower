@@ -92,19 +92,24 @@ class LoyaltyDialog(QDialog):
         self.adjust_btn.clicked.connect(self._adjust)
         self.dates_btn = QPushButton("📅 Памятные даты")
         self.dates_btn.clicked.connect(self._dates)
+        self.consent_btn = QPushButton("✅ Согласие")
+        self.consent_btn.setToolTip("Клиент согласился на обработку данных устно (на кассе) — отметить. "
+                                    "В боте согласие записывается само.")
+        self.consent_btn.clicked.connect(self._consent)
         top.addWidget(self.adjust_btn)
         top.addWidget(self.dates_btn)
+        top.addWidget(self.consent_btn)
         layout.addLayout(top)
 
-        self.table = QTableWidget(0, 6)
+        self.table = QTableWidget(0, 7)
         self.table.setHorizontalHeaderLabels(
-            ["Телефон", "Баланс", "Уровень", "Покупки за 12 мес.", "Последняя активность", "Сгорят"])
+            ["Телефон", "Баланс", "Уровень", "Покупки за 12 мес.", "Последняя активность", "Сгорят", "Согласие"])
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SingleSelection)
         self.table.verticalHeader().setVisible(False)
         header = self.table.horizontalHeader()
-        for col in range(6):
+        for col in range(7):
             header.setSectionResizeMode(col, QHeaderView.ResizeToContents)
         layout.addWidget(self.table, 3)
 
@@ -144,9 +149,10 @@ class LoyaltyDialog(QDialog):
         self.table.setRowCount(len(accounts))
         for row, acc in enumerate(accounts):
             tier = loyalty.tier_info(acc["phone"], now)
+            consent = acc["consent_at"].replace("T", " ")[:10] if acc["consent_at"] else "—"
             values = (_phone_text(acc["phone"]), _num(acc["balance"]), f"{tier['rate']}%",
                       _num(tier["spend"]), acc["last_activity"] or "—",
-                      acc["expires_at"] or "—")
+                      acc["expires_at"] or "—", consent)
             for col, value in enumerate(values):
                 cell = QTableWidgetItem(value)
                 if col == 0:
@@ -160,6 +166,7 @@ class LoyaltyDialog(QDialog):
         has = bool(phone)
         self.adjust_btn.setEnabled(has)
         self.dates_btn.setEnabled(has)
+        self.consent_btn.setEnabled(has)
         entries = self.db.loyalty().history(phone, limit=200) if has else []
         self.history.setRowCount(len(entries))
         for row, e in enumerate(entries):
@@ -194,3 +201,11 @@ class LoyaltyDialog(QDialog):
         phone = self._selected_phone()
         if phone:
             DatesDialog(self, self.db.loyalty(), phone).exec()
+
+    def _consent(self):
+        phone = self._selected_phone()
+        if not phone:
+            return
+        self.db.loyalty().set_consent(phone, "касса")
+        self.main.audit("Согласие на обработку данных", f"{_phone_text(phone)} — отмечено вручную")
+        self.refresh()

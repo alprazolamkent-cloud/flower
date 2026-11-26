@@ -70,9 +70,12 @@ def unsent_report(path: str, settings: QSettings | None = None, limit: int = 350
     if "\n=== " in "\n" + text:  # последнее зависание; самое важное (где застряла) — в его начале
         text = "=== " + ("\n" + text).rsplit("\n=== ", 1)[1]
     # faulthandler печатает первым поток-наблюдатель (_watch → time.sleep) — он всегда одинаковый
-    # и при обрезке вытесняет главный стек, где и видно, на чём застряла программа.
+    # и при обрезке вытесняет главный стек, где и видно, на чём застряла программа. Главный поток
+    # в дамке — единственный без имени в скобках; сетевые потоки (_send) тоже убираем, а каждый
+    # стек режем до самых свежих кадров (faulthandler печатает их первыми).
     blocks = re.split(r"(?=^(?:Current thread|Thread) )", text, flags=re.MULTILINE)
     header = "" if blocks[0].startswith(("Current thread", "Thread")) else blocks.pop(0)
-    stacks = [b for b in blocks if "_watch" not in b]
-    stacks.sort(key=lambda b: "[MainThread]" not in b)  # главный поток — первым, его не обрежет лимит
+    stacks = [b for b in blocks if "_watch" not in b and "_send" not in b]
+    stacks.sort(key=lambda b: "[" in b.split("\n", 1)[0])  # безымянный (главный) — первым
+    stacks = ["".join(b.splitlines(keepends=True)[:25]) for b in stacks]
     return (header + "".join(stacks))[:limit] if stacks else text[:limit]

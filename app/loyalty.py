@@ -42,6 +42,8 @@ CREATE TABLE IF NOT EXISTS loyalty_accounts (
     last_activity TEXT NOT NULL DEFAULT '',
     expires_at   TEXT,
     welcome      INTEGER NOT NULL DEFAULT 0,
+    consent_at   TEXT NOT NULL DEFAULT '',      -- когда клиент согласился на обработку данных
+    consent_source TEXT NOT NULL DEFAULT '',    -- где: «бот», «касса»…
     updated_at   TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS loyalty_txns (
@@ -218,6 +220,37 @@ class Loyalty:
 
     def has_welcome(self, phone: str) -> bool:
         return bool(self._account(norm_phone(phone)).welcome)
+
+    # ----- согласие на обработку персональных данных -----
+
+    def set_consent(self, phone: str, source: str, now: datetime | None = None):
+        """Клиент согласился на обработку данных (в боте или устно на кассе). Первое согласие храним."""
+        phone = norm_phone(phone)
+        if not phone:
+            return
+        now = self._now(now)
+        self._ensure(phone)
+        self.conn.execute(
+            "UPDATE loyalty_accounts SET consent_at=CASE WHEN consent_at='' THEN ? ELSE consent_at END,"
+            " consent_source=? WHERE phone=?",
+            (now.isoformat(timespec="seconds"), source, phone))
+        self.conn.commit()
+
+    def has_consent(self, phone: str) -> bool:
+        row = self.conn.execute("SELECT consent_at FROM loyalty_accounts WHERE phone=?",
+                                (norm_phone(phone),)).fetchone()
+        return bool(row and row[0])
+
+    def forget(self, phone: str) -> bool:
+        """Клиент попросил удалить данные: бонусы, история, памятные даты, напоминания."""
+        phone = norm_phone(phone)
+        if not phone:
+            return False
+        existed = self._account_row(phone) is not None
+        for table in ("loyalty_txns", "loyalty_dates", "loyalty_reminders", "loyalty_accounts"):
+            self.conn.execute(f"DELETE FROM {table} WHERE phone=?", (phone,))
+        self.conn.commit()
+        return existed
 
     def welcome(self, phone: str, now: datetime | None = None) -> int:
         """Приветственные баллы за первый указанный телефон. Только один раз."""
@@ -442,11 +475,12 @@ class Loyalty:
         """Все клиенты программы лояльности — для окна «Бонусы клиентов». ``query`` — цифры телефона."""
         digits = re.sub(r"\D", "", query)
         rows = self.conn.execute(
-            "SELECT phone, balance, last_activity, COALESCE(expires_at, ''), welcome"
-            " FROM loyalty_accounts ORDER BY balance DESC, last_activity DESC, phone").fetchall()
+            "SELECT phone, balance, last_activity, COALESCE(expires_at, ''), welcome,"
+            " COALESCE(consent_at, '') FROM loyalty_accounts"
+            " ORDER BY balance DESC, last_activity DESC, phone").fetchall()
         return [{"phone": phone, "balance": balance, "last_activity": last,
-                 "expires_at": expires, "welcome": bool(welcome)}
-                for phone, balance, last, expires, welcome in rows
+                 "expires_at": expires, "welcome": bool(welcome), "consent_at": consent}
+                for phone, balance, last, expires, welcome, consent in rows
                 if not digits or digits in phone]
 
     def history(self, phone: str, limit: int = 50) -> list[dict[str, Any]]:

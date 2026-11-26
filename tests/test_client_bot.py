@@ -319,6 +319,9 @@ def test_loyalty_dialog(window):
     assert dlg.table.item(0, 0).text() == "+7 900 111-22-33" and dlg.table.item(0, 1).text() == "500"
     dlg.table.selectRow(0)
     assert dlg.history.rowCount() == 1 and dlg.history.item(0, 2).text() == "+500"
+    dlg.consent_btn.click()  # отметка «клиент согласился на кассе»
+    assert db.loyalty().has_consent("79001112233")
+    assert dlg.table.item(0, 6).text() != "—"
     dlg.search.setText("111")
     assert dlg.table.rowCount() == 1
     dlg.search.setText("999")

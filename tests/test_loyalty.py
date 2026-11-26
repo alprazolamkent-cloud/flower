@@ -172,6 +172,20 @@ def test_accounts_list_and_search(loyalty):
     assert loyalty.accounts("555") == []
 
 
+def test_consent_and_forget(loyalty):
+    assert not loyalty.has_consent(KEY)
+    loyalty.set_consent(PHONE, "бот", NOW)
+    assert loyalty.has_consent(KEY)
+    assert loyalty.accounts()[0]["consent_at"].startswith("2026-11-23")
+    loyalty.set_consent(KEY, "касса", NOW + timedelta(days=1))  # хранится первое согласие
+    assert loyalty.accounts()[0]["consent_at"].startswith("2026-11-23")
+    loyalty.welcome(KEY, NOW)
+    loyalty.set_date(KEY, "жена", "14.02")
+    assert loyalty.forget(KEY)
+    assert loyalty.balance(KEY) == 0 and loyalty.dates(KEY) == [] and not loyalty.has_consent(KEY)
+    assert not loyalty.forget(KEY)  # уже нечего удалять
+
+
 def test_cancel_sale_reverses_bonuses():
     from app.db import Database
     from app.stock import CartLine

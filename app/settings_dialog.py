@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
 from . import autostart, backup, max_bot, telegram, theme
 from .audit_dialog import AuditDialog
 from .client_bot import QR_FILE, bot_link, client_settings, max_settings
+from .client_flow import DEFAULT_POLICY
 from .client_center import WorkPhoneDialog
 from .db import UserError
 from .duties_dialog import DutiesEditor
@@ -790,6 +791,15 @@ class SettingsDialog(QDialog):
         self.requisites_edit.setPlaceholderText("необязательно: например, «Получатель — ИП Иванова М.П.»")
         self.requisites_edit.setFixedHeight(60)
         form.addRow("Текст к оплате:", self.requisites_edit)
+        self.policy_edit = QPlainTextEdit(str(_settings().value("client_policy", "")))
+        self.policy_edit.setPlaceholderText(DEFAULT_POLICY.format(shop=cfg["shop"]))
+        self.policy_edit.setFixedHeight(90)
+        self.policy_edit.setToolTip("Что бот отвечает на кнопку «📄 Политика». Пусто — стандартный текст "
+                                    "(в подсказке), с именем магазина.")
+        form.addRow("Политика ПД:", self.policy_edit)
+        form.addRow(_gray_label("Согласие на обработку данных клиент даёт кнопкой «Отправить мой номер» — рядом\n"
+                                "с ней текст о согласии. Удалить свои данные клиент может кнопкой «🗑 Мои данные».\n"
+                                "Кто согласился — видно в окне «🎁 Бонусы»."))
         form.addRow(_gray_label("Сумму флорист вписывает каждый раз сам (букет + доставка). Бот присылает клиенту\n"
                                 "QR-код, сумму текстом (в статическом QR её нет — клиент вводит её сам) и кнопку\n"
                                 "«Я оплатил(а)». Заказ попадает в доставки, когда флорист подтвердит оплату."))
@@ -1187,6 +1197,7 @@ class SettingsDialog(QDialog):
         settings.setValue("client_token", client_token)
         settings.setValue("client_shop", self.shop_edit.text().strip())
         settings.setValue("client_requisites", self.requisites_edit.toPlainText().strip())
+        settings.setValue("client_policy", self.policy_edit.toPlainText().strip())
         settings.setValue("client_preorders", _bool(self.preorder_check.isChecked()))
         if self._qr_changed:
             self.db.set_file(QR_FILE, self._qr)

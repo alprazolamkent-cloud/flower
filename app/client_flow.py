@@ -8,13 +8,30 @@ import re
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 
+from PySide6.QtCore import QSettings
+
 from .db import ORDER_STATUS, ClientOrder, Database, ShowcaseItem, UserError
 from .delivery_dialog import money
 from .loyalty import norm_phone
 from .reminders import parse_deadline_time
 
+DEFAULT_POLICY = (
+    "📄 Политика обработки персональных данных\n\n"
+    "Магазин «{shop}» обрабатывает ваши имя, телефон, адрес доставки и историю заказов, чтобы принимать "
+    "и доставлять заказы и вести программу лояльности (бонусы, напоминания о памятных датах).\n\n"
+    "Данные хранятся на компьютере магазина и не передаются третьим лицам. Вы можете в любой момент "
+    "удалить свои данные — кнопка «🗑 Мои данные» в меню."
+)
+
+
+def policy_text(shop: str) -> str:
+    """Текст политики из настроек (Настройки → Клиенты); не задан — шаблон с именем магазина."""
+    own = str(QSettings("FlowerDeliveries", "FlowerDeliveries").value("client_policy", "")).strip()
+    return own or DEFAULT_POLICY.format(shop=shop)
+
 SHOWCASE, CUSTOM, CHAT, ORDERS = "💐 Витрина", "✍️ Свой букет", "💬 Написать флористу", "📦 Мои заказы"
 BONUSES, LOYALTY_DATES = "🎁 Бонусы", "📅 Памятные даты"
+POLICY, FORGET = "📄 Политика", "🗑 Мои данные"  # согласие на обработку данных и удаление своих данных
 TO_MENU, RESTART, SEND = "⬅ В меню", "↩ Начать заново", "✅ Отправить заказ"
 PICKUP, SELF, NO_CARD = "🏪 Заберу сам", "Себе", "Без открытки"
 STAFF_TODAY, STAFF_TOMORROW = "📋 Сегодня", "📅 Завтра"  # меню флориста: видно только в привязанном чате
@@ -39,7 +56,7 @@ def bouquets_word(n: int) -> str:
 
 
 MENU = {"keyboard": [[{"text": SHOWCASE}, {"text": CUSTOM}], [{"text": CHAT}, {"text": ORDERS}],
-                     [{"text": BONUSES}, {"text": LOYALTY_DATES}]],
+                     [{"text": BONUSES}, {"text": LOYALTY_DATES}], [{"text": POLICY}, {"text": FORGET}]],
         "resize_keyboard": True}
 PREORDER = "🌷 Предзаказ на "  # кнопка перед праздником: «🌷 Предзаказ на 8 Марта»
 PREORDER_DAYS = 14  # за сколько дней до праздника бот предлагает предзаказ
@@ -304,6 +321,19 @@ class ClientFlow:
                 lines.append("Сначала укажите телефон при заказе — иначе некуда сохранить дату.")
             res.say("\n\n".join(lines), keyboard([TO_MENU]))
             return res
+        if text == POLICY:
+            go("", {})
+            res.say(policy_text(self.shop), self.MENU)
+            return res
+        if text == FORGET:
+            go("", {})
+            if not phone_key:
+                res.say("У меня нет ваших сохранённых данных — телефон вы ещё не указывали.", self.MENU)
+            else:
+                res.say("Удалить ваши данные: бонусы, памятные даты, имя и телефон в боте?\n"
+                        "Выполненные заказы останутся в отчётности магазина.",
+                        inline(("🗑 Да, удалить всё", "forget:yes"), ("Отмена", "forget:no")))
+            return res
         if state == "loyalty_date":
             if not text:
                 return res
@@ -418,7 +448,8 @@ class ClientFlow:
                 self._ask_card(res)
             else:
                 go("phone", data)
-                res.say("Ваш номер телефона для связи:",
+                res.say("Ваш номер телефона для связи:\n\nНажимая «Отправить мой номер», вы соглашаетесь "
+                        "на обработку данных для заказов и программы лояльности — политика в «📄 Политика».",
                         keyboard([{"text": "📱 Отправить мой номер", "request_contact": True}], [TO_MENU]))
             return res
         if state == "phone":
@@ -428,6 +459,7 @@ class ClientFlow:
                 return res
             data["phone"] = phone
             go("card", data, phone=phone)
+            loyalty.set_consent(phone, "бот", now)  # клиент сам поделился номером после текста о согласии
             points = loyalty.welcome(phone, now)
             if points:
                 res.say(f"🎁 Добро пожаловать! Начислили {points} бонусов (= {points} ₽) "
@@ -842,6 +874,14 @@ class ClientFlow:
             self._ask_when(res)
         elif kind == "more" and value.isdigit():
             self._showcase(res, int(value))
+        elif kind == "forget":
+            if value == "yes":
+                chat = self.db.client_chat(str(msg.chat_id))
+                self.db.forget_client(str(msg.chat_id), chat.phone if chat else "")
+                res.say("Готово: бонусы, памятные даты, имя и телефон удалены 🌷 "
+                        "Если передумаете — просто оформите заказ заново.", self.MENU)
+            else:
+                res.say("Хорошо, ничего не удалял.", self.MENU)
         elif kind == "bonus" and ":" in value:
             order_id, _, points_text = value.partition(":")
             if not order_id.isdigit() or not points_text.isdigit():
