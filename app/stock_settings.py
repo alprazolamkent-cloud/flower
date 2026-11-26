@@ -63,6 +63,29 @@ def set_label_setup(size: str, offset: tuple[float, float]):
     _settings().setValue("label_offset_y", offset[1])
 
 
+def label_dpi() -> int:
+    """Разрешение термопринтера (203 или 300 dpi) — для печати напрямую: с чужим dpi этикетка
+    выходит больше/меньше и обрезается."""
+    try:
+        dpi = int(_settings().value("label_dpi", 203) or 203)
+    except (TypeError, ValueError):
+        return 203
+    return dpi if dpi in (203, 300) else 203
+
+
+def label_gap() -> float:
+    """Зазор между этикетками на рулоне, мм — если не совпадает, печать съезжает с каждой следующей."""
+    try:
+        return min(max(float(_settings().value("label_gap", 2) or 2), 0.0), 6.0)
+    except (TypeError, ValueError):
+        return 2.0
+
+
+def set_label_print(dpi: int, gap: float):
+    _settings().setValue("label_dpi", int(dpi))
+    _settings().setValue("label_gap", float(gap))
+
+
 def label_direct() -> tuple[bool, bool]:
     """(печатать напрямую командами TSPL, минуя драйвер; перевернуть) — по умолчанию через драйвер:
     принтер в режиме чеков печатает команды текстом и изводит рулон."""

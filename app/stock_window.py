@@ -26,12 +26,13 @@ from .loyalty import norm_phone
 from .photos import pick_photo, pixmap
 from .shifts import WRITEOFF_REASONS
 from .labels import (
-    LAYOUTS, THERMAL_SIZES, Label, barcode_modules, labels_html, print_labels, printers, send_raw, tspl_job,
-    tspl_probe,
+    LAYOUTS, THERMAL_SIZES, Label, barcode_modules, labels_html, print_labels, printers, render_label_image,
+    send_raw, tspl_job, tspl_probe,
 )
 from .stock_settings import (
-    SCAN_ONLY, fresh_days, price_markup, direct_checked, label_direct, label_offset, label_printer, label_size, scan_required,
-    set_direct_checked, set_label_direct, set_label_printer, set_label_setup,
+    SCAN_ONLY, fresh_days, price_markup, direct_checked, label_direct, label_dpi, label_gap, label_offset,
+    label_printer, label_size, scan_required,
+    set_direct_checked, set_label_direct, set_label_print, set_label_printer, set_label_setup,
 )
 from .stock import (
     CATEGORIES, PAYMENTS, CartLine, Product, Recipe, day_range, ean13_check, qty_text, reorder_text, short_label,
@@ -1427,10 +1428,33 @@ class LabelsDialog(QDialog):
         self.shift_x.setValue(dx)
         self.shift_x.setToolTip("Печать уехала вправо — поставьте минус")
         setup.addWidget(self.shift_x)
+        setup.addWidget(QLabel("Принтер:"))
+        self.dpi_box = QComboBox()
+        self.dpi_box.addItem("203 dpi", 203)
+        self.dpi_box.addItem("300 dpi", 300)
+        self.dpi_box.setCurrentIndex(max(self.dpi_box.findData(label_dpi()), 0))
+        self.dpi_box.setToolTip("Разрешение термопринтера (написано в его инструкции). Если этикетка выходит "
+                                "больше и обрезается — принтер 300 dpi, а стоит 203.")
+        setup.addWidget(self.dpi_box)
+        setup.addWidget(QLabel("Зазор:"))
+        self.gap_box = QDoubleSpinBox()
+        self.gap_box.setRange(0, 6)
+        self.gap_box.setSingleStep(0.5)
+        self.gap_box.setDecimals(1)
+        self.gap_box.setSuffix(" мм")
+        self.gap_box.setValue(label_gap())
+        self.gap_box.setToolTip("Расстояние между этикетками на рулоне. Если печать съезжает всё сильнее "
+                                "с каждой следующей этикеткой — зазор не совпадает (обычно 2–3 мм).")
+        setup.addWidget(self.gap_box)
         self.test_btn = QPushButton("🧪 Пробная")
         self.test_btn.setToolTip("Одна этикетка с рамкой по краю — видно, ровно ли ложится печать")
         self.test_btn.clicked.connect(self._print_test)
         setup.addWidget(self.test_btn)
+        self.preview_btn = QPushButton("👁 Просмотр")
+        self.preview_btn.setToolTip("Показать этикетку на экране так, как её напечатает принтер — "
+                                    "до траты рулона")
+        self.preview_btn.clicked.connect(self._preview)
+        setup.addWidget(self.preview_btn)
         setup.addStretch(1)
         direct, flip = label_direct()
         self.direct = QCheckBox("Напрямую, минуя драйвер (принтер в режиме этикеток)")
@@ -1535,9 +1559,34 @@ class LabelsDialog(QDialog):
     def _thermal_setup(self) -> dict:
         size_key = self.size_box.currentData()
         offset = (self.shift_x.value(), self.shift_y.value())
+        dpi, gap = int(self.dpi_box.currentData()), self.gap_box.value()
         set_label_setup(size_key, offset)
+        set_label_print(dpi, gap)
         set_label_direct(self.direct.isChecked(), self.flip.isChecked())
-        return {"size": THERMAL_SIZES[size_key], "offset": offset}
+        return {"size": THERMAL_SIZES[size_key], "offset": offset, "dpi": dpi, "gap": gap}
+
+    def _preview(self):
+        marked = [i for i, c in enumerate(self.checks) if c.isChecked()]
+        if not marked:
+            QMessageBox.information(self, "Просмотр", "Отметьте хотя бы одну этикетку.")
+            return
+        i = marked[0]
+        _, _, title, price, codes, _ = self.items[i]
+        text = self.tops[i].text().strip() or title.removeprefix("💐 ")
+        show = self.with_price.isChecked() and price > 0
+        label = Label(text, codes or "2000000000015", price if show else None)
+        setup = self._thermal_setup()
+        image = render_label_image(label, "thermal", dpi=setup["dpi"], size=setup["size"])
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Просмотр этикетки")
+        box = QVBoxLayout(dlg)
+        pic = QLabel()
+        pic.setPixmap(QPixmap.fromImage(image).scaled(image.width() * 2, image.height() * 2,
+                                                      Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        box.addWidget(pic, 0, Qt.AlignCenter)
+        box.addWidget(_gray(f"Так этикетка ляжет на принтер: {setup['size'][0]:g}×{setup['size'][1]:g} мм, "
+                            f"{setup['dpi']} dpi. Если на бумаге выходит иначе — проверьте размер, dpi и зазор."))
+        dlg.exec()
 
     def _send_thermal(self, labels: list[Label], name: str, frame: bool = False):
         """На термопринтер: напрямую (TSPL) или через драйвер Windows."""
@@ -1545,7 +1594,7 @@ class LabelsDialog(QDialog):
         if self.direct.isChecked():
             send_raw(name, tspl_job(labels, frame=frame, flip=self.flip.isChecked(), **setup))
         else:
-            print_labels(labels, "thermal", name, frame=frame, **setup)
+            print_labels(labels, "thermal", name, frame=frame, size=setup["size"], offset=setup["offset"])
 
     def _direct_test(self, name: str) -> bool:
         """Прямая печать: сначала крошечная пробная, человек подтверждает — иначе обратно на драйвер."""

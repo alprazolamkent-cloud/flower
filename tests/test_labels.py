@@ -79,6 +79,15 @@ def test_labels_page():
     assert "58mm 40mm" in labels_html([Label("x", "2000000000015")], "thermal")
 
 
+def test_tspl_job_dpi_and_gap():
+    from app.labels import _driver_page, tspl_job
+    job = tspl_job([Label("н15", "2000000000015", 150, 2)], size=(58, 40), gap=3, dpi=300)
+    assert b"SIZE 58 mm,40 mm" in job and b"GAP 3 mm,0 mm" in job and b"PRINT 1,2" in job
+    width_bytes = (round(58 * 300 / 25.4) + 7) // 8  # картинка — в точках принтера, иначе размер «плывёт»
+    assert f"BITMAP 0,0,{width_bytes},".encode("ascii") in job
+    assert _driver_page("несуществующий принтер", 58, 40) is None  # без драйвера — без падения
+
+
 class FakeMain(QWidget):
     def __init__(self, db, user):
         super().__init__()

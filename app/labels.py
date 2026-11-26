@@ -213,6 +213,22 @@ def render_label_image(label: Label, layout: str = "thermal", dpi: int = 203, si
     return image
 
 
+def _driver_page(printer_name: str, w_mm: float, h_mm: float):
+    """Размер этикетки из списка драйвера (±1 мм по стороне, в любой ориентации). Свой размер,
+    которого драйвер не знает, он молча обрезает или масштабирует — поэтому берём его родной."""
+    from PySide6.QtGui import QPageSize
+    from PySide6.QtPrintSupport import QPrinterInfo
+
+    best, best_diff = None, 2.0
+    for page in QPrinterInfo.printerInfo(printer_name).supportedPageSizes():
+        size = page.size(QPageSize.Millimeter)
+        diff = min(abs(size.width() - w_mm) + abs(size.height() - h_mm),
+                   abs(size.width() - h_mm) + abs(size.height() - w_mm))
+        if diff < best_diff:
+            best, best_diff = page, diff
+    return best
+
+
 def print_labels(labels: list[Label], layout: str = "thermal", printer_name: str = "", pdf_path: str = "",
                  size: tuple | None = None, offset: tuple = (0, 0), frame: bool = False) -> int:
     """Напечатать на принтер (по имени, как в Windows) или в PDF. Возвращает число страниц.
@@ -235,7 +251,10 @@ def print_labels(labels: list[Label], layout: str = "thermal", printer_name: str
     w_mm, h_mm = (size or LABEL_MM[layout]) if layout == "thermal" else LABEL_MM[layout]
     if layout == "thermal":
         page = QPageSize(QSizeF(w_mm, h_mm), QPageSize.Millimeter, f"Этикетка {w_mm:g}×{h_mm:g}", QPageSize.ExactMatch)
-        orientation = QPageLayout.Landscape if page.size(QPageSize.Millimeter).width() < w_mm else QPageLayout.Portrait
+        if printer_name and not pdf_path:
+            page = _driver_page(printer_name, w_mm, h_mm) or page
+        orientation = (QPageLayout.Landscape if page.size(QPageSize.Millimeter).width() < w_mm
+                       else QPageLayout.Portrait)
         printer.setPageLayout(QPageLayout(page, orientation, QMarginsF(0, 0, 0, 0), QPageLayout.Millimeter))
     else:
         printer.setPageLayout(QPageLayout(QPageSize(QPageSize.A4), QPageLayout.Portrait, QMarginsF(0, 0, 0, 0),
