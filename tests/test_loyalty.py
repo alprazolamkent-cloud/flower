@@ -23,7 +23,8 @@ def loyalty():
 
 def test_norm_phone():
     assert norm_phone(PHONE) == KEY
-    assert norm_phone("8 999 123-45-67") == "89991234567"
+    assert norm_phone("8 999 123-45-67") == KEY  # 8… и +7… — один клиент, один баланс
+    assert norm_phone("+7 999 123 45 67") == KEY
     assert norm_phone("123") == ""
     assert norm_phone(None) == ""
 
@@ -154,6 +155,21 @@ def test_config_override_without_qsettings():
         assert engine._account(KEY).expires == date(2026, 12, 23)
     finally:
         conn.close()
+
+
+def test_adjust_never_below_zero(loyalty):
+    loyalty.adjust(KEY, 100, note="тест")
+    assert loyalty.adjust(KEY, -500, note="ошибка") == -100  # списали только то, что было
+    assert loyalty.balance(KEY) == 0
+    assert loyalty.adjust(KEY, -50, note="ещё") == 0  # в минус не уходит
+
+
+def test_accounts_list_and_search(loyalty):
+    loyalty.welcome(PHONE, NOW)
+    loyalty.adjust("79160000000", 50, note="тест", now=NOW)
+    assert [a["phone"] for a in loyalty.accounts()] == [KEY, "79160000000"]  # по балансу
+    assert [a["phone"] for a in loyalty.accounts("916")] == ["79160000000"]
+    assert loyalty.accounts("555") == []
 
 
 def test_cancel_sale_reverses_bonuses():

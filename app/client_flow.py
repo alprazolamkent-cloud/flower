@@ -850,7 +850,7 @@ class ClientFlow:
             if order is None or order.chat_id != str(msg.chat_id) or order.status != "priced":
                 return
             loyalty = self.db.loyalty()
-            eligible = max(0, order.amount - order.delivery_fee)
+            eligible = self.db.order_bonus_eligible(order)  # без доставки и без уценённого букета
             can = loyalty.max_spend(order.client_phone, eligible, now)
             points = min(int(points_text), can)
             if points <= 0 or order.amount - points <= 0:
@@ -861,8 +861,11 @@ class ClientFlow:
             try:
                 self.db.price_client_order(order.id, order.amount - spent, order.delivery_fee, now)
             except UserError:
+                loyalty.adjust(order.client_phone, spent, note=f"Возврат: заказ №{order.id} уже изменился",
+                               author="Бот")
                 return
-            self.db.set_order_bonus(order.id, spent, order.bonus_accrued, order.loyalty_rate)
+            self.db.set_order_bonus(order.id, order.bonus_spent + spent,
+                                    order.bonus_accrued, order.loyalty_rate)
             res.say(f"Списали {spent} бонусов (−{spent} ₽). К оплате осталось "
                     f"{money(order.amount - spent)}. Нажмите «✅ Я оплатил(а)», когда переведёте деньги.")
         elif kind == "paid" and value.isdigit():

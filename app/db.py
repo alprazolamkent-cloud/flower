@@ -323,6 +323,7 @@ CLIENT_ORDER_MIGRATIONS = {  # лояльность в заказах из бо�
     "bonus_spent": "ALTER TABLE client_orders ADD COLUMN bonus_spent INTEGER NOT NULL DEFAULT 0",
     "bonus_accrued": "ALTER TABLE client_orders ADD COLUMN bonus_accrued INTEGER NOT NULL DEFAULT 0",
     "loyalty_rate": "ALTER TABLE client_orders ADD COLUMN loyalty_rate INTEGER NOT NULL DEFAULT 0",
+    "sale_id": "ALTER TABLE client_orders ADD COLUMN sale_id INTEGER",  # продажа по QR — чтобы отмена откатывала баллы
 }
 
 SHIFT_SELECT = """
@@ -492,6 +493,7 @@ class ClientOrder:
     bonus_spent: int = 0
     bonus_accrued: int = 0
     loyalty_rate: int = 0
+    sale_id: int | None = None
 
 
 @dataclass
@@ -510,7 +512,7 @@ ORDER_SELECT = (
     "SELECT o.id, o.chat_id, o.created_at, o.updated_at, o.day, o.time, o.items, o.address, o.recipient,"
     " o.client_phone, o.card, o.status, o.amount, o.delivery_fee, o.paid_photo IS NOT NULL, o.delivery_id,"
     " o.showcase_id, o.note, COALESCE(NULLIF(c.name, ''), c.username, ''),"
-    " o.bonus_spent, o.bonus_accrued, o.loyalty_rate"
+    " o.bonus_spent, o.bonus_accrued, o.loyalty_rate, o.sale_id"
     " FROM client_orders o LEFT JOIN client_chats c ON c.chat_id = o.chat_id")
 
 
@@ -520,7 +522,7 @@ def _row_to_order(r) -> ClientOrder:
                        items=r[6], address=r[7], recipient=r[8], client_phone=r[9], card=r[10], status=r[11],
                        amount=r[12], delivery_fee=r[13], has_paid_photo=bool(r[14]), delivery_id=r[15],
                        showcase_id=r[16], note=r[17], client_name=r[18],
-                       bonus_spent=r[19], bonus_accrued=r[20], loyalty_rate=r[21])
+                       bonus_spent=r[19], bonus_accrued=r[20], loyalty_rate=r[21], sale_id=r[22])
 
 
 class ClientStore:
@@ -698,6 +700,17 @@ class ClientStore:
             (spent, accrued, rate, order_id))
         self.conn.commit()
 
+    def order_bonus_eligible(self, order: ClientOrder) -> int:
+        """Сумма заказа, с которой идут баллы: без доставки и без уценённого букета с витрины.
+        order.amount уже за вычетом списанных баллов — второй раз их не вычитаем."""
+        if order.showcase_id:  # уценённый букет в баллах не участвует
+            promo = self.conn.execute(
+                "SELECT r.promo_price FROM showcase s JOIN recipes r ON r.id=s.recipe_id WHERE s.id=?",
+                (order.showcase_id,)).fetchone()
+            if promo and promo[0]:
+                return 0
+        return max(0, order.amount - order.delivery_fee)
+
     def set_client_order_status(self, order_id: int, status: str, now: datetime, note: str | None = None,
                                 restore_single: bool = True):
         """restore_single — при отказе вернуть готовый букет «в одном экземпляре» на витрину (если не продан)."""
@@ -748,8 +761,13 @@ class ClientStore:
         recipe_id = item.recipe_id if item else None  # собранный букет с витрины — продаётся с витрины, без списания
         title = item.title if item else re.sub(r"\s+—\s+[\d\s ]+₽\s*$", "", (order.items.splitlines() or ["Букет"])[0])
         if bouquet > 0:  # в «Топ продаж» — название без «— 3 500 ₽»
-            self.add_sale([CartLine(title or "Букет", 1, bouquet, recipe_id)],
-                          "qr", user_id, shift_id, now, note=f"Заказ из бота №{order_id}", flowers=True)
+            # в строке — полная цена букета, баллы отдельно: итог тот же, а отмена продажи вернёт их клиенту
+            sale_id = self.add_sale(
+                [CartLine(title or "Букет", 1, bouquet + order.bonus_spent, recipe_id)],
+                "qr", user_id, shift_id, now, note=f"Заказ из бота №{order_id}", flowers=True,
+                client_phone=norm_phone(order.client_phone), bonus_spent=order.bonus_spent)
+            self.conn.execute("UPDATE client_orders SET sale_id=? WHERE id=?", (sale_id, order_id))
+            self.conn.commit()
         return d
 
     def order_for_delivery(self, delivery_id: int) -> ClientOrder | None:

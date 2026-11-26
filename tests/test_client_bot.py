@@ -13,7 +13,7 @@ from app import client_bot, telegram
 from app import main_window as mw
 from app.client_bot import ClientBot, Parsed, best_photo, parse_update
 from app.client_center import needs_action
-from app.client_flow import Incoming
+from app.client_flow import ClientFlow, Incoming
 from app.db import Database, Delivery, ShowcaseItem
 from app.delivery_dialog import DeliveryDialog
 from app.photos import load_photo, to_jpeg
@@ -259,6 +259,71 @@ def test_reject_and_chat(window, monkeypatch):
     c._send_reply()
     assert outbox(db)[-1][:2] == ("555", "Есть, белые и красные")
     assert db.client_messages("555")[-1].author == "Анна"
+
+
+def test_bonus_spend_and_reject_returns_points(window, monkeypatch):
+    w, db = window, window.db
+    key = "79001112233"
+    loyalty = db.loyalty()
+    loyalty.adjust(key, 1000, note="тест", author="Анна")
+    o = client_order(w)
+    w.open_clients()
+    c = w.client_center
+    c.amount_box.setValue(4200)
+    c.fee_box.setValue(700)
+    c.price_btn.click()
+    flow = ClientFlow(db, "Магазин")
+    res = flow.handle(Incoming("555", callback=f"bonus:{o.id}:300"), NOW)
+    order = db.get_client_order(o.id)
+    assert order.bonus_spent == 300 and order.amount == 3900 and loyalty.balance(key) == 700
+    assert "Списали 300" in "\n".join(r.text for r in res.replies)
+    flow.handle(Incoming("555", callback=f"bonus:{o.id}:100"), NOW)  # второй раз — суммируется
+    order = db.get_client_order(o.id)
+    assert order.bonus_spent == 400 and order.amount == 3800 and loyalty.balance(key) == 600
+
+    monkeypatch.setattr(QInputDialog, "getText", staticmethod(lambda *a, **k: ("нет пионов", True)))
+    c.reject_btn.click()  # заказ не состоялся — баллы вернулись
+    assert db.get_client_order(o.id).bonus_spent == 0 and loyalty.balance(key) == 1000
+
+
+def test_confirm_accrues_points_and_cancel_reverses(window):
+    w, db = window, window.db
+    key = "79001112233"
+    loyalty = db.loyalty()
+    loyalty.adjust(key, 1000, note="тест", author="Анна")
+    o = client_order(w)
+    w.open_clients()
+    c = w.client_center
+    c.amount_box.setValue(4200)
+    c.fee_box.setValue(700)
+    c.price_btn.click()
+    ClientFlow(db, "Магазин").handle(Incoming("555", callback=f"bonus:{o.id}:300"), NOW)
+    c.confirm_btn.click()
+    order = db.get_client_order(o.id)
+    assert order.status == "confirmed" and order.sale_id
+    # начисление с суммы, реально оплаченной деньгами: 4200 − 300 баллами − 700 доставка = 3200 → 5% = 160
+    assert order.bonus_accrued == 160 and loyalty.balance(key) == 1000 - 300 + 160
+    sale = db.conn.execute("SELECT client_phone, bonus_spent, bonus_accrued FROM sales WHERE id=?",
+                           (order.sale_id,)).fetchone()
+    assert sale == (key, 300, 160)
+    db.cancel_sale(order.sale_id, "Возврат", None, datetime.now())  # отмена продажи откатывает баллы
+    assert loyalty.balance(key) == 1000
+
+
+def test_loyalty_dialog(window):
+    from app.loyalty_dialog import LoyaltyDialog
+    w, db = window, window.db
+    db.loyalty().adjust("79001112233", 500, note="тест", author="Анна")
+    dlg = LoyaltyDialog(w)
+    assert dlg.table.rowCount() == 1
+    assert dlg.table.item(0, 0).text() == "+7 900 111-22-33" and dlg.table.item(0, 1).text() == "500"
+    dlg.table.selectRow(0)
+    assert dlg.history.rowCount() == 1 and dlg.history.item(0, 2).text() == "+500"
+    dlg.search.setText("111")
+    assert dlg.table.rowCount() == 1
+    dlg.search.setText("999")
+    assert dlg.table.rowCount() == 0
+    dlg.deleteLater()
 
 
 def test_showcase_editor(window):

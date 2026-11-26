@@ -46,6 +46,7 @@ from .assembly_dialog import SNOOZE, AssemblyReminder
 from .client_bot import ClientBot, chat_configured
 from .max_bot import MaxBot
 from .client_center import NEEDS_ACTION, ClientCenter, StaffLinkDialog, needs_action
+from .loyalty_dialog import LoyaltyDialog
 from .client_flow import inline, order_summary
 from .photos import PhotoViewer
 from .flow_layout import FlowLayout, flow_policy
@@ -412,6 +413,12 @@ class MainWindow(QMainWindow):
         self.clients_btn.setMinimumHeight(32)
         self.clients_btn.clicked.connect(self.open_clients)
         buttons.addWidget(self.clients_btn)
+        self.bonus_btn = QPushButton("🎁 Бонусы")
+        self.bonus_btn.setToolTip("Баллы лояльности: балансы клиентов, история операций, корректировки, "
+                                  "памятные даты")
+        self.bonus_btn.setMinimumHeight(32)
+        self.bonus_btn.clicked.connect(self.open_loyalty)
+        buttons.addWidget(self.bonus_btn)
         row = QHBoxLayout()
         row.addWidget(actions_box, 3)
         row.addWidget(nav_box, 2)
@@ -881,6 +888,7 @@ class MainWindow(QMainWindow):
         role = "админ" if user.is_admin else "сотрудник"
         self.user_btn.setText(f"👤 {user.name or user.login} ({role})")
         self.settings_btn.setVisible(user.is_admin)
+        self.bonus_btn.setVisible(user.is_admin)
         self.update_shift_box()
         self._update_ann_button()
         self._update_notif_button()
@@ -1732,6 +1740,11 @@ class MainWindow(QMainWindow):
         self.client_center.show()
         self.client_center.raise_()
         self.client_center.activateWindow()
+
+    def open_loyalty(self):
+        if self.user is None or not self.user.is_admin:
+            return
+        LoyaltyDialog(self).exec()
 
     def link_telegram(self):
         if self.user is not None:

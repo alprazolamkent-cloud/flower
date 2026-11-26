@@ -347,19 +347,16 @@ class ClientCenter(QDialog):
             return
         loyalty = self.db.loyalty()
         phone = norm_phone(o.client_phone)
-        eligible = max(0, o.amount - o.delivery_fee - o.bonus_spent)
-        if o.showcase_id:  # уценённый букет в баллах не участвует
-            promo = self.db.conn.execute(
-                "SELECT r.promo_price FROM showcase s JOIN recipes r ON r.id=s.recipe_id WHERE s.id=?",
-                (o.showcase_id,)).fetchone()
-            if promo and promo[0]:
-                eligible = 0
+        eligible = self.db.order_bonus_eligible(o)  # amount уже за вычетом списанных баллов
         rate = loyalty.rate(phone, now)
         doubled = loyalty.is_occasion(phone, o.day)
         points = loyalty.accrue(phone, eligible, now=now, source=f"Заказ №{o.id}",
                                 author=self.main.user.name if self.main.user else "", doubled=doubled)
         if points:
             self.db.set_order_bonus(o.id, o.bonus_spent, points, rate)
+            sale_id = self.db.get_client_order(o.id).sale_id
+            if sale_id:  # баллы — и в продаже, чтобы её отмена их сняла
+                self.db.set_sale_bonus(sale_id, points, rate)
             self.main.audit("Начислены бонусы", f"заказ №{o.id}: +{points} баллов "
                                                 f"({rate}%{', двойные' if doubled else ''})")
         then = ("Напишем, когда букет будет готов — можно будет забирать." if o.address == "Самовывоз"
@@ -391,6 +388,11 @@ class ClientCenter(QDialog):
                 self, "Букет с витрины", f"Вернуть «{item.title}» на витрину? Он был в одном экземпляре.\n\n"
                 "«Нет» — если его уже продали.", QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes) == QMessageBox.Yes
         self.db.set_client_order_status(o.id, "rejected", datetime.now(), reason, restore_single=restore)
+        if o.bonus_spent:  # клиент списывал баллы — вернуть, заказ же не состоялся
+            self.db.loyalty().adjust(norm_phone(o.client_phone), o.bonus_spent,
+                                     note=f"Возврат баллов за отклонённый заказ №{o.id}",
+                                     author=self.main.user.name if self.main.user else "")
+            self.db.set_order_bonus(o.id, 0, o.bonus_accrued, o.loyalty_rate)
         self._to_client(o.chat_id, f"К сожалению, заказ №{o.id} не можем принять" + (f": {reason}" if reason else ".")
                         + "\nНапишите нам — подберём другой вариант 🌷", markup=MENU)
         self.main.audit("Заказ из бота отклонён", f"№{o.id}" + (f": {reason}" if reason else ""))

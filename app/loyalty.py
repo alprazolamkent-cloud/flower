@@ -81,6 +81,8 @@ def norm_phone(value: str | int | None) -> str:
     if value is None:
         return ""
     digits = re.sub(r"\D", "", str(value))
+    if len(digits) == 11 and digits.startswith("8"):  # 8 999… и +7 999… — один и тот же клиент
+        digits = "7" + digits[1:]
     if 10 <= len(digits) <= 15:
         return digits
     return ""
@@ -95,7 +97,7 @@ def add_months(day: date, months: int) -> date:
 
 
 def load_config(settings: QSettings | None = None) -> dict[str, int]:
-    s = settings or QSettings("FlowerDeliveries", "FlowerDeliveries")
+    s = settings or QSettings(SETTINGS_GROUP, SETTINGS_GROUP)
     result = dict(DEFAULT_CONFIG)
     for key in result:
         try:
@@ -223,15 +225,14 @@ class Loyalty:
         if not phone:
             return 0
         now = self._now(now)
-        acc = self._account(phone)
-        if acc.welcome:
+        if self._account(phone).welcome:
             return 0
         points = int(self.cfg["welcome"])
         self._touch(phone, now)
+        # флаг — в той же транзакции, что и начисление: иначе падение между коммитами даст баллы дважды
+        self.conn.execute("UPDATE loyalty_accounts SET welcome=1 WHERE phone=?", (phone,))
         self._txn(phone, now, "welcome", points, source="Регистрация в боте",
                   note="Приветственные баллы")
-        self.conn.execute("UPDATE loyalty_accounts SET welcome=1 WHERE phone=?", (phone,))
-        self.conn.commit()
         return points
 
     def eligible_amount(self, lines: list[dict[str, Any]]) -> int:
@@ -294,12 +295,17 @@ class Loyalty:
 
     def adjust(self, phone: str, delta: int, *, note: str, author: str = "",
                now: datetime | None = None) -> int:
-        """Ручная корректировка администратора. ``delta`` может быть отрицательным."""
+        """Ручная корректировка администратора. ``delta`` может быть отрицательным,
+        но баланс ниже нуля не уходит — списывается не больше, чем есть."""
         phone = norm_phone(phone)
         delta = int(delta)
         if not phone or delta == 0 or not note.strip():
             raise ValueError("Нужны телефон, ненулевая сумма и причина")
         now = self._now(now)
+        if delta < 0:
+            delta = max(delta, -self.balance(phone, now))
+            if delta == 0:
+                return 0
         self._txn(phone, now, "adjust", delta, source="Корректировка",
                   author=author, note=note.strip())
         if delta > 0:
@@ -431,6 +437,17 @@ class Loyalty:
         return True
 
     # ----- история -----
+
+    def accounts(self, query: str = "") -> list[dict[str, Any]]:
+        """Все клиенты программы лояльности — для окна «Бонусы клиентов». ``query`` — цифры телефона."""
+        digits = re.sub(r"\D", "", query)
+        rows = self.conn.execute(
+            "SELECT phone, balance, last_activity, COALESCE(expires_at, ''), welcome"
+            " FROM loyalty_accounts ORDER BY balance DESC, last_activity DESC, phone").fetchall()
+        return [{"phone": phone, "balance": balance, "last_activity": last,
+                 "expires_at": expires, "welcome": bool(welcome)}
+                for phone, balance, last, expires, welcome in rows
+                if not digits or digits in phone]
 
     def history(self, phone: str, limit: int = 50) -> list[dict[str, Any]]:
         rows = self.conn.execute(

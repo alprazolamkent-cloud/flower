@@ -624,3 +624,23 @@ def test_bot_logic_fixes(db):
     db.link_work_phone(db.work_phone_code(), "555", NOW)
     phone = flow.handle(Incoming("555", callback="wr:0"), NOW)  # старая кнопка «Почему?» без начатого списания
     assert "устарела" in texts(phone)
+
+
+def test_bonus_not_for_promo_bouquet(db):
+    from app.stock import Product, Recipe
+    rose = db.save_product(Product(0, "Кения", "Цветы", price=250))
+    recipe = db.save_recipe(Recipe(0, "Уценённый", 1000, items=[(rose, 3)], promo_price=700))
+    item_id = db.save_showcase_item(ShowcaseItem(0, "Уценённый", price=700))
+    db.conn.execute("UPDATE showcase SET recipe_id=? WHERE id=?", (recipe, item_id))  # так делает сборка
+    db.conn.execute("UPDATE recipes SET promo_price=700 WHERE id=?", (recipe,))  # уценка — через set_promo
+    db.conn.commit()
+    db.loyalty().adjust("79161234567", 1000, note="тест")
+    db.touch_client(CHAT_ID, "Иван", "ivan", NOW)
+    order = db.add_client_order(CHAT_ID, NOW, date(2026, 10, 21), "к 15:00", "Уценённый — 700 ₽",
+                                "ул. Ленина, 5", "Маша", "+79161234567", "", item_id)
+    db.price_client_order(order.id, 700, 0, NOW)
+    flow = ClientFlow(db, "Магазин")
+    res = say(flow, callback=f"bonus:{order.id}:200")
+    assert "нельзя" in texts(res)  # уценённый букет баллами не оплачивается
+    assert db.get_client_order(order.id).bonus_spent == 0
+    assert db.loyalty().balance("79161234567") == 1000
