@@ -6,13 +6,16 @@
 
 import html
 import secrets
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta
+from urllib.parse import quote
 
 from . import order_ops
 from .client_bot import QR_FILE, client_settings
-from .db import ORDER_STATUS, Database, User
+from .db import ORDER_STATUS, Database, ShowcaseItem, User
 from .delivery_dialog import money
-from .stock import qty_text
+from .loyalty import norm_phone
+from .photos import shrink
+from .stock import PAYMENTS, CartLine, qty_text
 
 SESSION_HOURS = 12
 COOKIE = "aloflorist_session"
@@ -62,6 +65,23 @@ a.btn.del, button.del {{ background: #d63384; color: #fff; }}
 .st-confirmed {{ color: #2e9e5b; font-weight: bold; }}
 .st-rejected {{ color: #6b5560; }}
 h3 {{ margin: 4px 0 10px; }}
+button.mini {{ flex: none; padding: 6px 12px; font-size: 15px; }}
+.card.showcase {{ display: flex; gap: 12px; align-items: center; }}
+.card.showcase .grow {{ flex: 1; }}
+.thumb {{ width: 72px; height: 72px; object-fit: cover; border-radius: 10px; flex: none; }}
+.thumb.none {{ display: flex; align-items: center; justify-content: center; background: #fbe9f1;
+               color: #b58a9c; font-size: 11px; text-align: center; }}
+.badge {{ background: #d63384; color: #fff; border-radius: 10px; padding: 1px 8px; font-size: 13px; }}
+.thread {{ display: flex; flex-direction: column; gap: 6px; margin-bottom: 10px; }}
+.msg {{ max-width: 85%; padding: 8px 12px; border-radius: 14px; background: #fff;
+        border: 1px solid #f1c3d3; white-space: pre-line; }}
+.msg.in {{ align-self: flex-start; }}
+.msg.out {{ align-self: flex-end; background: #fbd9e8; }}
+.msg .meta {{ font-size: 11px; color: #6b5560; margin-top: 3px; }}
+form.reply {{ display: flex; gap: 8px; position: sticky; bottom: 8px; }}
+form.reply input {{ margin-bottom: 0; }}
+form.reply button {{ flex: none; }}
+input[type=file] {{ padding: 8px 0; }}
 </style></head><body>{body}</body></html>"""
 
 
@@ -91,6 +111,7 @@ class WebApp:
         self.notify_admin = notify_admin
         self.sale_shift_id = sale_shift_id
         self.sessions: dict[str, tuple[User, datetime]] = {}  # токен → (сотрудник, действует до)
+        self.carts: dict[str, list[list]] = {}  # токен → корзина продажи: [вид («p»/«r»), id, кол-во]
 
     # ----- сессии -----
 
@@ -118,7 +139,8 @@ class WebApp:
 
     # ----- маршруты -----
 
-    def handle(self, method: str, path: str, form: dict, cookies: dict) -> tuple[int, dict, bytes]:
+    def handle(self, method: str, path: str, form: dict, cookies: dict,
+               files: dict | None = None) -> tuple[int, dict, bytes]:
         if path == "/login":
             if method == "POST":
                 return self._login(form)
@@ -141,6 +163,30 @@ class WebApp:
             return self._order_confirm(user, form, method)
         if path == "/order/reject" and method == "POST":
             return self._order_reject(user, form)
+        if path == "/sell":
+            return 200, {}, _page("Продажа", self._sell_page(user, form, cookies))
+        if path == "/sell/add" and method == "POST":
+            return self._sell_add(form, cookies)
+        if path == "/sell/remove" and method == "POST":
+            return self._sell_remove(form, cookies)
+        if path == "/sell/checkout" and method == "POST":
+            return self._sell_checkout(user, form, cookies)
+        if path == "/showcase":
+            return 200, {}, _page("Витрина", self._showcase_page(user, form))
+        if path == "/showcase/add" and method == "POST":
+            return self._showcase_add(user, form, files or {})
+        if path == "/showcase/toggle" and method == "POST":
+            return self._showcase_toggle(user, form)
+        if path == "/photo":
+            return self._photo(form)
+        if path == "/chats":
+            return 200, {}, _page("Переписки", self._chats_page(user))
+        if path == "/chat":
+            return 200, {}, _page("Переписка", self._chat_page(user, form))
+        if path == "/chat/reply" and method == "POST":
+            return self._chat_reply(user, form)
+        if path == "/reports":
+            return 200, {}, _page("Отчёты", self._reports_page(user))
         if path == "/stock":
             return 200, {}, _page("Склад", self._stock_page(user, form.get("q", "")))
         if path == "/":
@@ -156,15 +202,20 @@ class WebApp:
             return f'<a href="{href}"{cls}>{name}</a>'
 
         open_orders = len(self.db.client_orders(open_only=True))
-        orders_name = f"Заказы ({open_orders})" if open_orders else "Заказы"
-        return (f'<header><b>🌸 AloFlorist</b>{tab("/", "Доставки", "deliveries")}'
-                f'{tab("/orders", orders_name, "orders")}{tab("/stock", "Склад", "stock")}'
+        unread = self.db.client_unread()
+        return (f'<header><b>🌸</b>{tab("/", "Доставки", "deliveries")}'
+                f'{tab("/orders", f"Заказы ({open_orders})" if open_orders else "Заказы", "orders")}'
+                f'{tab("/sell", "Продажа", "sell")}{tab("/showcase", "Витрина", "showcase")}'
+                f'{tab("/chats", f"Чаты ({unread})" if unread else "Чаты", "chats")}'
+                f'{tab("/stock", "Склад", "stock")}{tab("/reports", "Отчёты", "reports")}'
                 f'<span class="who">{_esc(user.name or user.login)} · <a href="/logout">выйти</a></span></header>')
 
-    def _error_page(self, user: User, text: str, back: str) -> tuple[int, dict, bytes]:
-        body = (f'{self._header(user, "")}<main><div class="card">{_esc(text)}</div>'
+    def _error_body(self, user: User, text: str, back: str) -> str:
+        return (f'{self._header(user, "")}<main><div class="card">{_esc(text)}</div>'
                 f'<div class="row"><a class="btn" href="{back}">← Назад</a></div></main>')
-        return 200, {}, _page("Ошибка", body)
+
+    def _error_page(self, user: User, text: str, back: str) -> tuple[int, dict, bytes]:
+        return 200, {}, _page("Ошибка", self._error_body(user, text, back))
 
     # ----- доставки -----
 
@@ -252,7 +303,7 @@ class WebApp:
         except (TypeError, ValueError):
             o = None
         if o is None:
-            return self._error_page(user, "Такого заказа нет.", "/orders")[2].decode()
+            return self._error_body(user, "Такого заказа нет.", "/orders")
         status = ORDER_STATUS.get(o.status, o.status)
         rows = [("Статус", f'<span class="st-{_esc(o.status)}">{_esc(status)}</span>'),
                 ("Когда", f"{o.day:%d.%m.%Y} {o.time}"), ("Что", _esc(o.items)),
@@ -360,6 +411,257 @@ class WebApp:
             return self._error_page(user, str(e), "/orders")
         self.db.log_action(user, "Заказ из бота отклонён (сайт)", f"№{oid}" + (f": {reason}" if reason else ""))
         return _redirect("/orders")
+
+    # ----- продажа с телефона -----
+
+    def _cart_lines(self, cart: list[list]) -> list[CartLine]:
+        lines = []
+        for kind, ident, qty in cart:
+            if kind == "r":
+                r = self.db.get_recipe(ident)
+                if r is not None:
+                    lines.append(CartLine(r.title, qty, r.sell_price, recipe_id=r.id))
+            else:
+                p = next(iter(self.db.products(ids=[ident])), None)
+                if p is not None:
+                    lines.append(CartLine(p.name, qty, p.price, product_id=p.id))
+        return lines
+
+    def _sell_add(self, form: dict, cookies: dict) -> tuple[int, dict, bytes]:
+        token = cookies.get(COOKIE, "")
+        kind = "r" if form.get("kind") == "r" else "p"
+        try:
+            ident = int(form.get("id", "0"))
+        except ValueError:
+            return _redirect("/sell")
+        cart = self.carts.setdefault(token, [])
+        for entry in cart:
+            if entry[0] == kind and entry[1] == ident:
+                entry[2] += 1
+                break
+        else:
+            cart.append([kind, ident, 1])
+        query = form.get("q", "").strip()
+        return _redirect("/sell" + ("?q=" + quote(query) if query else ""))
+
+    def _sell_remove(self, form: dict, cookies: dict) -> tuple[int, dict, bytes]:
+        token = cookies.get(COOKIE, "")
+        try:
+            self.carts.get(token, []).pop(int(form.get("i", "-1")))
+        except (ValueError, IndexError):
+            pass
+        return _redirect("/sell")
+
+    def _sell_checkout(self, user: User, form: dict, cookies: dict) -> tuple[int, dict, bytes]:
+        token = cookies.get(COOKIE, "")
+        lines = self._cart_lines(self.carts.get(token, []))
+        if not lines:
+            return _redirect("/sell")
+        payment = form.get("payment", "")
+        phone = norm_phone(form.get("phone", ""))
+        now = datetime.now()
+        loyalty = self.db.loyalty()
+        rate = loyalty.rate(phone, now) if phone else 0
+        try:
+            sale_id = self.db.add_sale(lines, payment, user.id,
+                                       self.sale_shift_id() if self.sale_shift_id else None, now,
+                                       client_phone=phone, loyalty_rate=rate)
+        except UserError as e:
+            return self._error_page(user, str(e), "/sell")
+        total = sum(x.amount for x in lines)
+        points = loyalty.accrue(phone, total, now=now, source=f"Продажа №{sale_id}",
+                                author=user.name or user.login) if phone else 0
+        if points:
+            self.db.set_sale_bonus(sale_id, points, rate)
+        self.db.log_action(user, "Продажа (сайт)", f"№{sale_id}: {money(total)}, {PAYMENTS.get(payment)} — "
+                           + ", ".join(f"{x.title} × {qty_text(x.qty)}" for x in lines)
+                           + (f"; начислено {points} баллов" if points else ""))
+        self.carts.pop(token, None)
+        if self.on_change:
+            self.on_change()
+        return _redirect(f"/sell?ok={total}")
+
+    def _sell_page(self, user: User, form: dict, cookies: dict) -> str:
+        token = cookies.get(COOKIE, "")
+        cart = self.carts.get(token, [])
+        parts = [self._header(user, "sell"), "<main>"]
+        if form.get("ok", "").isdigit():
+            parts.append(f'<div class="card">✅ Продажа на {money(int(form["ok"]))} записана.</div>')
+        if cart:
+            lines = self._cart_lines(cart)
+            total = sum(x.amount for x in lines)
+            rows = "".join(
+                f'<tr><td>{_esc(x.title)}</td><td>{qty_text(x.qty)}</td><td>{money(x.amount)}</td>'
+                f'<td><form method="post" action="/sell/remove"><input type="hidden" name="i" value="{i}">'
+                f'<button class="mini">✕</button></form></td></tr>'
+                for i, x in enumerate(lines))
+            parts.append(f'<div class="card"><b>🧾 Корзина — {money(total)}</b><table>{rows}</table>'
+                         '<form method="post" action="/sell/checkout">'
+                         '<input name="phone" inputmode="tel" placeholder="📱 Телефон клиента — бонусы '
+                         '(необязательно)"><div class="row">'
+                         '<button class="del" name="payment" value="cash">💵 Наличные</button>'
+                         '<button class="del" name="payment" value="card">💳 Терминал</button>'
+                         '<button class="del" name="payment" value="qr">📱 QR</button>'
+                         '</div></form></div>')
+        query = form.get("q", "")
+        needle = query.strip().casefold()
+
+        def add_row(kind, ident, title, price):
+            return (f'<tr><td>{_esc(title)}</td><td>{price} ₽</td>'
+                    f'<td><form method="post" action="/sell/add">'
+                    f'<input type="hidden" name="kind" value="{kind}">'
+                    f'<input type="hidden" name="id" value="{ident}">'
+                    f'<input type="hidden" name="q" value="{_esc(query)}">'
+                    f'<button class="mini">＋</button></form></td></tr>')
+
+        rows = [add_row("r", r.id, "💐 " + r.title, r.sell_price) for r in self.db.recipes()
+                if not needle or needle in r.title.casefold()]
+        rows += [add_row("p", p.id, p.name, p.price) for p in self.db.products()
+                 if not needle or needle in p.name.casefold()]
+        truncated = len(rows) > 150
+        parts.append(f'<div class="card"><form method="get" action="/sell">'
+                     f'<input name="q" value="{_esc(query)}" placeholder="Поиск товара или букета"></form>'
+                     f"<table>{''.join(rows[:150])}</table>"
+                     + ('<div class="gray">Показаны первые 150 — уточните поиск.</div>' if truncated else "")
+                     + "</div></main>")
+        return "".join(parts)
+
+    # ----- витрина -----
+
+    def _showcase_page(self, user: User, form: dict) -> str:
+        cards = []
+        for item in self.db.showcase():
+            photo = (f'<img class="thumb" src="/photo?kind=showcase&id={item.id}" alt="">' if item.photo
+                     else '<div class="thumb none">нет фото</div>')
+            state = "" if item.active else '<div class="st-rejected">скрыт — нет в наличии</div>'
+            toggle = "🚫 Нет в наличии" if item.active else "✅ Вернуть на витрину"
+            single = " · 1️⃣ один экземпляр" if item.single else ""
+            cards.append(f'''<div class="card showcase">{photo}<div class="grow">
+<div><b>{_esc(item.title)}</b> — {item.price} ₽{single}</div>{state}
+<form method="post" action="/showcase/toggle"><input type="hidden" name="id" value="{item.id}">
+<button class="mini">{toggle}</button></form></div></div>''')
+        if not cards:
+            cards.append('<div class="card">Витрина пуста — добавьте первый букет.</div>')
+        add_form = '''<div class="card"><b>➕ Новый букет</b>
+<form method="post" action="/showcase/add" enctype="multipart/form-data">
+<input name="title" placeholder="Название — например, «Нежность»">
+<input name="price" type="number" inputmode="numeric" min="0" placeholder="Цена, ₽">
+<input name="description" placeholder="Описание (необязательно): состав, размер">
+<input name="photo" type="file" accept="image/*">
+<button class="del">Добавить на витрину</button></form>
+<div class="gray">Фото сразу увидят клиенты в боте.</div></div>'''
+        return (self._header(user, "showcase") + f"<main>{add_form}{''.join(cards)}</main>")
+
+    def _showcase_add(self, user: User, form: dict, files: dict) -> tuple[int, dict, bytes]:
+        title = form.get("title", "").strip()
+        try:
+            price = int(form.get("price", "0") or 0)
+        except ValueError:
+            price = 0
+        photo = None
+        if files.get("photo") and files["photo"][1]:
+            try:
+                photo = shrink(files["photo"][1])
+            except Exception:  # noqa: BLE001 — не картинка: добавим без фото
+                photo = None
+        try:
+            self.db.save_showcase_item(ShowcaseItem(0, title, form.get("description", "").strip(),
+                                                    price, photo=photo))
+        except UserError as e:
+            return self._error_page(user, str(e), "/showcase")
+        self.db.log_action(user, "Витрина: добавлен букет (сайт)", f"{title} — {price} ₽")
+        return _redirect("/showcase")
+
+    def _showcase_toggle(self, user: User, form: dict) -> tuple[int, dict, bytes]:
+        try:
+            item = self.db.get_showcase_item(int(form.get("id", "0")))
+        except ValueError:
+            item = None
+        if item is not None:
+            item.active = not item.active
+            self.db.save_showcase_item(item)
+            self.db.log_action(user, "Витрина (сайт)",
+                               f"«{item.title}» — {'вернули на витрину' if item.active else 'скрыли'}")
+        return _redirect("/showcase")
+
+    def _photo(self, form: dict) -> tuple[int, dict, bytes]:
+        try:
+            item = self.db.get_showcase_item(int(form.get("id", "0")))
+        except ValueError:
+            item = None
+        if item is not None and item.photo:
+            return 200, {"Content-Type": "image/jpeg", "Cache-Control": "max-age=3600"}, item.photo
+        return 404, {"Content-Type": "text/plain; charset=utf-8"}, "нет фото".encode("utf-8")
+
+    # ----- переписки -----
+
+    def _chats_page(self, user: User) -> str:
+        cards = []
+        for chat, unread, last in self.db.client_chats():
+            name = chat.name or chat.username or chat.chat_id
+            badge = f' <span class="badge">{unread}</span>' if unread else ""
+            preview = _esc(last.text[:80]) if last else ""
+            cards.append(f'<a class="card order" href="/chat?id={quote(chat.chat_id)}">'
+                         f"<div><b>{_esc(name)}</b>{badge}</div>"
+                         f'<div class="addr">{preview}</div></a>')
+        if not cards:
+            cards.append('<div class="card">Переписок пока нет — клиенты пишут боту.</div>')
+        return self._header(user, "chats") + f"<main>{''.join(cards)}</main>"
+
+    def _chat_page(self, user: User, form: dict) -> str:
+        chat_id = form.get("id", "")
+        chat = self.db.client_chat(chat_id)
+        if chat is None:
+            return self._error_body(user, "Такой переписки нет.", "/chats")
+        self.db.mark_client_read(chat_id)
+        bubbles = []
+        for m in self.db.client_messages(chat_id):
+            side = "in" if m.incoming else "out"
+            text = _esc(m.text) + (" 📷" if m.has_photo else "")
+            who = f" · {_esc(m.author)}" if m.author and not m.incoming else ""
+            bubbles.append(f'<div class="msg {side}">{text}'
+                           f'<div class="meta">{m.at:%d.%m %H:%M}{who}</div></div>')
+        name = chat.name or chat.username or chat.chat_id
+        return (self._header(user, "chats") + f"<main><h3>💬 {_esc(name)}</h3>"
+                f'<div class="thread">{"".join(bubbles) or "<div class=card>Пусто.</div>"}</div>'
+                f'<form method="post" action="/chat/reply" class="reply">'
+                f'<input type="hidden" name="id" value="{_esc(chat_id)}">'
+                f'<input name="text" placeholder="Ответ клиенту…" autocomplete="off" autofocus>'
+                f'<button class="del">➤</button></form></main>')
+
+    def _chat_reply(self, user: User, form: dict) -> tuple[int, dict, bytes]:
+        chat_id = form.get("id", "")
+        text = form.get("text", "").strip()
+        if chat_id and text:
+            self.send_to_client(chat_id, text, None, None)
+            self.db.log_action(user, "Ответ клиенту (сайт)", f"{chat_id}: {text[:60]}")
+            if self.on_change:
+                self.on_change()
+        return _redirect("/chat?id=" + quote(chat_id))
+
+    # ----- отчёты -----
+
+    def _reports_page(self, user: User) -> str:
+        today = date.today()
+        start = datetime.combine(today, time.min)
+        end = start + timedelta(days=1)
+        rep = self.db.sales_report(start, end)
+        week = self.db.sales_report(start - timedelta(days=7), end)
+        deliveries = [d for d in self.db.for_day(today) if d.delete_requested_at is None]
+        delivered = sum(1 for d in deliveries if d.delivered)
+        payments = " · ".join(f"{PAYMENTS.get(k, k)} {money(v)}" for k, v in rep.by_payment.items()) or "—"
+        top = "".join(f"<tr><td>{_esc(t)}</td><td>{qty_text(q)}</td><td>{money(s)}</td></tr>"
+                      for t, q, s in rep.top[:5]) or '<tr><td colspan="3">Продаж пока нет.</td></tr>'
+        open_orders = len(self.db.client_orders(open_only=True))
+        return (self._header(user, "reports") + f"<main><h3>Сегодня, {today:%d.%m.%Y}</h3>"
+                f'<div class="card"><b>💰 Продажи: {money(rep.revenue)}</b> (чеков: {rep.count}, '
+                f'средний {money(rep.average)})<div class="gray">{payments}</div></div>'
+                f'<div class="card"><b>🚚 Доставки:</b> {delivered} из {len(deliveries)} доставлено'
+                f'<div class="gray">Заказов из бота ждут: {open_orders}</div></div>'
+                f'<div class="card"><b>🏆 Топ продаж дня</b><table>'
+                f'<tr><th>Что</th><th>Сколько</th><th>Выручка</th></tr>{top}</table></div>'
+                f'<div class="card"><b>📅 За 7 дней:</b> {money(week.revenue)} '
+                f'(чеков: {week.count})</div></main>')
 
     # ----- склад -----
 

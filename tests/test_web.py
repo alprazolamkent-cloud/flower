@@ -151,3 +151,78 @@ def test_reject_returns_bonus_on_site(db):
     assert db.get_client_order(o.id).status == "rejected"
     assert db.loyalty().balance("79001112233") == 500  # списанные баллы вернулись
     assert "нет цветов" in sent[-1]
+
+
+def test_sell_from_phone(db):
+    app = WebApp(db, sale_shift_id=lambda: None)
+    cookies = login(app)
+    rose = db.products()[0]
+    _, _, body = app.handle("GET", "/sell", {}, cookies)
+    assert "Роза Кения" in body.decode()
+    app.handle("POST", "/sell/add", {"kind": "p", "id": str(rose.id)}, cookies)
+    app.handle("POST", "/sell/add", {"kind": "p", "id": str(rose.id)}, cookies)
+    _, _, body = app.handle("GET", "/sell", {}, cookies)
+    assert "Корзина" in body.decode() and "500" in body.decode()  # 2 × 250
+    status, headers, _ = app.handle("POST", "/sell/checkout",
+                                    {"payment": "cash", "phone": "+7 900 111-22-33"}, cookies)
+    assert status == 303 and headers["Location"] == "/sell?ok=500"
+    sale = db.sales_between(datetime(2020, 1, 1), datetime(2030, 1, 1))[0]
+    assert sale.total == 500 and sale.payment == "cash" and sale.client_phone == "79001112233"
+    assert db.loyalty().balance("79001112233") == 25  # 5% с 500
+    _, _, body = app.handle("GET", "/sell", {}, cookies)
+    assert "Корзина" not in body.decode()  # корзина очистилась
+
+
+def test_showcase_add_and_toggle(db):
+    from app.photos import to_jpeg
+    from PySide6.QtGui import QImage
+    app = WebApp(db)
+    cookies = login(app)
+    image = QImage(60, 40, QImage.Format_RGB32)
+    jpeg = to_jpeg(image)
+    status, _, _ = app.handle("POST", "/showcase/add",
+                              {"title": "Нежность", "price": "3500", "description": "пионы"},
+                              cookies, {"photo": ("b.jpg", jpeg)})
+    assert status == 303
+    [item] = db.showcase()
+    assert item.title == "Нежность" and item.price == 3500 and item.photo
+    status, headers, body = app.handle("GET", "/photo", {"kind": "showcase", "id": str(item.id)}, cookies)
+    assert status == 200 and headers["Content-Type"] == "image/jpeg" and body
+    app.handle("POST", "/showcase/toggle", {"id": str(item.id)}, cookies)
+    assert not db.get_showcase_item(item.id).active  # скрыли с витрины
+    _, _, body = app.handle("GET", "/showcase", {}, cookies)
+    assert "Вернуть на витрину" in body.decode()
+
+
+def test_chats_and_reply(db):
+    sent = []
+    app = WebApp(db, send_to_client=lambda chat, text, photo=None, markup=None: sent.append((chat, text)))
+    cookies = login(app)
+    db.touch_client("555", "Иван", "ivan", NOW)
+    db.add_client_message("555", True, "Здравствуйте! Есть пионы?", NOW)
+    _, _, body = app.handle("GET", "/chats", {}, cookies)
+    assert "Иван" in body.decode() and "пионы" in body.decode()
+    _, _, body = app.handle("GET", "/chat", {"id": "555"}, cookies)
+    assert "Здравствуйте" in body.decode() and db.client_unread() == 0  # прочитано
+    status, _, _ = app.handle("POST", "/chat/reply", {"id": "555", "text": "Есть, белые и розовые"}, cookies)
+    assert status == 303 and sent == [("555", "Есть, белые и розовые")]
+
+
+def test_reports_page(db):
+    app = WebApp(db, sale_shift_id=lambda: None)
+    cookies = login(app)
+    _, _, body = app.handle("GET", "/reports", {}, cookies)
+    text = body.decode()
+    assert "Продажи" in text and "Доставки" in text and "Топ продаж" in text
+
+
+def test_parse_multipart():
+    from app.web_server import parse_multipart
+    boundary = b"XBOUND"
+    body = (b"--XBOUND\r\nContent-Disposition: form-data; name=\"title\"\r\n\r\n"
+            b"\xd0\x9d\xd0\xb5\xd0\xb6\xd0\xbd\xd0\xbe\xd1\x81\xd1\x82\xd1\x8c\r\n"
+            b"--XBOUND\r\nContent-Disposition: form-data; name=\"photo\"; filename=\"a.jpg\"\r\n"
+            b"Content-Type: image/jpeg\r\n\r\n\xff\xd8\xff\xe0BINARY\r\n--XBOUND--\r\n")
+    fields, files = parse_multipart(body, 'multipart/form-data; boundary="XBOUND"')
+    assert fields["title"] == "Нежность"
+    assert files["photo"] == ("a.jpg", b"\xff\xd8\xff\xe0BINARY")

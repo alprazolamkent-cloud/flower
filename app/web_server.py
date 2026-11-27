@@ -14,7 +14,7 @@ from PySide6.QtCore import QObject, QSettings, QTimer
 
 from .web import WebApp
 
-MAX_BODY = 64 * 1024  # формы крошечные; всё большее — не наше
+MAX_BODY = 12 * 1024 * 1024  # фото с телефона — до ~10 МБ (сожмём на той стороне)
 WAIT_SECONDS = 10  # сколько телефон ждёт ответа главного потока
 
 
@@ -58,6 +58,37 @@ def _parse_cookies(header: str) -> dict:
     return out
 
 
+def parse_multipart(body: bytes, content_type: str) -> tuple[dict, dict]:
+    """(поля, файлы) из multipart/form-data. файлы: имя поля → (имя файла, байты)."""
+    fields, files = {}, {}
+    boundary = content_type.partition("boundary=")[2].strip().strip('"').encode()
+    if not boundary:
+        return fields, files
+    for part in body.split(b"--" + boundary):
+        head, sep, data = part.partition(b"\r\n\r\n")
+        if not sep or not data.endswith(b"\r\n"):
+            continue
+        data = data[:-2]  # CRLF перед следующей границей — разделитель, не содержимое
+        disposition = ""
+        for line in head.decode("utf-8", "replace").split("\r\n"):
+            if line.lower().startswith("content-disposition:"):
+                disposition = line
+        name = filename = ""
+        for piece in disposition.split(";"):
+            piece = piece.strip()
+            if piece.startswith("name="):
+                name = piece[5:].strip('"')
+            elif piece.startswith("filename="):
+                filename = piece[9:].strip('"')
+        if not name:
+            continue
+        if filename:
+            files[name] = (filename, data)
+        else:
+            fields[name] = data.decode("utf-8", "replace")
+    return fields, files
+
+
 class WebServer(QObject):
     def __init__(self, app: WebApp, port: int = 8080, parent=None):
         super().__init__(parent)
@@ -91,12 +122,18 @@ class WebServer(QObject):
                 except ValueError:
                     length = 0
                 body = self.rfile.read(length) if length else b""
-                form = {k: v[0] for k, v in
-                        parse_qs(body.decode("utf-8", "replace")).items()} if method == "POST" else {}
+                content_type = self.headers.get("Content-Type", "")
+                files: dict = {}
+                if method == "POST" and content_type.startswith("multipart/form-data"):
+                    form, files = parse_multipart(body, content_type)
+                elif method == "POST":
+                    form = {k: v[0] for k, v in parse_qs(body.decode("utf-8", "replace")).items()}
+                else:
+                    form = {}
                 query = {k: v[0] for k, v in parse_qs(urlparse(self.path).query).items()}
                 done = threading.Event()
                 box: dict = {}
-                server.requests.put((method, urlparse(self.path).path, {**query, **form},
+                server.requests.put((method, urlparse(self.path).path, {**query, **form}, files,
                                      _parse_cookies(self.headers.get("Cookie", "")), done, box))
                 if not done.wait(WAIT_SECONDS):
                     self._reply(503, {}, "Программа занята — обновите страницу.".encode("utf-8"))
@@ -123,11 +160,11 @@ class WebServer(QObject):
         """Разобрать накопившиеся запросы. Только из главного потока (таймер или тест)."""
         while True:
             try:
-                method, path, form, cookies, done, box = self.requests.get_nowait()
+                method, path, form, files, cookies, done, box = self.requests.get_nowait()
             except queue.Empty:
                 return
             try:
-                box["response"] = self.app.handle(method, path, form, cookies)
+                box["response"] = self.app.handle(method, path, form, cookies, files)
             except Exception as e:  # noqa: BLE001 — один запрос не должен уронить сервер
                 box["response"] = (500, {}, f"Ошибка: {e}".encode("utf-8"))
             done.set()
