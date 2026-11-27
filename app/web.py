@@ -11,11 +11,11 @@ from urllib.parse import quote
 
 from . import order_ops
 from .client_bot import QR_FILE, client_settings
-from .db import ORDER_STATUS, Database, ShowcaseItem, User
+from .db import ORDER_STATUS, Database, ShowcaseItem, User, UserError
 from .delivery_dialog import money
 from .loyalty import norm_phone
 from .photos import shrink
-from .stock import PAYMENTS, CartLine, qty_text
+from .stock import PAYMENTS, CartLine, StockError, qty_text
 
 SESSION_HOURS = 12
 COOKIE = "aloflorist_session"
@@ -114,7 +114,8 @@ class WebApp:
         self.notify_admin = notify_admin
         self.sale_shift_id = sale_shift_id
         self.sessions: dict[str, tuple[User, datetime]] = {}  # токен → (сотрудник, действует до)
-        self.carts: dict[str, list[list]] = {}  # токен → корзина продажи: [вид («p»/«r»), id, кол-во]
+        self.carts: dict[str, dict] = {}  # токен → корзина продажи
+        self.supply_carts: dict[str, dict] = {}  # токен → приёмка поставки: поставщик и строки
 
     # ----- сессии -----
 
@@ -180,6 +181,16 @@ class WebApp:
             return self._sell_bonus(form, cookies)
         if path == "/sell/checkout" and method == "POST":
             return self._sell_checkout(user, form, cookies)
+        if path == "/supply":
+            return 200, {}, _page("Поставка", self._supply_page(user, form, cookies))
+        if path == "/supply/add" and method == "POST":
+            return self._supply_add(form, cookies)
+        if path == "/supply/update" and method == "POST":
+            return self._supply_update(form, cookies)
+        if path == "/supply/finish" and method == "POST":
+            return self._supply_finish(user, form, cookies)
+        if path == "/supply/prices" and method == "POST":
+            return self._supply_prices(user, form)
         if path == "/showcase":
             return 200, {}, _page("Витрина", self._showcase_page(user, form))
         if path == "/showcase/add" and method == "POST":
@@ -214,7 +225,8 @@ class WebApp:
         unread = self.db.client_unread()
         return (f'<header><b>🌸</b>{tab("/", "Доставки", "deliveries")}'
                 f'{tab("/orders", f"Заказы ({open_orders})" if open_orders else "Заказы", "orders")}'
-                f'{tab("/sell", "Продажа", "sell")}{tab("/showcase", "Витрина", "showcase")}'
+                f'{tab("/sell", "Продажа", "sell")}{tab("/supply", "Поставка", "supply")}'
+                f'{tab("/showcase", "Витрина", "showcase")}'
                 f'{tab("/chats", f"Чаты ({unread})" if unread else "Чаты", "chats")}'
                 f'{tab("/stock", "Склад", "stock")}{tab("/reports", "Отчёты", "reports")}'
                 f'<span class="who">{_esc(user.name or user.login)} · <a href="/logout">выйти</a></span></header>')
@@ -668,6 +680,139 @@ class WebApp:
                      f"<table>{''.join(rows[:150])}</table>"
                      + ('<div class="gray">Показаны первые 150 — уточните поиск.</div>' if truncated else "")
                      + "</div></main>")
+        return "".join(parts)
+
+    # ----- приёмка поставки -----
+
+    def _supply_cart(self, cookies: dict) -> dict:
+        return self.supply_carts.setdefault(cookies.get(COOKIE, ""), {"supplier": "", "items": []})
+
+    def _supply_add(self, form: dict, cookies: dict) -> tuple[int, dict, bytes]:
+        cart = self._supply_cart(cookies)
+        try:
+            pid = int(form.get("id", "0"))
+        except ValueError:
+            return _redirect("/supply")
+        for entry in cart["items"]:
+            if entry["id"] == pid:
+                entry["qty"] += 1
+                break
+        else:
+            p = next(iter(self.db.products(ids=[pid])), None)
+            cost = round(p.avg_cost) if p is not None else 0  # прошлая закупка — как черновик цены
+            cart["items"].append({"id": pid, "qty": 1, "cost": cost})
+        query = form.get("q", "").strip()
+        return _redirect("/supply" + ("?q=" + quote(query) if query else ""))
+
+    def _supply_update(self, form: dict, cookies: dict) -> tuple[int, dict, bytes]:
+        cart = self._supply_cart(cookies)
+        cart["supplier"] = form.get("supplier", cart["supplier"]).strip()
+        kept = []
+        for i, entry in enumerate(cart["items"]):
+            if form.get(f"drop_{i}"):
+                continue
+            try:
+                entry["qty"] = float(form.get(f"qty_{i}", entry["qty"]) or 0)
+                entry["cost"] = float(form.get(f"cost_{i}", entry["cost"]) or 0)
+            except ValueError:
+                pass
+            if entry["qty"] > 0:
+                kept.append(entry)
+        cart["items"] = kept
+        return _redirect("/supply")
+
+    def _supply_finish(self, user: User, form: dict, cookies: dict) -> tuple[int, dict, bytes]:
+        cart = self._supply_cart(cookies)
+        lines = [(e["id"], e["qty"], e["cost"]) for e in cart["items"] if e["qty"] > 0]
+        if not lines:
+            return _redirect("/supply")
+        supplier = form.get("supplier", cart["supplier"]).strip()
+        try:
+            supply_id = self.db.add_supply(supplier, lines, user.id, datetime.now())
+        except (UserError, StockError) as e:
+            return self._error_page(user, str(e), "/supply")
+        total = round(sum(qty * cost for _, qty, cost in lines))
+        self.db.log_action(user, "Поставка (сайт)", f"№{supply_id}: {money(total)} — "
+                           + ", ".join(f"#{pid} × {qty_text(qty)}" for pid, qty, _ in lines))
+        cart["items"] = []  # поставщика запоминаем — следующая поставка обычно от него же
+        if self.on_change:
+            self.on_change()
+        from .stock_settings import price_markup
+        rises = self.db.price_rises(supply_id, price_markup())
+        if not rises:  # ничего не подорожало — сразу готово
+            return _redirect("/supply?ok=" + str(total))
+        rows = "".join(
+            f'<tr><td>{_esc(r.product.name)}<div class="gray">закупка {r.old_cost:.0f} → {r.new_cost:.0f} ₽</div></td>'
+            f'<td><input type="checkbox" name="apply_{r.product.id}" checked></td>'
+            f'<td><input name="price_{r.product.id}" type="number" inputmode="numeric" min="0" '
+            f'value="{r.suggested}"></td></tr>'
+            for r in rises)
+        body = (f'{self._header(user, "supply")}<main><div class="card">✅ Поставка на {money(total)} принята.'
+                f'<div class="gray">Но кое-что подорожало — проверьте цены продажи:</div></div>'
+                f'<div class="card"><form method="post" action="/supply/prices"><table>'
+                f'<tr><th>Товар</th><th>Новая цена?</th><th>Цена, ₽</th></tr>{rows}</table>'
+                '<button class="del">Применить цены</button></form></div></main>')
+        return 200, {}, _page("Цены после поставки", body)
+
+    def _supply_prices(self, user: User, form: dict) -> tuple[int, dict, bytes]:
+        changed = []
+        for key, value in form.items():
+            if not key.startswith("apply_"):
+                continue
+            pid = key[6:]
+            try:
+                price = int(form.get(f"price_{pid}", "0") or 0)
+                self.db.set_price(int(pid), price)
+                changed.append(f"#{pid} → {price} ₽")
+            except (ValueError, StockError):
+                continue
+        if changed:
+            self.db.log_action(user, "Новые цены после поставки (сайт)", ", ".join(changed))
+        return _redirect("/supply?ok=1")
+
+    def _supply_page(self, user: User, form: dict, cookies: dict) -> str:
+        cart = self._supply_cart(cookies)
+        parts = [self._header(user, "supply"), "<main>"]
+        if form.get("ok"):
+            done = f" на {money(int(form['ok']))}" if form["ok"].isdigit() else ""
+            parts.append(f'<div class="card">✅ Поставка{done} записана, остатки обновлены.</div>')
+        if cart["items"]:
+            names = {p.id: p.name for p in self.db.products(ids=[e["id"] for e in cart["items"]])}
+            rows = "".join(
+                f'<tr><td>{_esc(names.get(e["id"], str(e["id"])))}</td>'
+                f'<td><input name="qty_{i}" type="number" inputmode="decimal" min="0" step="any" '
+                f'value="{e["qty"]:g}"></td>'
+                f'<td><input name="cost_{i}" type="number" inputmode="decimal" min="0" step="any" '
+                f'value="{e["cost"]:g}"></td>'
+                f'<td><button class="mini" name="drop_{i}" value="1">✕</button></td></tr>'
+                for i, e in enumerate(cart["items"]))
+            total = round(sum(e["qty"] * e["cost"] for e in cart["items"]))
+            parts.append(f'<div class="card"><b>📦 Поставка — {money(total)}</b>'
+                         '<form method="post" action="/supply/update">'
+                         f'<input name="supplier" value="{_esc(cart["supplier"])}" placeholder="Поставщик">'
+                         f'<table><tr><th>Товар</th><th>Кол-во</th><th>Закупка, ₽</th><th></th></tr>{rows}</table>'
+                         '<button>Обновить</button></form>'
+                         '<form method="post" action="/supply/finish">'
+                         f'<input type="hidden" name="supplier" value="{_esc(cart["supplier"])}">'
+                         '<button class="del">✅ Принять поставку</button></form></div>')
+        else:
+            parts.append('<div class="card"><b>📦 Приёмка поставки</b>'
+                         '<div class="gray">Найдите товар ниже и добавьте «＋», потом впишите количество '
+                         'и закупочную цену.</div></div>')
+        query = form.get("q", "")
+        needle = query.strip().casefold()
+        found = [p for p in self.db.products() if not needle or needle in p.name.casefold()]
+        rows = "".join(
+            f'<tr><td>{_esc(p.name)}<div class="gray">остаток {qty_text(p.stock)} {p.unit}</div></td>'
+            f'<td><form method="post" action="/supply/add">'
+            f'<input type="hidden" name="id" value="{p.id}">'
+            f'<input type="hidden" name="q" value="{_esc(query)}">'
+            f'<button class="mini">＋</button></form></td></tr>'
+            for p in found[:150])
+        more = ('<div class="gray">Показаны первые 150 — уточните поиск.</div>' if len(found) > 150 else "")
+        parts.append(f'<div class="card"><form method="get" action="/supply">'
+                     f'<input name="q" value="{_esc(query)}" placeholder="Поиск товара"></form>'
+                     f"<table>{rows}</table>{more}</div></main>")
         return "".join(parts)
 
     # ----- витрина -----

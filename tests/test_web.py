@@ -269,3 +269,33 @@ def test_parse_multipart():
     fields, files = parse_multipart(body, 'multipart/form-data; boundary="XBOUND"')
     assert fields["title"] == "Нежность"
     assert files["photo"] == ("a.jpg", b"\xff\xd8\xff\xe0BINARY")
+
+
+def test_supply_from_phone(db):
+    app = WebApp(db)
+    cookies = login(app)
+    rose = db.products()[0]
+    _, _, body = app.handle("GET", "/supply", {}, cookies)
+    assert "Приёмка поставки" in body.decode() and "Роза Кения" in body.decode()
+    app.handle("POST", "/supply/add", {"id": str(rose.id)}, cookies)
+    _, _, body = app.handle("GET", "/supply", {}, cookies)
+    assert "Поставка —" in body.decode()
+    app.handle("POST", "/supply/update", {"supplier": "База", "qty_0": "20", "cost_0": "80"}, cookies)
+    _, _, body = app.handle("GET", "/supply", {}, cookies)
+    assert "1 600" in body.decode()  # 20 × 80
+    status, headers, _ = app.handle("POST", "/supply/finish", {"supplier": "База"}, cookies)
+    assert status == 303  # не подорожало — сразу готово
+    assert db.stock_of(rose.id) == 20
+    [supply] = db.supplies()
+    assert supply.supplier == "База" and supply.total == 1600
+
+    # вторая поставка дороже — программа предложит новые цены
+    app.handle("POST", "/supply/add", {"id": str(rose.id)}, cookies)
+    app.handle("POST", "/supply/update", {"supplier": "База", "qty_0": "10", "cost_0": "150"}, cookies)
+    _, _, body = app.handle("POST", "/supply/finish", {"supplier": "База"}, cookies)
+    text = body.decode()
+    assert "подорожало" in text and f"price_{rose.id}" in text
+    status, _, _ = app.handle("POST", "/supply/prices",
+                              {f"apply_{rose.id}": "on", f"price_{rose.id}": "390"}, cookies)
+    assert status == 303
+    assert db.products()[0].price == 390  # новая цена продажи применилась
