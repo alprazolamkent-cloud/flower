@@ -157,20 +157,63 @@ def test_sell_from_phone(db):
     app = WebApp(db, sale_shift_id=lambda: None)
     cookies = login(app)
     rose = db.products()[0]
+    db.add_supply("База", [(rose.id, 10, 100)], None, NOW)
     _, _, body = app.handle("GET", "/sell", {}, cookies)
     assert "Роза Кения" in body.decode()
     app.handle("POST", "/sell/add", {"kind": "p", "id": str(rose.id)}, cookies)
     app.handle("POST", "/sell/add", {"kind": "p", "id": str(rose.id)}, cookies)
     _, _, body = app.handle("GET", "/sell", {}, cookies)
     assert "Корзина" in body.decode() and "500" in body.decode()  # 2 × 250
-    status, headers, _ = app.handle("POST", "/sell/checkout",
-                                    {"payment": "cash", "phone": "+7 900 111-22-33"}, cookies)
-    assert status == 303 and headers["Location"] == "/sell?ok=500"
+    app.handle("POST", "/sell/phone", {"phone": "+7 900 111-22-33"}, cookies)
+    app.handle("POST", "/sell/adjust", {"mode": "discount", "value": "10", "unit": "%",
+                                        "note": "Акция"}, cookies)  # скидка 10% = 50
+    _, _, body = app.handle("GET", "/sell", {}, cookies)
+    assert "скидка 50" in body.decode() and "к оплате 450" in body.decode()
+    status, headers, _ = app.handle("POST", "/sell/checkout", {"payment": "cash"}, cookies)
+    assert status == 303 and headers["Location"] == "/sell?ok=450"
     sale = db.sales_between(datetime(2020, 1, 1), datetime(2030, 1, 1))[0]
-    assert sale.total == 500 and sale.payment == "cash" and sale.client_phone == "79001112233"
-    assert db.loyalty().balance("79001112233") == 25  # 5% с 500
+    assert sale.total == 450 and sale.discount == 50 and sale.adjust_note == "Акция"
+    assert sale.client_phone == "79001112233"
+    assert db.loyalty().balance("79001112233") == 25  # 5% с 500 (база начисления — без скидки)
     _, _, body = app.handle("GET", "/sell", {}, cookies)
     assert "Корзина" not in body.decode()  # корзина очистилась
+
+
+def test_sell_markup_bonus_custom_line(db):
+    app = WebApp(db, sale_shift_id=lambda: None)
+    cookies = login(app)
+    rose = db.products()[0]
+    db.add_supply("База", [(rose.id, 10, 100)], None, NOW)
+    db.loyalty().adjust("79001112233", 1000, note="тест")
+    app.handle("POST", "/sell/add", {"kind": "p", "id": str(rose.id)}, cookies)  # 250
+    app.handle("POST", "/sell/add", {"kind": "x", "title": "Доставка к двери", "price": "300"}, cookies)
+    _, _, body = app.handle("GET", "/sell", {}, cookies)
+    assert "Доставка к двери" in body.decode() and "550" in body.decode()
+    app.handle("POST", "/sell/phone", {"phone": "89001112233"}, cookies)  # 8… = тот же клиент
+    _, _, body = app.handle("GET", "/sell", {}, cookies)
+    assert "Списать 75" in body.decode()  # 30% от 250 (своя позиция в баллах не участвует)
+    app.handle("POST", "/sell/bonus", {}, cookies)
+    app.handle("POST", "/sell/adjust", {"mode": "markup", "value": "100", "unit": "₽",
+                                        "note": "Срочно"}, cookies)
+    _, _, body = app.handle("GET", "/sell", {}, cookies)
+    assert "наценка 100" in body.decode() and "к оплате 575" in body.decode()  # 550 + 100 − 75
+    status, headers, _ = app.handle("POST", "/sell/checkout", {"payment": "qr"}, cookies)
+    assert headers["Location"] == "/sell?ok=575"
+    sale = db.sales_between(datetime(2020, 1, 1), datetime(2030, 1, 1))[0]
+    assert sale.total == 575 and sale.discount == -100 and sale.bonus_spent == 75
+    assert db.loyalty().balance("79001112233") == 1000 - 75 + 8  # +5% с 175
+
+
+def test_sell_shortage_asks_confirmation(db):
+    app = WebApp(db, sale_shift_id=lambda: None)
+    cookies = login(app)
+    rose = db.products()[0]  # без поставки — остаток 0
+    app.handle("POST", "/sell/add", {"kind": "p", "id": str(rose.id)}, cookies)
+    _, _, body = app.handle("POST", "/sell/checkout", {"payment": "cash"}, cookies)
+    assert "Не хватает на складе" in body.decode()  # сначала предупреждение, как на кассе
+    status, _, _ = app.handle("POST", "/sell/checkout", {"payment": "cash", "confirm": "1"}, cookies)
+    assert status == 303
+    assert db.sales_between(datetime(2020, 1, 1), datetime(2030, 1, 1))[0].total == 250
 
 
 def test_showcase_add_and_toggle(db):

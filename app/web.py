@@ -82,6 +82,9 @@ form.reply {{ display: flex; gap: 8px; position: sticky; bottom: 8px; }}
 form.reply input {{ margin-bottom: 0; }}
 form.reply button {{ flex: none; }}
 input[type=file] {{ padding: 8px 0; }}
+form.inline {{ display: inline; }}
+td.qty form {{ display: flex; align-items: center; gap: 4px; }}
+details summary {{ padding: 8px 0; color: #d63384; cursor: pointer; }}
 </style></head><body>{body}</body></html>"""
 
 
@@ -167,8 +170,14 @@ class WebApp:
             return 200, {}, _page("Продажа", self._sell_page(user, form, cookies))
         if path == "/sell/add" and method == "POST":
             return self._sell_add(form, cookies)
-        if path == "/sell/remove" and method == "POST":
-            return self._sell_remove(form, cookies)
+        if path == "/sell/qty" and method == "POST":
+            return self._sell_qty(form, cookies)
+        if path == "/sell/adjust" and method == "POST":
+            return self._sell_adjust(form, cookies)
+        if path == "/sell/phone" and method == "POST":
+            return self._sell_phone(form, cookies)
+        if path == "/sell/bonus" and method == "POST":
+            return self._sell_bonus(form, cookies)
         if path == "/sell/checkout" and method == "POST":
             return self._sell_checkout(user, form, cookies)
         if path == "/showcase":
@@ -414,95 +423,230 @@ class WebApp:
 
     # ----- продажа с телефона -----
 
-    def _cart_lines(self, cart: list[list]) -> list[CartLine]:
+    def _cart(self, cookies: dict) -> dict:
+        return self.carts.setdefault(cookies.get(COOKIE, ""),
+                                     {"items": [], "adjust": 0, "note": "", "phone": "", "bonus": 0})
+
+    def _cart_lines(self, cart: dict) -> list[CartLine]:
         lines = []
-        for kind, ident, qty in cart:
-            if kind == "r":
-                r = self.db.get_recipe(ident)
+        for entry in cart["items"]:
+            if entry["kind"] == "r":
+                r = self.db.get_recipe(entry["id"])
                 if r is not None:
-                    lines.append(CartLine(r.title, qty, r.sell_price, recipe_id=r.id))
+                    lines.append(CartLine(r.title, entry["qty"], r.sell_price, recipe_id=r.id))
+            elif entry["kind"] == "x":  # своя позиция — без склада
+                lines.append(CartLine(entry["title"], entry["qty"], entry["price"]))
             else:
-                p = next(iter(self.db.products(ids=[ident])), None)
+                p = next(iter(self.db.products(ids=[entry["id"]])), None)
                 if p is not None:
-                    lines.append(CartLine(p.name, qty, p.price, product_id=p.id))
+                    lines.append(CartLine(p.name, entry["qty"], p.price, product_id=p.id))
         return lines
 
+    def _eligible_total(self, cart: dict) -> int:
+        """Сумма, с которой идут баллы: без уценённых букетов и своих позиций."""
+        total = 0
+        for entry in cart["items"]:
+            if entry["kind"] == "r":
+                r = self.db.get_recipe(entry["id"])
+                if r is not None and not r.promo_price:
+                    total += round(entry["qty"] * r.sell_price)
+            elif entry["kind"] == "p":
+                p = next(iter(self.db.products(ids=[entry["id"]])), None)
+                if p is not None:
+                    total += round(entry["qty"] * p.price)
+        return total
+
+    def _bonus_limit(self, cart: dict, gross: int) -> int:
+        phone = cart["phone"]
+        if not phone:
+            return 0
+        limit = self.db.loyalty().max_spend(phone, self._eligible_total(cart))
+        return max(0, min(limit, gross - cart["adjust"]))
+
     def _sell_add(self, form: dict, cookies: dict) -> tuple[int, dict, bytes]:
-        token = cookies.get(COOKIE, "")
-        kind = "r" if form.get("kind") == "r" else "p"
+        cart = self._cart(cookies)
+        kind = form.get("kind") if form.get("kind") in ("r", "x") else "p"
         try:
-            ident = int(form.get("id", "0"))
+            if kind == "x":
+                title = form.get("title", "").strip()
+                price = int(form.get("price", "0") or 0)
+                if not title or price <= 0:
+                    return _redirect("/sell")
+                cart["items"].append({"kind": "x", "id": None, "qty": 1, "title": title, "price": price})
+            else:
+                ident = int(form.get("id", "0"))
+                for entry in cart["items"]:
+                    if entry["kind"] == kind and entry["id"] == ident:
+                        entry["qty"] += 1
+                        break
+                else:
+                    cart["items"].append({"kind": kind, "id": ident, "qty": 1})
         except ValueError:
-            return _redirect("/sell")
-        cart = self.carts.setdefault(token, [])
-        for entry in cart:
-            if entry[0] == kind and entry[1] == ident:
-                entry[2] += 1
-                break
-        else:
-            cart.append([kind, ident, 1])
+            pass
         query = form.get("q", "").strip()
         return _redirect("/sell" + ("?q=" + quote(query) if query else ""))
 
-    def _sell_remove(self, form: dict, cookies: dict) -> tuple[int, dict, bytes]:
-        token = cookies.get(COOKIE, "")
+    def _sell_qty(self, form: dict, cookies: dict) -> tuple[int, dict, bytes]:
+        cart = self._cart(cookies)
         try:
-            self.carts.get(token, []).pop(int(form.get("i", "-1")))
+            entry = cart["items"][int(form.get("i", "-1"))]
+            if form.get("d") == "x":
+                cart["items"].remove(entry)
+            else:
+                entry["qty"] += 1 if form.get("d") == "+" else -1
+                if entry["qty"] <= 0:
+                    cart["items"].remove(entry)
         except (ValueError, IndexError):
             pass
         return _redirect("/sell")
 
+    def _sell_adjust(self, form: dict, cookies: dict) -> tuple[int, dict, bytes]:
+        cart = self._cart(cookies)
+        gross = sum(x.amount for x in self._cart_lines(cart))
+        if form.get("reset"):
+            cart["adjust"], cart["note"] = 0, ""
+            return _redirect("/sell")
+        try:
+            value = max(0, int(form.get("value", "0") or 0))
+        except ValueError:
+            value = 0
+        rub = round(gross * value / 100) if form.get("unit") == "%" else value
+        markup = form.get("mode") == "markup"
+        cart["adjust"] = -rub if markup else min(rub, gross)  # скидка — не больше суммы корзины
+        cart["note"] = form.get("note", "").strip()
+        return _redirect("/sell")
+
+    def _sell_phone(self, form: dict, cookies: dict) -> tuple[int, dict, bytes]:
+        cart = self._cart(cookies)
+        cart["phone"] = norm_phone(form.get("phone", ""))
+        cart["bonus"] = 0
+        return _redirect("/sell")
+
+    def _sell_bonus(self, form: dict, cookies: dict) -> tuple[int, dict, bytes]:
+        cart = self._cart(cookies)
+        gross = sum(x.amount for x in self._cart_lines(cart))
+        limit = self._bonus_limit(cart, gross)
+        cart["bonus"] = limit - cart["bonus"] if limit else 0  # второе нажатие — отменить
+        return _redirect("/sell")
+
     def _sell_checkout(self, user: User, form: dict, cookies: dict) -> tuple[int, dict, bytes]:
-        token = cookies.get(COOKIE, "")
-        lines = self._cart_lines(self.carts.get(token, []))
+        cart = self._cart(cookies)
+        lines = self._cart_lines(cart)
         if not lines:
             return _redirect("/sell")
+        short = self.db.shortages(lines)
+        if short and not form.get("confirm"):  # как на кассе: сначала предупреждение
+            body = (f'{self._header(user, "sell")}<main><div class="card"><b>Не хватает на складе:</b>'
+                    + "".join(f"<div>• {_esc(s)}</div>" for s in short)
+                    + '<div class="gray">Если товар на самом деле есть — не внесли поставку, остаток уйдёт в минус.</div>'
+                    f'<form method="post" action="/sell/checkout"><input type="hidden" name="confirm" value="1">'
+                    f'<input type="hidden" name="payment" value="{_esc(form.get("payment", ""))}">'
+                    '<div class="row"><button class="del">Всё равно продать</button></div></form>'
+                    '<div class="row"><a class="btn" href="/sell">← Вернуться в корзину</a></div></div></main>')
+            return 200, {}, _page("Продажа", body)
         payment = form.get("payment", "")
-        phone = norm_phone(form.get("phone", ""))
+        phone = cart["phone"]
+        gross = sum(x.amount for x in lines)
+        bonus_spent = min(cart["bonus"], self._bonus_limit(cart, gross))
         now = datetime.now()
         loyalty = self.db.loyalty()
         rate = loyalty.rate(phone, now) if phone else 0
         try:
             sale_id = self.db.add_sale(lines, payment, user.id,
                                        self.sale_shift_id() if self.sale_shift_id else None, now,
-                                       client_phone=phone, loyalty_rate=rate)
+                                       discount=cart["adjust"], adjust_note=cart["note"],
+                                       client_phone=phone, bonus_spent=bonus_spent, loyalty_rate=rate)
         except UserError as e:
             return self._error_page(user, str(e), "/sell")
-        total = sum(x.amount for x in lines)
-        points = loyalty.accrue(phone, total, now=now, source=f"Продажа №{sale_id}",
-                                author=user.name or user.login) if phone else 0
+        if bonus_spent:
+            loyalty.spend(phone, bonus_spent, now=now, source=f"Продажа №{sale_id}",
+                          author=user.name or user.login)
+        points = loyalty.accrue(phone, max(0, self._eligible_total(cart) - bonus_spent), now=now,
+                                source=f"Продажа №{sale_id}", author=user.name or user.login) if phone else 0
         if points:
             self.db.set_sale_bonus(sale_id, points, rate)
+        total = gross - cart["adjust"] - bonus_spent
+        adjust = ("; скидка " if cart["adjust"] > 0 else "; наценка " if cart["adjust"] < 0 else "")
+        if adjust:
+            adjust += f"{money(abs(cart['adjust']))} — {cart['note']}"
         self.db.log_action(user, "Продажа (сайт)", f"№{sale_id}: {money(total)}, {PAYMENTS.get(payment)} — "
-                           + ", ".join(f"{x.title} × {qty_text(x.qty)}" for x in lines)
+                           + ", ".join(f"{x.title} × {qty_text(x.qty)}" for x in lines) + adjust
+                           + (f"; бонусами {bonus_spent} ₽" if bonus_spent else "")
                            + (f"; начислено {points} баллов" if points else ""))
-        self.carts.pop(token, None)
+        self.carts.pop(cookies.get(COOKIE, ""), None)
         if self.on_change:
             self.on_change()
         return _redirect(f"/sell?ok={total}")
 
     def _sell_page(self, user: User, form: dict, cookies: dict) -> str:
-        token = cookies.get(COOKIE, "")
-        cart = self.carts.get(token, [])
+        from .stock_window import ADJUST_REASONS  # те же причины, что на кассе
+        cart = self._cart(cookies)
         parts = [self._header(user, "sell"), "<main>"]
         if form.get("ok", "").isdigit():
             parts.append(f'<div class="card">✅ Продажа на {money(int(form["ok"]))} записана.</div>')
-        if cart:
-            lines = self._cart_lines(cart)
-            total = sum(x.amount for x in lines)
+        lines = self._cart_lines(cart)
+        if lines:
+            gross = sum(x.amount for x in lines)
+            limit = self._bonus_limit(cart, gross)
+            cart["bonus"] = min(cart["bonus"], limit)
+            to_pay = gross - cart["adjust"] - cart["bonus"]
             rows = "".join(
-                f'<tr><td>{_esc(x.title)}</td><td>{qty_text(x.qty)}</td><td>{money(x.amount)}</td>'
-                f'<td><form method="post" action="/sell/remove"><input type="hidden" name="i" value="{i}">'
-                f'<button class="mini">✕</button></form></td></tr>'
+                f'<tr><td>{_esc(x.title)}</td>'
+                f'<td class="qty"><form method="post" action="/sell/qty">'
+                f'<input type="hidden" name="i" value="{i}"><button class="mini" name="d" value="-">−</button>'
+                f'{qty_text(x.qty)}<button class="mini" name="d" value="+">＋</button></form></td>'
+                f'<td>{money(x.amount)}</td>'
+                f'<td><form method="post" action="/sell/qty"><input type="hidden" name="i" value="{i}">'
+                f'<input type="hidden" name="d" value="x"><button class="mini">✕</button></form></td></tr>'
                 for i, x in enumerate(lines))
-            parts.append(f'<div class="card"><b>🧾 Корзина — {money(total)}</b><table>{rows}</table>'
-                         '<form method="post" action="/sell/checkout">'
-                         '<input name="phone" inputmode="tel" placeholder="📱 Телефон клиента — бонусы '
-                         '(необязательно)"><div class="row">'
+            summary = f"по корзине {money(gross)}"
+            if cart["adjust"]:
+                kind = "скидка" if cart["adjust"] > 0 else "наценка"
+                summary += (f' · {kind} {money(abs(cart["adjust"]))} — {_esc(cart["note"])} '
+                            '<form method="post" action="/sell/adjust" class="inline">'
+                            '<input type="hidden" name="reset" value="1">'
+                            '<button class="mini">✕</button></form>')
+            if cart["bonus"]:
+                summary += f" · баллами −{cart['bonus']}"
+            reasons = (*ADJUST_REASONS["discount"], *ADJUST_REASONS["markup"])
+            datalist = ('<datalist id="reasons">' + "".join(f'<option value="{_esc(r)}">'
+                                                            for r in reasons) + "</datalist>")
+            if cart["adjust"]:
+                adjust_block = ""
+            else:
+                adjust_block = ('<details><summary>🧮 Скидка / наценка</summary>'
+                                '<form method="post" action="/sell/adjust">'
+                                '<select name="mode"><option value="discount">Скидка</option>'
+                                '<option value="markup">Наценка</option></select>'
+                                '<input name="value" type="number" inputmode="numeric" min="0" placeholder="Сумма">'
+                                '<select name="unit"><option value="₽">₽</option><option value="%">%</option></select>'
+                                f'<input name="note" list="reasons" placeholder="Причина — обязательно">{datalist}'
+                                '<button>Применить</button></form></details>')
+            if cart["phone"]:
+                balance = self.db.loyalty().balance(cart["phone"])
+                bonus_btn = (f'<form method="post" action="/sell/bonus" class="inline">'
+                             f'<button class="mini">{"🎁 Отменить" if cart["bonus"] else f"🎁 Списать {limit}"}</button>'
+                             "</form>" if limit else '<span class="gray"> · пока нечем платить</span>')
+                phone_block = (f'<div>📱 {cart["phone"]}: <b>{balance} баллов</b>{bonus_btn} '
+                               '<form method="post" action="/sell/phone" class="inline">'
+                               '<button class="mini">✕</button></form></div>')
+            else:
+                phone_block = ('<form method="post" action="/sell/phone">'
+                               '<input name="phone" inputmode="tel" placeholder="📱 Телефон клиента — бонусы '
+                               '(необязательно)"></form>')
+            parts.append(f'<div class="card"><b>🧾 Корзина — к оплате {money(to_pay)}</b>'
+                         f"<table>{rows}</table>"
+                         '<form method="post" action="/sell/add"><input type="hidden" name="kind" value="x">'
+                         '<div class="row"><input name="title" placeholder="✏️ Своя позиция">'
+                         '<input name="price" type="number" inputmode="numeric" min="1" placeholder="Цена">'
+                         '<button class="mini">＋</button></div></form>'
+                         f"{adjust_block}{phone_block}"
+                         f'<div class="gray">{summary}</div>'
+                         '<form method="post" action="/sell/checkout"><div class="row">'
                          '<button class="del" name="payment" value="cash">💵 Наличные</button>'
                          '<button class="del" name="payment" value="card">💳 Терминал</button>'
                          '<button class="del" name="payment" value="qr">📱 QR</button>'
-                         '</div></form></div>')
+                         "</div></form></div>")
         query = form.get("q", "")
         needle = query.strip().casefold()
 
